@@ -1,0 +1,63 @@
+// ============================================================================
+// step3_compute.zr — Step-3 End-to-End Verification Suite
+// ============================================================================
+
+FIB_TARGET   :: 20
+ACTIVE_LANES :: (1 << 0) | (1 << 3) | (1 << 7) | (1 << 12) | (1 << 15)
+TILE_BYTES   :: 32KB
+
+fn main() i64 {
+    print("=== Zero Step-3 Native Compute Suite ===")
+    print("TILE_BYTES = {TILE_BYTES}, fib({FIB_TARGET}) = {fib(FIB_TARGET)}")
+
+    even_sum := 0
+    for i in 0..12 {
+        if (i & 1) == 1 {
+            continue
+        }
+        even_sum += i * i
+    }
+    print("even squares sum (0..12) = {even_sum}")
+
+    bit_acc := 0
+    bit_cnt := 0
+    for slot in ACTIVE_LANES <bits> {
+        print("  active lane bit -> slot {slot}")
+        bit_acc += slot * 10
+        bit_cnt += 1
+    }
+    print("scanned {bit_cnt} set bits, weighted sum = {bit_acc}")
+
+    steps := collatz_steps(27)
+    print("collatz(27) converged to 1 in {steps} steps")
+
+    delta := mix_signed(-42, 6, 100)
+    print("mix_signed(-42, 6, 100) = {delta}")
+
+    return 0
+}
+
+fn fib(n: i64) i64 {
+    if n <= 1 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn collatz_steps(start: i64) i64 {
+    n := start
+    steps := 0
+    loop <max: 200 | until: n == 1> {
+        if (n % 2) == 0 {
+            n /= 2
+        } else {
+            n = n * 3 + 1
+        }
+        steps += 1
+    }
+    return steps
+}
+
+fn mix_signed(a: i64, b: i64, bias: i64) i64 {
+    return (a * b) + bias
+}

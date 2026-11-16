@@ -1,0 +1,105 @@
+// ============================================================================
+// phase0_scalar.zr — Phase-0 Frozen Scalar Rules Suite (`PEER_MASTER_PLAN.md` §5)
+// ============================================================================
+
+Flags :: <hi: u32 | mid: u16 | lo: u16>
+
+@slab  pair_slab : <i64 | max: 2>
+@arena tiny_buf  : <cap: 4>
+
+fn main() i64 {
+    print("=== Zero Phase-0 Frozen Scalar Suite ===")
+
+    // 1. Unsigned `shr` vs Signed `sar` on bit 63 (`1 << 63`)
+    u_top: u64 = 1 << 63
+    s_top: i64 = 1 << 63
+    print("u64 >> 1 = {u_top >> 1}")
+    print("i64 >> 1 = {s_top >> 1}")
+
+    // 2. Unsigned `div`/`mod` vs Signed `idiv`
+    print("u64 / 10 = {u_top / 10}, u64 % 10 = {u_top % 10}")
+    print("i64 / 10 = {s_top / 10}")
+
+    // 3. Relational `< <= > >=`: unsigned iff BOTH operands are unsigned (§5.1)
+    u_five: u64 = 5
+    s_five: i64 = 5
+    print("cmp u64 vs u64: {u_top > u_five}, {u_five < u_top}")
+    print("cmp u64 vs i64: {u_top > s_five}, {u_top > 5}")
+
+    // 4. Narrow unsigned store truncation (`u8`)
+    narrow: u8 = 260
+    print("u8(260) = {narrow}")
+
+    // 5. Lexical `{}` brace shadowing & outer slot restoration (§5.2)
+    shadow := 1
+    {
+        shadow := 2
+        print("inner shadow = {shadow}")
+    }
+    print("outer shadow = {shadow}")
+
+    // 6. Division & remainder by zero -> `fail 1` (never SIGFPE!)
+    zero_val := 0
+    {
+        bad_q := 99 / zero_val
+        print("BUG div0: {bad_q}")
+    } recover err_d {
+        print("div0 fault = {err_d}")
+    }
+
+    {
+        bad_r := u_top % 0
+        print("BUG mod0: {bad_r}")
+    } recover err_m {
+        print("mod0 fault = {err_m}")
+    }
+
+    // 7. Dynamic `fail 0` rewritten to `1` (§5.3)
+    {
+        fail zero_val
+    } recover err_z {
+        print("fail(0) delivered = {err_z}")
+    }
+
+    // 8. `@slab` & `@arena` unsigned bounds check (`i >= cap` & negative -> `fail 2`)
+    pair_slab[0] = 11
+    pair_slab[1] = 22
+    {
+        pair_slab[2] = 99
+        print("BUG slab overrun")
+    } recover err_b1 {
+        print("slab[2] bounds fault = {err_b1}")
+    }
+
+    {
+        neg_idx := -1
+        leak := pair_slab[neg_idx]
+        print("BUG neg index: {leak}")
+    } recover err_b2 {
+        print("slab[-1] bounds fault = {err_b2}")
+    }
+
+    {
+        tiny_buf[4] = 1
+        print("BUG arena overrun")
+    } recover err_b3 {
+        print("arena[4] bounds fault = {err_b3}")
+    }
+    print("valid slab sum = {pair_slab[0] + pair_slab[1]}")
+
+    // 9. Context-exact `|` and `>` inside `loop <...>` & BitPack literals (§5.4)
+    n := 0
+    steps := 0
+    loop <max: 10 | until: (n & 4) | (n >= 6)> {
+        n += 2
+        steps += 1
+    }
+    m := 0
+    loop <max: 4 | until: m | 1> {
+        m += 1
+    }
+    f := Flags<hi: 10 > 3 | mid: 4 | 1 | lo: 7>
+    print("lens pipe/gt: n={n}, steps={steps}, m={m}, hi={f.hi}, mid={f.mid}, lo={f.lo}")
+
+    return 0
+}

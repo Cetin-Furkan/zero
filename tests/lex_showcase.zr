@@ -1,0 +1,17 @@
+// Step-2 Full Zero Syntax Lexer Verification
+/* Multi-line comment verifying
+   line tracking across block comments */
+Token :: <gen: u32 | slot: u16 | op: u16>
+
+@ring cmd_queue : <Impulse | cap: 1_024 | align: 64B>
+@slab world     : <Body    | max: 65_536>
+@mmio kick      : <u64     | addr: 0xfed0_2030>
+
+fn step(mask: mask64) {
+    flags := 0b1010_1100
+    for slot in 0..64 <tile: 32KB | simd: 16> {
+        flags += 1
+    } recover bad {
+        print("fault recovered\n")
+    }
+}

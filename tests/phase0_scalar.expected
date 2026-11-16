@@ -1,0 +1,18 @@
+=== Zero Phase-0 Frozen Scalar Suite ===
+u64 >> 1 = 4611686018427387904
+i64 >> 1 = -4611686018427387904
+u64 / 10 = 922337203685477580, u64 % 10 = 8
+i64 / 10 = -922337203685477580
+cmp u64 vs u64: 1, 1
+cmp u64 vs i64: 0, 0
+u8(260) = 4
+inner shadow = 2
+outer shadow = 1
+div0 fault = 1
+mod0 fault = 1
+fail(0) delivered = 1
+slab[2] bounds fault = 2
+slab[-1] bounds fault = 2
+arena[4] bounds fault = 2
+valid slab sum = 33
+lens pipe/gt: n=4, steps=2, m=0, hi=1, mid=5, lo=7

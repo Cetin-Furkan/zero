@@ -1,0 +1,12 @@
+=== Zero Step-4 Systems & Hardened Audit Suite ===
+forward const DERIVED_CONST = 42
+tok: gen=8, slot=42, op=7
+pte: tag=10, pfn=703710, flags=131
+world[3]: x=500, vel=-90, gen=12, slot=99, tag=777, max=128
+ZERO!
+syscall wrote 6 bytes from @arena
+rsp16 nested call result = 150
+short-circuit: a=0, b=1, c=1, calls=4
+until n > 8 stopped at n = 9
+healthy guarded block ok
+recovered scalar fault = 404 after sum = 60

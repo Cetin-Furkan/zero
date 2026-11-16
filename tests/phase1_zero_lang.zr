@@ -1,0 +1,150 @@
+// ============================================================================
+// phase1_zero_lang.zr — Idiomatic Zero Language Features & Edge Cases
+// ============================================================================
+
+// Forward `@sizeof` & `@alignof` inside `::` constants BEFORE `Tss64` is declared!
+TSS_LIM      :: @sizeof(Tss64) - 1
+TSS_ALIGN_10 :: @alignof(Tss64) + 10
+ENABLE_FEAT  :: 1
+ZERO_MODE    :: 2
+STR_CONST    :: 16
+
+Tag :: <ver: u4 | len: u12 | cmd: u16>
+
+Tss64 :: <packed> {
+    res0:       u32
+    rsp0:       u64
+    rsp1:       u64
+    rsp2:       u64
+    res1:       u64
+    ist1:       u64
+    ist2:       u64
+    ist3:       u64
+    ist4:       u64
+    ist5:       u64
+    ist6:       u64
+    ist7:       u64
+    res2:       u64
+    res3:       u16
+    iomap_base: u16
+}
+
+PacketHdr :: <align: 16B> {
+    magic: u32
+    tag:   Tag
+    seq:   u64
+}
+
+@slab tss_mem : <u8 | max: 128>
+@slab pkts    : <PacketHdr | max: 8>
+@slab calls   : <i64 | max: 2>
+
+fn inspect_hdr(p: @PacketHdr) i64 {
+    p.seq += 100
+    return p.tag.cmd
+}
+
+fn side_bump(v: i64) i64 {
+    calls[0] += 1
+    return v
+}
+
+fn main() i64 {
+    print("=== Phase-1 Zero Language Suite ===")
+
+    // 1. `<packed>` layout, forward `@sizeof`/`@alignof` in `::` & runtime `@sizeof`
+    print("Tss64 sizeof={@sizeof(Tss64)} align={@alignof(Tss64)} TSS_LIM={TSS_LIM} align10={TSS_ALIGN_10}")
+    print("PacketHdr sizeof={@sizeof(PacketHdr)} align={@alignof(PacketHdr)}")
+
+    // 2. Write & read `<packed>` struct across an `@view<Tss64>` overlay
+    tss := @view<Tss64>(tss_mem.base)
+    tss.rsp0 = 0x123456789ABCDEF0
+    tss.iomap_base = @sizeof(Tss64)
+    print("tss iomap_base={tss.iomap_base} low_rsp0_byte0={tss_mem[4]}")
+
+    // 3. `Struct{...}` literals, direct `.field` access, struct-to-struct & slab copies
+    lit_seq := PacketHdr{ magic: 0xABCD, tag: Tag<ver: 3 | len: 512 | cmd: 77>, seq: 11 }.seq
+    p0 := PacketHdr{ magic: 0x5A45524F, tag: Tag<ver: 1 | len: 64 | cmd: 99>, seq: 5 }
+    p1: PacketHdr = p0
+    pkts[2] = p1
+    p2 := pkts[2]
+    cmd_ret := inspect_hdr(@view<PacketHdr>(pkts.base + 2 * @sizeof(PacketHdr)))
+    print("struct copy: lit_seq={lit_seq} p2.ver={p2.tag.ver} p2.len={p2.tag.len} cmd={cmd_ret} mutated_seq={pkts[2].seq}")
+
+    // 4. Bounded `@view<PacketHdr>(base, len)` span + `.len` + OOB `fail 2` + null `fail 3`
+    pkts[0] = PacketHdr{ magic: 0x1111, tag: Tag<ver: 2 | len: 8 | cmd: 42>, seq: 1000 }
+    span := @view<PacketHdr>(pkts.base, 4)
+    span[1] = span[0]
+    span[1].tag.cmd += 8
+    print("span: eq_base={span.base == pkts.base} len={span.len} s1.cmd={span[1].tag.cmd}")
+
+    oob_code := 0
+    bad_idx := 4
+    {
+        _x := span[bad_idx].seq
+    } recover e2 {
+        oob_code = e2
+    }
+    null_code := 0
+    {
+        _nv := @view<PacketHdr>(0)
+    } recover e3 {
+        null_code = e3
+    }
+    null_span_code := 0
+    {
+        _ns := @view<PacketHdr>(0, 2)
+    } recover e3b {
+        null_span_code = e3b
+    }
+    empty_span := @view<PacketHdr>(0, 0)
+    print("guards: oob={oob_code} null={null_code} null_span={null_span_code} empty_len={empty_span.len}")
+
+    // 5. `%=`, `<<=`, `>>=` (signed `sar` vs unsigned `shr` + `%= 0 -> fail 1`)
+    su: u64 = 1
+    su <<= 63
+    su >>= 1
+    si: i64 = 1 << 63
+    si >>= 1
+    rm: u64 = 100
+    rm %= 7
+    mod0_code := 0
+    zero_div := 0
+    {
+        rm %= zero_div
+    } recover e1 {
+        mod0_code = e1
+    }
+    print("shifts/mod: su={su} si={si} rm={rm} mod0={mod0_code}")
+
+    // 6. `\xHH` escapes & immediate-RHS precedence + local shadowing
+    c_hex := '\x41'
+    calls[0] = 0
+    prec1 := 2 + 3 * 4
+    prec2 := prec1 * 8 + 1
+    local_shadow: i64 = 0
+    {
+        STR_CONST := 3
+        local_shadow = 10 + STR_CONST * 4
+    }
+    print("hex=\x5A\x45 c_hex={c_hex} prec1={prec1} prec2={prec2} shadow={local_shadow}")
+
+    // 7. Compile-time `if` / `else if` / `else` elision (`side_bump` dead branches MUST NOT run)
+    kept := 0
+    if ENABLE_FEAT == 1 && @sizeof(Tss64) == 104 {
+        kept = 10
+    } else {
+        kept = side_bump(999)
+        fail 99
+    }
+    if ZERO_MODE == 1 {
+        kept += side_bump(111)
+    } else if ZERO_MODE == 2 {
+        kept += 20
+    } else {
+        kept += side_bump(222)
+    }
+    print("comptime_if: kept={kept} side_calls={calls[0]}")
+
+    return 0
+}

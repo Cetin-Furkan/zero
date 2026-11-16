@@ -1,0 +1,5 @@
+// First Zero (.zr) source compiled with zero C lineage
+fn main() {
+    print("Zero (.zr) is alive — pure assembly bootstrap, zero C bloodline.")
+    print("Direct x86-64 -> ELF64 machine emission verified.")
+}

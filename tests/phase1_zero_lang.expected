@@ -1,0 +1,10 @@
+=== Phase-1 Zero Language Suite ===
+Tss64 sizeof=104 align=1 TSS_LIM=103 align10=11
+PacketHdr sizeof=16 align=16
+tss iomap_base=104 low_rsp0_byte0=240
+struct copy: lit_seq=11 p2.ver=1 p2.len=64 cmd=99 mutated_seq=105
+span: eq_base=1 len=4 s1.cmd=50
+guards: oob=2 null=3 null_span=3 empty_len=0
+shifts/mod: su=4611686018427387904 si=-4611686018427387904 rm=2 mod0=1
+hex=ZE c_hex=65 prec1=14 prec2=113 shadow=22
+comptime_if: kept=30 side_calls=0

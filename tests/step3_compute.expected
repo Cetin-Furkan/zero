@@ -1,0 +1,11 @@
+=== Zero Step-3 Native Compute Suite ===
+TILE_BYTES = 32768, fib(20) = 6765
+even squares sum (0..12) = 220
+  active lane bit -> slot 0
+  active lane bit -> slot 3
+  active lane bit -> slot 7
+  active lane bit -> slot 12
+  active lane bit -> slot 15
+scanned 5 set bits, weighted sum = 370
+collatz(27) converged to 1 in 111 steps
+mix_signed(-42, 6, 100) = -152

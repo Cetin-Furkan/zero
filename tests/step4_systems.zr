@@ -1,0 +1,113 @@
+// ============================================================================
+// step4_systems.zr — Hardened Audit Fixes + Step-4 Systems Suite
+// ============================================================================
+
+// 1. Order-independent forward constant resolution (`DERIVED` uses `BASE` below)
+DERIVED_CONST :: BASE_CONST * 4 + 2
+BASE_CONST    :: 10
+WORLD_MAX     :: 128
+SYS_WRITE     :: 1
+
+// 2. Bit-partitioned descriptors (64-bit & odd-width 32-bit layouts)
+Token    :: <gen: u32 | slot: u16 | op: u16>
+PteEntry :: <tag: u4  | pfn:  u20 | flags: u8>
+
+// 3. Cacheline-aligned struct containing nested BitPack
+Body :: <align: 64B> {
+    x:   i64
+    vel: i64
+    tok: Token
+    tag: u16
+}
+
+// 4. Disjoint writable spaces in Phdr[1] (`0x10000000`, 0 disk bytes)
+@slab  world      : <Body | max: WORLD_MAX>
+@slab  side_count : <i64  | max: 2>
+@arena io_buf     : <cap: 4KB>
+
+fn main() i64 {
+    print("=== Zero Step-4 Systems & Hardened Audit Suite ===")
+    print("forward const DERIVED_CONST = {DERIVED_CONST}")
+
+    // A. Bit-partitioned pack, field extract, and in-place field mutation
+    tok := Token<gen: 5 | slot: 1023 | op: 7>
+    tok.gen  += 3
+    tok.slot  = 42
+    pte := PteEntry<tag: 0xA | pfn: 0xABCDE | flags: 0x83>
+    print("tok: gen={tok.gen}, slot={tok.slot}, op={tok.op}")
+    print("pte: tag={pte.tag}, pfn={pte.pfn}, flags={pte.flags}")
+
+    // B. @slab struct indexing, nested bitpack mutation, and `.max` property
+    world[3].x   = 500
+    world[3].vel = -98
+    world[3].vel += 8
+    world[3].tok = Token<gen: 2 | slot: 99 | op: 15>
+    world[3].tok.gen += 10
+    world[3].tag = 777
+    print("world[3]: x={world[3].x}, vel={world[3].vel}, gen={world[3].tok.gen}, slot={world[3].tok.slot}, tag={world[3].tag}, max={world.max}")
+
+    // C. @arena byte indexing + direct Linux `@syscall` (`SYS_WRITE`)
+    io_buf[0] = 'Z'
+    io_buf[1] = 'E'
+    io_buf[2] = 'R'
+    io_buf[3] = 'O'
+    io_buf[4] = '!'
+    io_buf[5] = '\n'
+    wrote := @syscall(SYS_WRITE, 1, io_buf.base, 6)
+    print("syscall wrote {wrote} bytes from @arena")
+
+    // D. Strict `0 mod 16` RSP alignment inside nested expression calls
+    align_sum := verify_rsp16(10) + verify_rsp16(20) * (verify_rsp16(3) + verify_rsp16(4))
+    print("rsp16 nested call result = {align_sum}")
+
+    // E. Short-circuit `&&` and `||` (RHS must NOT execute when LHS decides)
+    side_count[0] = 0
+    sc_a := record_side(0) && record_side(1)
+    sc_b := record_side(1) || record_side(1)
+    sc_c := record_side(1) && record_side(1)
+    print("short-circuit: a={sc_a}, b={sc_b}, c={sc_c}, calls={side_count[0]}")
+
+    // F. `loop <max: 10 | until: n > 8>` with bare `>` operator inside lens
+    n := 0
+    loop <max: 10 | until: n > 8> {
+        n += 3
+    }
+    print("until n > 8 stopped at n = {n}")
+
+    // G. Real scalar `fail` + interprocedural `recover` (and healthy skip)
+    {
+        print("healthy guarded block ok")
+    } recover unused_err {
+        print("BUG: recover ran on healthy block!")
+    }
+
+    processed := 0
+    for pkt_id in 0..5 {
+        val := validate_packet(pkt_id)
+        processed += val
+    } recover fault_code {
+        print("recovered scalar fault = {fault_code} after sum = {processed}")
+    }
+
+    return 0
+}
+
+fn verify_rsp16(v: i64) i64 {
+    rem := @rsp_align()
+    if rem != 0 {
+        fail 0xBAD16
+    }
+    return v
+}
+
+fn record_side(ret_val: i64) i64 {
+    side_count[0] += 1
+    return ret_val
+}
+
+fn validate_packet(id: i64) !Fault {
+    if id == 3 {
+        fail 404
+    }
+    return (id + 1) * 10
+}
