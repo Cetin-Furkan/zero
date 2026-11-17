@@ -1,0 +1,29 @@
+// =============================================================================
+// ZeroOS Sealed Ring-0 Bit-Matrix & CRC32C Capsule (`examples/capsules/cap_matrix_crc.zr`)
+// =============================================================================
+// Compiled via `zero2 --target=capsule` into a position-independent, CRC32C-signed
+// `.zcap` image streamed from NVMe Extent 2, sealed `PTE_RX` (`WX=0`), and
+// dispatched across `ZeroOS` Reactor worker cores via `MOVDIR64B` + `MWAIT`.
+// =============================================================================
+
+fn matrix_row_step(acc: u64, row: u64, mask_a: u64, mask_b: u64) u64 {
+    ext_bits: u64 = @pext(acc ^ (row * 0x9E37_79B9), mask_a)
+    dep_bits: u64 = @pdep(ext_bits ^ row, mask_b)
+    rot_mix:  u64 = (dep_bits <<< 7) ^ (acc <<< 13)
+    return @crc32c(acc, rot_mix ^ dep_bits)
+}
+
+fn main(arg0: u64, arg1: u64) u64 {
+    rid: u64 = @reactor_id()
+    acc: u64 = 0x5A45_524F ^ (arg0 * 263) ^ (arg1 * 97) ^ (rid * 521)
+
+    tile {
+        for r in 0..16 {
+            ur: u64 = r
+            acc = matrix_row_step(acc, ur + rid, 0x5555_AAAA_5555_AAAA, 0x3333_CCCC_3333_CCCC) ^ (acc <<< 5)
+        }
+    }
+
+    folded: u64 = (acc ^ (acc >> 16)) & 0x00FF_FFFF
+    return folded + 2000 + rid
+}

@@ -1,0 +1,8 @@
+=== Phase-4 AVX-512 (EVEX) Vector & <simd> Suite ===
+geom: sz32=64 al32=64 sz64=64 al64=64
+alu: sum32=552 big32=17179869184 sum64=312 vsh64=1538 neg=0 not_ok=1
+k1_mask: psum32=2800 ok32=1 psum64=15000 ok64=1
+stream: nt_ok=1 s32_15=138 s64_7=777 tail19=55
+simd16: n0=1 n1=1 n7=1 n19=1 n37=1
+simd8: n0=1 n1=1 n7=1 n19=1 n37=1
+guard: oob_fault=2

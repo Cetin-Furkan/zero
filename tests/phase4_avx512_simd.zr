@@ -1,0 +1,195 @@
+// =============================================================================
+// Phase-4 512-Bit `AVX-512` (`EVEX`) Vector & `<simd>` Suite (`tests/phase4_avx512_simd.zr`)
+// =============================================================================
+// Verifies:
+//   1. First-class 64B `u32x16` & `u64x8` vectors (`@sizeof`/`@alignof` == 64),
+//      ALU (`+ - * & | ^ << >>` unary `- ~`), compound `op=`, fn args/returns,
+//      `@vec_splat32/64`, `@vec_iota32/64`, and 64b overflow-free `@vec_sum32/64`.
+//   2. Hardware `k1` opmask `@vec_load32/64(addr, k)` (`{k1}{z}`) &
+//      `@vec_store32/64(addr, v, k)` (`{k1}`) with sentinel preservation.
+//   3. Non-temporal 64B `@vec_stream(addr, v)` (`vmovntdq [rcx], zmm0`) + `@sfence()`.
+//   4. `for i in lo..hi <simd: 16>` (`u32`) & `<simd: 8>` (`u64`) auto-vectorization
+//      with branchless `k1` tails across odd lengths `N = 0, 1, 7, 19, 37` + `recover`.
+// =============================================================================
+
+@slab src32    : <u32 | max: 128>
+@slab dst32    : <u32 | max: 128>
+@slab ref32    : <u32 | max: 128>
+@slab stream32 : <u32 | max: 64>
+
+@slab src64    : <u64 | max: 128>
+@slab dst64    : <u64 | max: 128>
+@slab ref64    : <u64 | max: 128>
+@slab stream64 : <u64 | max: 64>
+
+@slab tiny64   : <u64 | max: 16>
+
+fn vec32_affine(v: u32x16, gain: u32, bias: u32) u32x16 {
+    vg: u32x16 = @vec_splat32(gain)
+    vb: u32x16 = @vec_splat32(bias)
+    out: u32x16 = v * vg + vb
+    return out
+}
+
+fn vec64_mix(v: u64x8, sh: u64) u64x8 => (v << sh) ^ (v >> 1)
+
+fn verify_simd16_len(n: i64) i64 {
+    SENT32: u32 = 0xDEAD_BEEF
+    for k in 0..64 {
+        uk: u64 = k
+        v32: u32 = (uk * 17 + 5)[31:0]
+        src32[uk] = v32
+        dst32[uk] = SENT32
+        ref32[uk] = SENT32
+    }
+
+    gain: u32 = 7
+    off: i64 = 3
+    for i in 0..n {
+        ui: u64 = i
+        t_sc: u32 = src32[i] * gain + (ui[7:0] ^ 0x5A)
+        ref32[i] = t_sc ^ (src32[i + off] >> 2)
+    }
+
+    for i in 0..n <simd: 16> {
+        t_v := src32[i] * gain + (i[7:0] ^ 0x5A)
+        dst32[i] = t_v ^ (src32[i + off] >> 2)
+    }
+
+    for k in 0..64 {
+        if dst32[k] != ref32[k] {
+            return 0
+        }
+    }
+    return 1
+}
+
+fn verify_simd8_len(n: i64) i64 {
+    SENT64: u64 = 0xCAFE_BABE_DEAD_BEEF
+    for k in 0..64 {
+        uk: u64 = k
+        src64[uk] = uk * 0x0101_0101_0000_0003 + 11
+        dst64[uk] = SENT64
+        ref64[uk] = SENT64
+    }
+
+    bias: u64 = 0x1234_5678
+    off: i64 = 2
+    for i in 0..n {
+        ui: u64 = i
+        a_sc: u64 = (src64[i] * 5 + bias) ^ (ui << 4)
+        ref64[i] = a_sc + (src64[off + i] >> 3)
+        ref64[i] += 9
+    }
+
+    for i in 0..n <simd: 8> {
+        a_v := (src64[i] * 5 + bias) ^ (i << 4)
+        dst64[i] = a_v + (src64[off + i] >> 3)
+        dst64[i] += 9
+    }
+
+    for k in 0..64 {
+        if dst64[k] != ref64[k] {
+            return 0
+        }
+    }
+    return 1
+}
+
+fn main() i64 {
+    print("=== Phase-4 AVX-512 (EVEX) Vector & <simd> Suite ===")
+
+    // 1. Geometry & first-class `u32x16` / `u64x8` ALU + fn call/return + 64b horizontal sums
+    sz32 := @sizeof(u32x16)
+    al32 := @alignof(u32x16)
+    sz64 := @sizeof(u64x8)
+    al64 := @alignof(u64x8)
+    print("geom: sz32={sz32} al32={al32} sz64={sz64} al64={al64}")
+
+    i32v: u32x16 = @vec_iota32()                      // [0..15], sum = 120
+    aff32: u32x16 = vec32_affine(i32v, 3, 10)         // [10 + 3*k], sum = 16*10 + 3*120 = 520
+    aff32 += @vec_splat32(2)                          // [12 + 3*k], sum = 552
+    sh_var: u64 = 1
+    sh32: u32x16 = (aff32 << sh_var) >> 1             // [12 + 3*k], sum = 552
+    sum_aff32: u64 = @vec_sum32(sh32)
+
+    // Verify `@vec_sum32` widens to 64b without wrapping 32 bits (`16 * 0x40000000 = 0x400000000 = 17179869184`)
+    big32: u32x16 = @vec_splat32(0x4000_0000)
+    sum_big32: u64 = @vec_sum32(big32)
+
+    i64v: u64x8 = @vec_iota64()                       // [0..7], sum = 28
+    base64: u64x8 = i64v * @vec_splat64(10) + @vec_splat64(4) // [4, 14, ..., 74], sum = 8*4 + 280 = 312
+    mixed64: u64x8 = vec64_mix(base64, 2)             // (x*4) ^ (x/2): lanes = 16^2,56^7,96^12,136^17,176^22,216^27,256^32,296^37
+    sum_base64: u64 = @vec_sum64(base64)
+    // Verify per-lane shifts & bitwise ops (`(i64v << i64v)` = [0, 2, 8, 24, 64, 160, 384, 896] -> sum = 1538)
+    vsh64: u64x8 = i64v << i64v
+    sum_vsh64: u64 = @vec_sum64(vsh64)
+    neg_chk: u64 = @vec_sum64((-i64v) + i64v)
+    not_chk: u64 = @vec_sum64((~mixed64) ^ mixed64)   // 8 * (-1) wraps u64 to -8, check == 0xFFFFFFFFFFFFFFF8
+    not_ok := not_chk == 0xFFFF_FFFF_FFFF_FFF8
+    print("alu: sum32={sum_aff32} big32={sum_big32} sum64={sum_base64} vsh64={sum_vsh64} neg={neg_chk} not_ok={not_ok}")
+
+    // 2. Explicit `k1` opmask `{k1}{z}` loads & `{k1}` stores (odd active lane counts `7` and `5`)
+    for k in 0..16 {
+        uk: u64 = k
+        src32[uk] = (uk + 1) * 100
+        dst32[uk] = 9999
+    }
+    part32: u32x16 = @vec_load32(src32.base, 7)       // lanes 0..6 = 100..700 (sum=2800), lanes 7..15 = 0!
+    psum32: u64 = @vec_sum32(part32)
+    @vec_store32(dst32.base, part32 + @vec_splat32(1), 5) // writes ONLY lanes 0..4 (101..501); lanes 5..15 stay 9999!
+    k1_32_ok := dst32[0] == 101 && dst32[4] == 501 && dst32[5] == 9999 && dst32[15] == 9999
+
+    for k in 0..8 {
+        uk: u64 = k
+        src64[uk] = (uk + 1) * 1000
+        dst64[uk] = 88888
+    }
+    part64: u64x8 = @vec_load64(src64.base, 5)        // lanes 0..4 = 1000..5000 (sum=15000), lanes 5..7 = 0!
+    psum64: u64 = @vec_sum64(part64)
+    @vec_store64(dst64.base, part64 + @vec_splat64(7), 3) // writes ONLY lanes 0..2 (1007..3007); lanes 3..7 stay 88888!
+    k1_64_ok := dst64[0] == 1007 && dst64[2] == 3007 && dst64[3] == 88888 && dst64[7] == 88888
+    print("k1_mask: psum32={psum32} ok32={k1_32_ok} psum64={psum64} ok64={k1_64_ok}")
+
+    // 3. 64-byte non-temporal `@vec_stream` (`vmovntdq [rcx], zmm0`) + `<simd>` on `@stream`
+    st_v32: u32x16 = @vec_iota32() * @vec_splat32(9) + @vec_splat32(3)
+    st_v64: u64x8  = @vec_iota64() * @vec_splat64(100) + @vec_splat64(77)
+    @vec_stream(stream32.base, st_v32)
+    @vec_stream(stream64.base, st_v64)
+
+    nt_span32 := @stream<u32>(stream32.base + 64, 19)
+    for i in 0..19 <simd: 16> {
+        nt_span32[i] = i * 3 + 1
+    }
+    @sfence()
+    nt_ok := stream32[0] == 3 && stream32[15] == 138 && stream64[0] == 77 && stream64[7] == 777 && stream32[16] == 1 && stream32[34] == 55
+    print("stream: nt_ok={nt_ok} s32_15={stream32[15]} s64_7={stream64[7]} tail19={stream32[34]}")
+
+    // 4. `<simd: 16>` (`u32`) & `<simd: 8>` (`u64`) odd-length `k1` tail verification (`N = 0, 1, 7, 19, 37`)
+    ok16_0  := verify_simd16_len(0)
+    ok16_1  := verify_simd16_len(1)
+    ok16_7  := verify_simd16_len(7)
+    ok16_19 := verify_simd16_len(19)
+    ok16_37 := verify_simd16_len(37)
+    print("simd16: n0={ok16_0} n1={ok16_1} n7={ok16_7} n19={ok16_19} n37={ok16_37}")
+
+    ok8_0  := verify_simd8_len(0)
+    ok8_1  := verify_simd8_len(1)
+    ok8_7  := verify_simd8_len(7)
+    ok8_19 := verify_simd8_len(19)
+    ok8_37 := verify_simd8_len(37)
+    print("simd8: n0={ok8_0} n1={ok8_1} n7={ok8_7} n19={ok8_19} n37={ok8_37}")
+
+    // 5. `<simd>` bounds fault safety (`fail 2` caught cleanly via `recover`)
+    oob_fault := 0
+    {
+        for i in 0..19 <simd: 8> {
+            tiny64[i] = i + 1
+        }
+    } recover err {
+        oob_fault = err
+    }
+    print("guard: oob_fault={oob_fault}")
+
+    return 0
+}

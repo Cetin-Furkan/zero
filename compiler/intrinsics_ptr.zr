@@ -1,0 +1,1610 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — Views, Pointers, & Silicon (`compiler/intrinsics_ptr.zr`)
+// =============================================================================
+// Lowers Zero hardware overlays, programmable `@ptr` lenses, `@atomic` ops,
+// `@stream` non-temporal spans, `@port` channels, `Struct{...}` value literals,
+// and all Ring-0 / Reactor / Silicon `@` intrinsics directly to native x86-64
+// machine instructions with zero helper calls.
+// =============================================================================
+
+// --- Composite Type Classification & Width/Alignment Queries ---
+
+fn is_struct_value_ty(ty: i64) i64 {
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+        return 0
+    }
+    base := ty & TY_BASE_MASK
+    if base >= TY_STRUCT_BASE && base < TY_PTR_BASE {
+        return 1
+    }
+    return 0
+}
+
+fn is_custom_ptr_ty(ty: i64) i64 {
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+        return 0
+    }
+    base := ty & TY_BASE_MASK
+    if base >= TY_PTR_BASE {
+        return 1
+    }
+    return 0
+}
+
+fn expr_ty_size(ty: i64) i64  => ty_byte_size(ty)
+fn expr_ty_align(ty: i64) i64 => ty_align(ty)
+
+// Evaluates `@sizeof(T)` (`is_align == 0`) or `@alignof(T)` (`is_align == 1`) at runtime
+fn eval_type_query_expr(is_align: i64) i64 {
+    expect_kind(TOK_LPAREN)
+    if peek_kind() == TOK_AT {
+        g[G_TOK_IDX] += 1
+        parse_type_tag()
+        expect_kind(TOK_RPAREN)
+        return 8
+    }
+    ty := parse_type_tag()
+    expect_kind(TOK_RPAREN)
+
+    if is_struct_value_ty(ty) == 1 {
+        ut_idx := (ty & TY_BASE_MASK) - TY_STRUCT_BASE
+        sz_chk: i64 = ut_size[ut_idx]
+        if sz_chk == 0 {
+            if g[G_CST_TRIAL] == 1 {
+                g[G_CST_UNRES] = 1
+                return 0
+            }
+            die_cur("error: parse fault (unresolved struct layout)")
+        }
+    }
+    if is_align == 1 {
+        return expr_ty_align(ty)
+    }
+    return expr_ty_size(ty)
+}
+
+// --- Low-Level Index Scaling, Offset Addition, & Endian Byte-Swap Emitters ---
+
+fn emit_scale_rax(esz: i64) {
+    if esz <= 1 { return }
+    if esz == 2  { emit_u8(0x48)  emit_u8(0xD1)  emit_u8(0xE0)  return }
+    if esz == 4  { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(2)  return }
+    if esz == 8  { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(3)  return }
+    if esz == 16 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(4)  return }
+    if esz == 32 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(5)  return }
+    if esz == 64 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(6)  return }
+    emit_mov_rcx_imm64(esz)
+    emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xAF)  emit_u8(0xC1) // imul rax, rcx
+}
+
+fn emit_add_rax_imm(off: i64) {
+    if off == 0 { return }
+    if off >= -128 && off <= 127 {
+        emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xC0)  emit_u8(off)
+    } else {
+        emit_u8(0x48)  emit_u8(0x81)  emit_u8(0xC0)  emit_u32(off)
+    }
+}
+
+// Stores `rax` (or `&src`) into `*(T*)rcx`, including 16B spans, structs (`rep movsb`), & `@stream`
+fn ip_emit_store_any(ty: i64) {
+    if (ty & TY_FLAG_SPAN) != 0 {
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC3)                // mov r11, rax
+        emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x03)                // mov rax, [r11]
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x01)                // mov [rcx], rax
+        emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x43)  emit_u8(0x08) // mov rax, [r11 + 8]
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x41)  emit_u8(0x08) // mov [rcx + 8], rax
+        return
+    }
+    emit_store_mem_typed(ty)
+}
+
+// Inline hardware byte-swap on `rax` for `ety` (`2`, `4`, or `8` bytes, sign-extending `i16`/`i32`)
+fn emit_bswap_for_ty(ety: i64) {
+    sz   := expr_ty_size(ety)
+    base := ety & TY_BASE_MASK
+    if sz == 2 {
+        emit_u8(0x66)  emit_u8(0xC1)  emit_u8(0xC0)  emit_u8(8) // rol ax, 8
+        if base == TY_I16 {
+            emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBF)  emit_u8(0xC0) // movsx rax, ax
+        } else {
+            emit_u8(0x0F)  emit_u8(0xB7)  emit_u8(0xC0)                // movzx eax, ax
+        }
+        return
+    }
+    if sz == 4 {
+        emit_u8(0x0F)  emit_u8(0xC8) // bswap eax
+        if base == TY_I32 {
+            emit_u8(0x48)  emit_u8(0x63)  emit_u8(0xC0) // movsxd rax, eax
+        }
+        return
+    }
+    emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xC8) // bswap rax
+}
+
+// --- Custom `@ptr<T | mask | wrap | stride | bswap>` Lowering ---
+
+fn emit_custom_ptr_elem_addr_from_rax(ut_idx: i64) {
+    if ptr_has_mask[ut_idx] == 1 {
+        emit_mov_rcx_imm64(ptr_mask[ut_idx])
+        emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8) // and rax, rcx
+    }
+    emit_null_check_rax()
+
+    base_slot := alloc_temp_qword()
+    emit_store_local(base_slot)
+
+    expect_kind(TOK_LBRACK)
+    parse_expr(1)
+    expect_kind(TOK_RBRACK)
+
+    if ptr_has_wrap[ut_idx] == 1 {
+        emit_mov_rcx_imm64(ptr_wrap_mask[ut_idx])
+        emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8) // and rax, rcx
+    }
+
+    stride: i64 = ptr_stride[ut_idx]
+    emit_scale_rax(stride)
+
+    emit_load_local_rcx(base_slot)
+    free_temp_qwords(1)
+    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+}
+
+fn emit_custom_ptr_elem_addr(disp: i64, ptr_ty: i64) i64 {
+    emit_load_local(disp)
+    ut_idx := (ptr_ty & TY_BASE_MASK) - TY_PTR_BASE
+    emit_custom_ptr_elem_addr_from_rax(ut_idx)
+    return ut_idx
+}
+
+// --- `@atomic<u32|u64|i32|i64>` Method Lowering (`rax` = addr, `.` consumed) ---
+
+fn parse_atomic_method_from_rax(ty: i64) {
+    msym := expect_ident()
+    ety  := ty & TY_BASE_MASK
+    esz  := expr_ty_size(ety)
+
+    addr_slot := alloc_temp_qword()
+    emit_store_local(addr_slot)
+
+    if msym == g[G_SYM_LOAD] {
+        expect_kind(TOK_LPAREN)
+        expect_kind(TOK_RPAREN)
+        emit_load_local(addr_slot)
+        free_temp_qwords(1)
+        emit_load_mem_typed(ety)
+        g[G_LAST_EXPR_TY] = ety
+        return
+    }
+
+    if msym == g[G_SYM_STORE] || msym == g[G_SYM_SWAP] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_load_local_rcx(addr_slot)
+        free_temp_qwords(1)
+        if esz == 8 { emit_u8(0x48) }
+        emit_u8(0x87)  emit_u8(0x01) // xchg [rcx], eax/rax
+        if ety == TY_I32 {
+            emit_u8(0x48)  emit_u8(0x63)  emit_u8(0xC0) // movsxd rax, eax
+        }
+        g[G_LAST_EXPR_TY] = ety
+        return
+    }
+
+    if msym == g[G_SYM_ADD] || msym == g[G_SYM_SUB] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        if msym == g[G_SYM_SUB] {
+            emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD8) // neg rax
+        }
+        emit_load_local_rcx(addr_slot)
+        free_temp_qwords(1)
+        emit_u8(0xF0) // LOCK
+        if esz == 8 { emit_u8(0x48) }
+        emit_u8(0x0F)  emit_u8(0xC1)  emit_u8(0x01) // lock xadd [rcx], eax/rax
+        if ety == TY_I32 {
+            emit_u8(0x48)  emit_u8(0x63)  emit_u8(0xC0) // movsxd rax, eax
+        }
+        g[G_LAST_EXPR_TY] = ety
+        return
+    }
+
+    if msym == g[G_SYM_CAS] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        exp_slot := alloc_temp_qword()
+        emit_store_local(exp_slot)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2) // mov rdx, rax (desired)
+        emit_load_local(exp_slot)                   // rax = expected
+        emit_load_local_rcx(addr_slot)              // rcx = addr
+        free_temp_qwords(2)
+        emit_u8(0xF0) // LOCK
+        if esz == 8 { emit_u8(0x48) }
+        emit_u8(0x0F)  emit_u8(0xB1)  emit_u8(0x11) // lock cmpxchg [rcx], edx/rdx
+        emit_u8(0x0F)  emit_u8(0x94)  emit_u8(0xC0) // sete al
+        emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0xC0) // movzx eax, al
+        g[G_LAST_EXPR_TY] = TY_U8
+        return
+    }
+
+    die_cur("error: parse fault (unknown @atomic method)")
+}
+
+fn parse_atomic_dot_method(disp: i64, ty: i64) {
+    expect_kind(TOK_DOT)
+    emit_load_local(disp)
+    parse_atomic_method_from_rax(ty)
+}
+
+// --- `@port` Hardware Channel Lowering (`.read()`, `.write(v)`, `.port`) ---
+
+fn ip_port_num(si: i64) i64 {
+    p: i64 = sp_port_num[si]
+    if p != 0 { return p }
+    v: i64 = sp_vaddr[si]
+    return v
+}
+
+fn emit_port_in(si: i64) {
+    ety: i64   = sp_elem_ty[si]
+    width: i64 = sp_elem_sz[si]
+    port       := ip_port_num(si)
+    if port <= 255 {
+        if width == 1 {
+            emit_u8(0x31)  emit_u8(0xC0) // xor eax, eax
+            emit_u8(0xE4)  emit_u8(port) // in al, imm8
+        } else {
+            if width == 2 {
+                emit_u8(0x31)  emit_u8(0xC0)
+                emit_u8(0x66)  emit_u8(0xE5)  emit_u8(port) // in ax, imm8
+            } else {
+                emit_u8(0xE5)  emit_u8(port) // in eax, imm8
+            }
+        }
+    } else {
+        emit_u8(0xBA)  emit_u32(port) // mov edx, port32
+        if width == 1 {
+            emit_u8(0x31)  emit_u8(0xC0)
+            emit_u8(0xEC) // in al, dx
+        } else {
+            if width == 2 {
+                emit_u8(0x31)  emit_u8(0xC0)
+                emit_u8(0x66)  emit_u8(0xED) // in ax, dx
+            } else {
+                emit_u8(0xED) // in eax, dx
+            }
+        }
+    }
+    g[G_LAST_EXPR_TY] = ety
+}
+
+fn emit_port_out_rax(si: i64) {
+    width: i64 = sp_elem_sz[si]
+    port       := ip_port_num(si)
+    if port <= 255 {
+        if width == 1 {
+            emit_u8(0xE6)  emit_u8(port) // out imm8, al
+        } else {
+            if width == 2 {
+                emit_u8(0x66)  emit_u8(0xE7)  emit_u8(port) // out imm8, ax
+            } else {
+                emit_u8(0xE7)  emit_u8(port) // out imm8, eax
+            }
+        }
+    } else {
+        emit_u8(0xBA)  emit_u32(port) // mov edx, port32
+        if width == 1 {
+            emit_u8(0xEE) // out dx, al
+        } else {
+            if width == 2 {
+                emit_u8(0x66)  emit_u8(0xEF) // out dx, ax
+            } else {
+                emit_u8(0xEF) // out dx, eax
+            }
+        }
+    }
+    g[G_LAST_EXPR_TY] = TY_U64
+}
+
+fn parse_port_space_expr(si: i64) {
+    expect_kind(TOK_DOT)
+    msym := expect_ident()
+    if msym == g[G_SYM_PORT] {
+        emit_mov_rax_imm64(ip_port_num(si))
+        g[G_LAST_EXPR_TY] = TY_U16
+        return
+    }
+    if msym == g[G_SYM_READ] {
+        expect_kind(TOK_LPAREN)
+        expect_kind(TOK_RPAREN)
+        emit_port_in(si)
+        return
+    }
+    if msym == g[G_SYM_WRITE] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_port_out_rax(si)
+        return
+    }
+    die_cur("error: parse fault (unknown @port method)")
+}
+
+fn emit_port_write_stmt(si: i64) {
+    expect_kind(TOK_DOT)
+    msym := expect_ident()
+    if msym != g[G_SYM_WRITE] {
+        die_cur("error: parse fault (expected .write on @port)")
+    }
+    expect_kind(TOK_LPAREN)
+    parse_expr(1)
+    expect_kind(TOK_RPAREN)
+    emit_port_out_rax(si)
+}
+
+// --- `Struct{ field: expr, ... }` Stack Literal & Span/Space Sub-Slicing ---
+
+fn parse_struct_literal_expr(ut_idx: i64) {
+    sz: i64 = ut_size[ut_idx]
+    qwords := (sz + 7) >> 3
+    if qwords < 1 { qwords = 1 }
+    slot_disp := alloc_anon_qwords(qwords)
+
+    // Zero all qwords (covers `@cell64` trailing cacheline bytes as well)
+    emit_mov_rax_imm64(0)
+    for i in 0..qwords {
+        emit_store_local(slot_disp + i * 8)
+    }
+
+    expect_kind(TOK_LBRACE)
+    loop <max: 256 | until: peek_kind() == TOK_RBRACE> {
+        fsym := expect_ident()
+        fi   := find_struct_field(ut_idx, fsym)
+        if fi < 0 {
+            die_cur("error: parse fault (unknown struct field)")
+        }
+        foff: i64 = fld_off[fi]
+        fty: i64  = fld_ty[fi]
+        expect_kind(TOK_COLON)
+        parse_expr(1)
+        emit_lea_local_rcx(slot_disp + foff)
+        ip_emit_store_any(fty)
+        if peek_kind() == TOK_COMMA {
+            g[G_TOK_IDX] += 1
+        }
+    }
+    expect_kind(TOK_RBRACE)
+
+    emit_lea_local(slot_disp)
+    g[G_LAST_EXPR_TY] = TY_STRUCT_BASE + ut_idx
+}
+
+// Called from `parse_postfix` when `span_ptr_t` holds `&{base, len}`, `rax` = `lo`, and `..` is next
+fn parse_span_subslice_from_slot(span_ptr_t: i64, span_ty: i64) {
+    expect_kind(TOK_DOT2)
+    lo_t := alloc_temp_qword()
+    emit_store_local(lo_t)
+
+    parse_expr(1)
+    expect_kind(TOK_RBRACK)
+    hi_t := alloc_temp_qword()
+    emit_store_local(hi_t)
+
+    // Bounds check: `(u64)lo <= (u64)hi && (u64)hi <= span.len` -> else `fail 2`
+    emit_load_local(lo_t)
+    emit_load_local_rcx(hi_t)
+    emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx (lo vs hi)
+    emit_u8(0x0F)  emit_u8(0x87)                // ja .oob
+    oob_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    emit_load_local(span_ptr_t)
+    emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x40)  emit_u8(8) // mov rax, [rax + 8] (span.len)
+    emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC1)             // cmp rcx, rax (hi vs span.len)
+    emit_u8(0x0F)  emit_u8(0x86)                            // jbe .ok
+    ok_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    patch_rel32_here(oob_p)
+    emit_raise_fault_imm(2)
+    patch_rel32_here(ok_p)
+
+    new_span := alloc_anon_qwords(2)
+
+    // `new_len = hi - lo`
+    emit_load_local(hi_t)
+    emit_load_local_rcx(lo_t)
+    emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx
+    emit_store_local(new_span + 8)
+
+    // `new_base = span.base + lo * esz`
+    ety := span_ty & TY_BASE_MASK
+    esz := expr_ty_size(ety)
+    emit_load_local(lo_t)
+    emit_scale_rax(esz)
+    emit_load_local_rcx(span_ptr_t)
+    emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x09) // mov rcx, [rcx]
+    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+    emit_store_local(new_span)
+
+    free_temp_qwords(3)
+    emit_lea_local(new_span)
+    g[G_LAST_EXPR_TY] = span_ty
+}
+
+// Memory & `@port` space rvalue handler (`sp.base`, `sp.cap`, `sp.span`, `sp.slot_addr(s)`, `sp[lo..hi]`, `sp[i]`)
+fn parse_space_rval_expr(si: i64) {
+    sk: i64 = sp_kind[si]
+    if sk == SKIND_PORT {
+        parse_port_space_expr(si)
+        return
+    }
+
+    cap: i64 = sp_cap[si]
+    ety: i64 = sp_elem_ty[si]
+    esz: i64 = sp_elem_sz[si]
+
+    if peek_kind() == TOK_DOT {
+        g[G_TOK_IDX] += 1
+        psym := expect_ident()
+        if psym == g[G_SYM_BASE] {
+            emit_load_space_base_rax(si)
+            g[G_LAST_EXPR_TY] = TY_U64
+            return
+        }
+        if psym == g[G_SYM_CAP] || psym == g[G_SYM_MAX] || psym == g[G_SYM_LEN] {
+            emit_mov_rax_imm64(cap)
+            g[G_LAST_EXPR_TY] = TY_U64
+            return
+        }
+        if psym == g[G_SYM_SPAN] {
+            slot := alloc_anon_qwords(2)
+            emit_load_space_base_rax(si)
+            emit_store_local(slot)
+            emit_mov_rax_imm64(cap)
+            emit_store_local(slot + 8)
+            emit_lea_local(slot)
+            g[G_LAST_EXPR_TY] = ety | TY_FLAG_SPAN
+            return
+        }
+        if psym == g[G_SYM_SLOT_ADDR] {
+            if sk != SKIND_RING && sk != SKIND_DMA_QUEUE {
+                die_cur("error: parse fault (.slot_addr requires @ring or @dma_queue)")
+            }
+            expect_kind(TOK_LPAREN)
+            parse_expr(1)
+            expect_kind(TOK_RPAREN)
+            emit_mov_rcx_imm64(cap - 1)
+            emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8) // and rax, rcx
+            emit_scale_rax(esz)
+            emit_load_space_base_rcx(si)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            g[G_LAST_EXPR_TY] = TY_U64
+            return
+        }
+        die_cur("error: parse fault (unknown space property)")
+    }
+
+    expect_kind(TOK_LBRACK)
+    parse_expr(1)
+
+    // Sub-slice `space[lo..hi]`
+    if peek_kind() == TOK_DOT2 {
+        g[G_TOK_IDX] += 1
+        lo_t := alloc_temp_qword()
+        emit_store_local(lo_t)
+        parse_expr(1)
+        expect_kind(TOK_RBRACK)
+        hi_t := alloc_temp_qword()
+        emit_store_local(hi_t)
+
+        emit_load_local(lo_t)
+        emit_load_local_rcx(hi_t)
+        emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+        emit_u8(0x0F)  emit_u8(0x87)                // ja .oob
+        oob_p := g[G_CODE_OFF]
+        emit_u32(0)
+
+        emit_mov_rax_imm64(cap)
+        emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC1) // cmp rcx, rax (hi vs cap)
+        emit_u8(0x0F)  emit_u8(0x86)                // jbe .ok
+        ok_p := g[G_CODE_OFF]
+        emit_u32(0)
+
+        patch_rel32_here(oob_p)
+        emit_raise_fault_imm(2)
+        patch_rel32_here(ok_p)
+
+        new_span := alloc_anon_qwords(2)
+        emit_load_local(hi_t)
+        emit_load_local_rcx(lo_t)
+        emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // hi - lo
+        emit_store_local(new_span + 8)
+
+        emit_load_local(lo_t)
+        emit_scale_rax(esz)
+        emit_load_space_base_rcx(si)
+        emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+        emit_store_local(new_span)
+
+        free_temp_qwords(2)
+        emit_lea_local(new_span)
+        g[G_LAST_EXPR_TY] = ety | TY_FLAG_SPAN
+        return
+    }
+
+    expect_kind(TOK_RBRACK)
+
+    // `@ring` & `@dma_queue` wrap `(idx & (cap - 1))`; `@slab`/`@arena`/`@capsule` check `idx < cap`
+    if sk == SKIND_RING || sk == SKIND_DMA_QUEUE {
+        emit_mov_rcx_imm64(cap - 1)
+        emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8) // and rax, rcx
+    } else {
+        emit_bounds_check_rax(cap)
+    }
+
+    emit_scale_rax(esz)
+    emit_load_space_base_rcx(si)
+    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+    if is_ty_vec(ety) == 1 {
+        check_avx512_context(peek_line())
+    }
+    if (ety & TY_FLAG_SPAN) == 0 {
+        emit_load_mem_typed(ety)
+    }
+    g[G_LAST_EXPR_TY] = ety
+}
+
+// --- `@view<T>` / `@mmio<T>` / `@span<T>` / `@stream<T>` Shared Parser ---
+
+fn ip_parse_view_or_mmio(is_mmio: i64, require_span: i64, is_stream: i64) {
+    expect_kind(TOK_LT)
+    elem_ty := parse_type_tag()
+    if (elem_ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+        die_cur("error: parse fault (invalid overlay element type)")
+    }
+    base_ty := elem_ty & TY_BASE_MASK
+    if is_stream == 1 {
+        if base_ty >= TY_STRUCT_BASE {
+            die_cur("error: parse fault (@stream requires 32-bit or 64-bit scalar)")
+        }
+        esz := expr_ty_size(base_ty)
+        if esz != 4 && esz != 8 && is_ty_vec(base_ty) == 0 {
+            die_cur("error: parse fault (@stream requires 32-bit or 64-bit scalar)")
+        }
+    }
+    expect_kind(TOK_GT)
+    expect_kind(TOK_LPAREN)
+    parse_expr(1)
+
+    if peek_kind() != TOK_COMMA {
+        if require_span == 1 {
+            die_cur("error: parse fault (span intrinsic requires 2 arguments)")
+        }
+        expect_kind(TOK_RPAREN)
+        if is_mmio == 0 {
+            emit_null_check_rax()
+        }
+        out_ty := base_ty | TY_FLAG_VIEW1
+        if is_mmio == 1 { out_ty = out_ty | TY_FLAG_MMIO }
+        g[G_LAST_EXPR_TY] = out_ty
+        return
+    }
+
+    g[G_TOK_IDX] += 1
+    span_slot := alloc_anon_qwords(2)
+    emit_store_local(span_slot)
+    parse_expr(1)
+    expect_kind(TOK_RPAREN)
+
+    // Null guard (`len != 0 && base == 0 -> fail 3`) when required:
+    //   - `@view` & `@span`: enforced on all targets
+    //   - `@stream`: enforced on `ELF64` (`G_MODE_EFI == 0`), allowed at `0` or non-null on EFI
+    //   - `@mmio`: never faults on `0`
+    need_null_chk := 0
+    if is_mmio == 0 {
+        if is_stream == 0 {
+            need_null_chk = 1
+        } else {
+            if g[G_MODE_EFI] == 0 && g[G_MODE_CAPSULE] == 0 {
+                need_null_chk = 1
+            }
+        }
+    }
+
+    if need_null_chk == 1 {
+        zlen_p := emit_jz_rel32()
+        emit_load_local_rcx(span_slot)
+        emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9) // test rcx, rcx
+        emit_u8(0x0F)  emit_u8(0x85)                // jnz .ok
+        nz_p := g[G_CODE_OFF]
+        emit_u32(0)
+        emit_raise_fault_imm(3)
+        patch_rel32_here(nz_p)
+        patch_rel32_here(zlen_p)
+    }
+
+    emit_store_local(span_slot + 8)
+    emit_lea_local(span_slot)
+
+    out_span_ty := base_ty | TY_FLAG_SPAN
+    if is_mmio == 1   { out_span_ty = out_span_ty | TY_FLAG_MMIO }
+    if is_stream == 1 { out_span_ty = out_span_ty | TY_FLAG_STREAM }
+    g[G_LAST_EXPR_TY] = out_span_ty
+}
+
+// --- Ring-0 Intrinsic Argument & Static Alignment / CR Validators ---
+
+fn ip_expect_0_args() {
+    expect_kind(TOK_LPAREN)
+    expect_kind(TOK_RPAREN)
+}
+
+fn ip_eval_1_arg_rax() {
+    expect_kind(TOK_LPAREN)
+    parse_expr(1)
+    expect_kind(TOK_RPAREN)
+}
+
+fn ip_eval_2_args_after_lparen() {
+    parse_expr(1)
+    t0 := alloc_temp_qword()
+    emit_store_local(t0)
+    expect_kind(TOK_COMMA)
+    parse_expr(1)
+    expect_kind(TOK_RPAREN)
+    emit_load_local_rcx(t0)
+    free_temp_qwords(1)
+}
+
+fn ip_eval_2_args_rcx_rax() {
+    expect_kind(TOK_LPAREN)
+    ip_eval_2_args_after_lparen()
+}
+
+fn ip_range_is_pure_const(start_i: i64, end_i: i64) i64 {
+    if start_i >= end_i { return 0 }
+    i := start_i
+    loop <max: 4096 | until: i >= end_i> {
+        k := tok_kind[i]
+        if k == TOK_DOT { return 0 }
+        if k == TOK_AT {
+            if tok_kind[i + 1] != TOK_IDENT { return 0 }
+            asym := tok_val[i + 1]
+            if asym != g[G_SYM_SIZEOF] && asym != g[G_SYM_ALIGNOF] { return 0 }
+            if tok_kind[i + 2] != TOK_LPAREN { return 0 }
+            p := i + 3
+            pd := 1
+            loop <max: 512 | until: p >= end_i || pd == 0> {
+                if tok_kind[p] == TOK_LPAREN { pd += 1 }
+                if tok_kind[p] == TOK_RPAREN { pd -= 1 }
+                p += 1
+            }
+            if pd != 0 { return 0 }
+            i = p
+            continue
+        }
+        if k == TOK_IDENT {
+            nk := tok_kind[i + 1]
+            if nk == TOK_LPAREN || nk == TOK_LT || nk == TOK_LBRACE { return 0 }
+            sym := tok_val[i]
+            if find_local(sym) >= 0 { return 0 }
+            if find_space(sym) >= 0 { return 0 }
+            ci := find_const(sym)
+            if ci < 0 || cst_done[ci] == 0 { return 0 }
+        }
+        i += 1
+    }
+    return 1
+}
+
+fn ip_eval_const_ring0_arg(delim_kind: i64, err_line: i64) i64 {
+    start_i := g[G_TOK_IDX]
+    pdepth  := 0
+    idx     := start_i
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            die_line("error: invalid or unaligned ring-0 intrinsic constant", err_line)
+        }
+        if k == TOK_LPAREN { pdepth += 1  idx += 1  continue }
+        if k == TOK_RPAREN {
+            if pdepth == 0 {
+                if delim_kind == TOK_RPAREN { break }
+                die_line("error: invalid or unaligned ring-0 intrinsic constant", err_line)
+            }
+            pdepth -= 1
+            idx += 1
+            continue
+        }
+        if pdepth == 0 && k == delim_kind { break }
+        idx += 1
+    }
+    end_i := idx
+    if ip_range_is_pure_const(start_i, end_i) == 0 {
+        die_line("error: invalid or unaligned ring-0 intrinsic constant", err_line)
+    }
+
+    val := try_eval_const_fenced(start_i, end_i)
+    if g[G_CST_UNRES] != 0 || g[G_TOK_IDX] != end_i {
+        die_line("error: invalid or unaligned ring-0 intrinsic constant", err_line)
+    }
+    return val
+}
+
+fn ip_check_const_align8_before_comma(err_line: i64) {
+    start_i := g[G_TOK_IDX]
+    pdepth  := 0
+    idx     := start_i
+    found   := 0
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF { break }
+        if k == TOK_LPAREN { pdepth += 1  idx += 1  continue }
+        if k == TOK_RPAREN {
+            if pdepth == 0 { break }
+            pdepth -= 1
+            idx += 1
+            continue
+        }
+        if pdepth == 0 && k == TOK_COMMA {
+            found = 1
+            break
+        }
+        idx += 1
+    }
+    if found == 0 {
+        g[G_TOK_IDX] = start_i
+        return
+    }
+    comma_i := idx
+    if ip_range_is_pure_const(start_i, comma_i) == 0 {
+        g[G_TOK_IDX] = start_i
+        return
+    }
+
+    val := try_eval_const_fenced(start_i, comma_i)
+    end_after := g[G_TOK_IDX]
+    g[G_TOK_IDX] = start_i
+
+    if g[G_CST_UNRES] == 0 && end_after == comma_i {
+        if (val & 7) != 0 {
+            die_line("error: invalid or unaligned ring-0 intrinsic constant", err_line)
+        }
+    }
+}
+
+fn ip_require_efi(at_line: i64) {
+    if g[G_MODE_EFI] == 0 && g[G_MODE_CAPSULE] == 0 {
+        die_line("error: ring-0 intrinsic requires --target=efi-os", at_line)
+    }
+}
+
+fn ip_require_efi_non_isr(at_line: i64) {
+    ip_require_efi(at_line)
+    if g[G_IN_ISR_MODE] != 0 {
+        die_line("error: @isr/@isr_ok forbids reactor regs", at_line)
+    }
+}
+
+// Enforces the Ring-0 Zero-XSAVE `<tile>` & `@isr`/`@isr_ok` law on AVX-512 (`ZMM`) usage
+fn check_avx512_context(err_line: i64) {
+    if g[G_IN_ISR_MODE] != 0 {
+        die_line("error: @isr/@isr_ok forbids AVX-512 <simd>", err_line)
+    }
+    if (g[G_MODE_EFI] == 1 || g[G_MODE_CAPSULE] == 1) && g[G_TILE_DEPTH] <= 0 {
+        die_line("error: AVX-512 <simd> in Ring-0 requires enclosing <tile>", err_line)
+    }
+    g[G_TILE_USED_ZMM] = 1
+}
+
+// --- Full `@` Intrinsic Dispatcher (`parse_at_expr`) ---
+
+fn parse_at_expr() {
+    at_line := peek_line()
+    expect_kind(TOK_AT)
+
+    // 1. Keyword `@syscall` or `@mmio`
+    if peek_kind() == TOK_KW {
+        kw := peek_kw()
+        if kw == KW_MMIO {
+            ip_require_efi(at_line)
+            g[G_TOK_IDX] += 1
+            ip_parse_view_or_mmio(1, 0, 0)
+            return
+        }
+        if kw == KW_SYSCALL {
+            if g[G_MODE_EFI] == 1 || g[G_MODE_CAPSULE] == 1 {
+                die_line("error: host print/@syscall unavailable in --target=efi-os", at_line)
+            }
+            g[G_TOK_IDX] += 1
+            expect_kind(TOK_LPAREN)
+            s0: i64 = 0  s1: i64 = 0  s2: i64 = 0  s3: i64 = 0
+            s4: i64 = 0  s5: i64 = 0  s6: i64 = 0
+            scnt: i64 = 0
+            loop <max: 8 | until: 0 == 1> {
+                if scnt >= 7 { die_cur("error: parse fault (too many @syscall arguments)") }
+                parse_expr(1)
+                slot := alloc_temp_qword()
+                emit_store_local(slot)
+                if scnt == 0 { s0 = slot }
+                if scnt == 1 { s1 = slot }
+                if scnt == 2 { s2 = slot }
+                if scnt == 3 { s3 = slot }
+                if scnt == 4 { s4 = slot }
+                if scnt == 5 { s5 = slot }
+                if scnt == 6 { s6 = slot }
+                scnt += 1
+                if peek_kind() != TOK_COMMA { break }
+                g[G_TOK_IDX] += 1
+            }
+            expect_kind(TOK_RPAREN)
+            if scnt >= 2 { emit_load_local(s1)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC7) } // rdi
+            if scnt >= 3 { emit_load_local(s2)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC6) } // rsi
+            if scnt >= 4 { emit_load_local(s3)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2) } // rdx
+            if scnt >= 5 { emit_load_local(s4)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC2) } // r10
+            if scnt >= 6 { emit_load_local(s5)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0) } // r8
+            if scnt >= 7 { emit_load_local(s6)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC1) } // r9
+            emit_load_local(s0)
+            free_temp_qwords(scnt)
+            emit_u8(0x0F)  emit_u8(0x05) // syscall
+            g[G_LAST_EXPR_TY] = TY_I64
+            return
+        }
+        die_line("error: parse fault (unexpected keyword after '@')", at_line)
+    }
+
+    sym := expect_ident()
+
+    // 2. Target-agnostic type/memory/code intrinsics
+    if sym == g[G_SYM_MMIO] {
+        ip_require_efi(at_line)
+        ip_parse_view_or_mmio(1, 0, 0)
+        return
+    }
+    if sym == g[G_SYM_VIEW] {
+        ip_parse_view_or_mmio(0, 0, 0)
+        return
+    }
+    if sym == g[G_SYM_SPAN] {
+        ip_parse_view_or_mmio(0, 1, 0)
+        return
+    }
+    if sym == g[G_SYM_STREAM] {
+        ip_parse_view_or_mmio(0, 1, 1)
+        return
+    }
+    if sym == g[G_SYM_ATOMIC] {
+        expect_kind(TOK_LT)
+        aty := parse_type_tag()
+        if (aty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+            die_cur("error: parse fault (invalid @atomic element type)")
+        }
+        abase := aty & TY_BASE_MASK
+        if abase >= TY_STRUCT_BASE {
+            die_cur("error: parse fault (@atomic requires 32-bit or 64-bit scalar)")
+        }
+        asz := expr_ty_size(abase)
+        if asz != 4 && asz != 8 {
+            die_cur("error: parse fault (@atomic requires 32-bit or 64-bit scalar)")
+        }
+        expect_kind(TOK_GT)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_null_check_rax()
+        g[G_LAST_EXPR_TY] = abase | TY_FLAG_ATOMIC
+        return
+    }
+
+    if sym == g[G_SYM_SIZEOF] {
+        sz := eval_type_query_expr(0)
+        emit_mov_rax_imm64(sz)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_ALIGNOF] {
+        al := eval_type_query_expr(1)
+        emit_mov_rax_imm64(al)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_RSP_ALIGN] {
+        ip_expect_0_args()
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xE0) // mov rax, rsp
+        emit_u8(0x83)  emit_u8(0xE0)  emit_u8(0x0F) // and eax, 15
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_FN_ADDR] {
+        expect_kind(TOK_LPAREN)
+        fsym := expect_ident()
+        fidx := find_or_add_fn(fsym)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x05) // lea rax, [rip + rel32]
+        fx := g[G_CALL_FIX_CNT]
+        call_fix_off[fx] = g[G_CODE_OFF]
+        call_fix_fn[fx]  = fidx
+        g[G_CALL_FIX_CNT] = fx + 1
+        emit_u32(0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_CODE_BYTES] {
+        expect_kind(TOK_LPAREN)
+        fsym := expect_ident()
+        fidx := find_or_add_fn(fsym)
+        expect_kind(TOK_RPAREN)
+        emit_code_bytes_expr(fidx)
+        return
+    }
+    if sym == g[G_SYM_CALL] {
+        if g[G_IN_ISR_MODE] != 0 {
+            die_line("error: @isr/@isr_ok forbids indirect @call", at_line)
+        }
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        emit_null_check_rax()
+        fn_ptr_slot := alloc_temp_qword()
+        emit_store_local(fn_ptr_slot)
+        d0: i64 = 0  d1: i64 = 0  d2: i64 = 0
+        d3: i64 = 0  d4: i64 = 0  d5: i64 = 0
+        acnt: i64 = 0
+        if peek_kind() == TOK_COMMA {
+            g[G_TOK_IDX] += 1
+            loop <max: 8 | until: 0 == 1> {
+                if acnt >= 6 { die_cur("error: parse fault (maximum 6 @call arguments)") }
+                parse_expr(1)
+                if is_ty_vec(g[G_LAST_EXPR_TY]) == 1 {
+                    check_avx512_context(peek_line())
+                    varg := alloc_anon_qwords(8)
+                    emit_zmm0_store_rbp(varg)
+                    emit_lea_local(varg)
+                }
+                slot := alloc_temp_qword()
+                emit_store_local(slot)
+                if acnt == 0 { d0 = slot }
+                if acnt == 1 { d1 = slot }
+                if acnt == 2 { d2 = slot }
+                if acnt == 3 { d3 = slot }
+                if acnt == 4 { d4 = slot }
+                if acnt == 5 { d5 = slot }
+                acnt += 1
+                if peek_kind() != TOK_COMMA { break }
+                g[G_TOK_IDX] += 1
+            }
+        }
+        expect_kind(TOK_RPAREN)
+        emit_load_arg_regs_lo(acnt, d0, d1, d2)
+        emit_load_arg_regs_hi(acnt, d3, d4, d5)
+        emit_load_local(fn_ptr_slot)
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC3) // mov r11, rax
+        free_temp_qwords(acnt + 1)
+        emit_u8(0x41)  emit_u8(0xFF)  emit_u8(0xD3) // call r11
+        emit_check_call_fault()
+        g[G_LAST_EXPR_TY] = TY_I64
+        return
+    }
+
+    // 2b. 512-Bit `AVX-512` (`EVEX` / `ZMM` / `k1`) Vector Intrinsics
+    if sym == g[G_SYM_VEC_SPLAT32] {
+        check_avx512_context(at_line)
+        ip_eval_1_arg_rax()
+        emit_zmm0_splat32_eax()
+        g[G_LAST_EXPR_TY] = TY_U32X16
+        return
+    }
+    if sym == g[G_SYM_VEC_SPLAT64] {
+        check_avx512_context(at_line)
+        ip_eval_1_arg_rax()
+        emit_zmm0_splat64_rax()
+        g[G_LAST_EXPR_TY] = TY_U64X8
+        return
+    }
+    if sym == g[G_SYM_VEC_IOTA32] {
+        check_avx512_context(at_line)
+        ip_expect_0_args()
+        emit_zmm0_iota32()
+        g[G_LAST_EXPR_TY] = TY_U32X16
+        return
+    }
+    if sym == g[G_SYM_VEC_IOTA64] {
+        check_avx512_context(at_line)
+        ip_expect_0_args()
+        emit_zmm0_iota64()
+        g[G_LAST_EXPR_TY] = TY_U64X8
+        return
+    }
+    if sym == g[G_SYM_VEC_LOAD32] {
+        check_avx512_context(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        if peek_kind() != TOK_COMMA {
+            expect_kind(TOK_RPAREN)
+            emit_zmm0_load32_rax()
+            g[G_LAST_EXPR_TY] = TY_U32X16
+            return
+        }
+        addr_s := alloc_temp_qword()
+        emit_store_local(addr_s)
+        g[G_TOK_IDX] += 1
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_k1_lane_mask_eax(16)
+        emit_load_local_rcx(addr_s)
+        free_temp_qwords(1)
+        emit_zmm0_load32_k1z_rcx()
+        g[G_LAST_EXPR_TY] = TY_U32X16
+        return
+    }
+    if sym == g[G_SYM_VEC_LOAD64] {
+        check_avx512_context(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        if peek_kind() != TOK_COMMA {
+            expect_kind(TOK_RPAREN)
+            emit_zmm0_load64_rax()
+            g[G_LAST_EXPR_TY] = TY_U64X8
+            return
+        }
+        addr_s := alloc_temp_qword()
+        emit_store_local(addr_s)
+        g[G_TOK_IDX] += 1
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_k1_lane_mask_eax(8)
+        emit_load_local_rcx(addr_s)
+        free_temp_qwords(1)
+        emit_zmm0_load64_k1z_rcx()
+        g[G_LAST_EXPR_TY] = TY_U64X8
+        return
+    }
+    if sym == g[G_SYM_VEC_STORE32] {
+        check_avx512_context(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        addr_s := alloc_temp_qword()
+        emit_store_local(addr_s)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        if g[G_LAST_EXPR_TY] != TY_U32X16 {
+            die_cur("error: parse fault (@vec_store32 requires u32x16)")
+        }
+        if peek_kind() != TOK_COMMA {
+            expect_kind(TOK_RPAREN)
+            emit_load_local_rcx(addr_s)
+            free_temp_qwords(1)
+            emit_zmm0_store32_rcx()
+            g[G_LAST_EXPR_TY] = TY_U64
+            return
+        }
+        vec_s := alloc_temp_vec()
+        emit_zmm0_store_rbp(vec_s)
+        g[G_TOK_IDX] += 1
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_k1_lane_mask_eax(16)
+        emit_zmm0_load_rbp(vec_s)
+        emit_load_local_rcx(addr_s)
+        free_temp_vec()
+        free_temp_qwords(1)
+        emit_zmm0_store32_k1_rcx()
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_VEC_STORE64] {
+        check_avx512_context(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        addr_s := alloc_temp_qword()
+        emit_store_local(addr_s)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        if g[G_LAST_EXPR_TY] != TY_U64X8 {
+            die_cur("error: parse fault (@vec_store64 requires u64x8)")
+        }
+        if peek_kind() != TOK_COMMA {
+            expect_kind(TOK_RPAREN)
+            emit_load_local_rcx(addr_s)
+            free_temp_qwords(1)
+            emit_zmm0_store64_rcx()
+            g[G_LAST_EXPR_TY] = TY_U64
+            return
+        }
+        vec_s := alloc_temp_vec()
+        emit_zmm0_store_rbp(vec_s)
+        g[G_TOK_IDX] += 1
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_k1_lane_mask_eax(8)
+        emit_zmm0_load_rbp(vec_s)
+        emit_load_local_rcx(addr_s)
+        free_temp_vec()
+        free_temp_qwords(1)
+        emit_zmm0_store64_k1_rcx()
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_VEC_STREAM] {
+        check_avx512_context(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        addr_s := alloc_temp_qword()
+        emit_store_local(addr_s)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        vty := g[G_LAST_EXPR_TY]
+        if vty != TY_U32X16 && vty != TY_U64X8 {
+            die_cur("error: parse fault (@vec_stream requires u32x16 or u64x8)")
+        }
+        expect_kind(TOK_RPAREN)
+        emit_load_local_rcx(addr_s)
+        free_temp_qwords(1)
+        emit_zmm0_stream_rcx()
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_VEC_SUM32] {
+        check_avx512_context(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        if g[G_LAST_EXPR_TY] != TY_U32X16 {
+            die_cur("error: parse fault (@vec_sum32 requires u32x16)")
+        }
+        expect_kind(TOK_RPAREN)
+        emit_zmm0_sum32_rax()
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_VEC_SUM64] {
+        check_avx512_context(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        if g[G_LAST_EXPR_TY] != TY_U64X8 {
+            die_cur("error: parse fault (@vec_sum64 requires u64x8)")
+        }
+        expect_kind(TOK_RPAREN)
+        emit_zmm0_sum64_rax()
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_EMIT] {
+        expect_kind(TOK_LPAREN)
+        loop <max: 4096 | until: 0 == 1> {
+            start_b := g[G_TOK_IDX]
+            pdepth  := 0
+            idx     := start_b
+            loop <max: 1024 | until: 0 == 1> {
+                tk := tok_kind[idx]
+                if tk == TOK_EOF { die_cur("error: parse fault (unclosed @emit)") }
+                if tk == TOK_LPAREN { pdepth += 1  idx += 1  continue }
+                if tk == TOK_RPAREN {
+                    if pdepth == 0 { break }
+                    pdepth -= 1
+                    idx += 1
+                    continue
+                }
+                if pdepth == 0 && tk == TOK_COMMA { break }
+                idx += 1
+            }
+            saved_tk := tok_kind[idx]
+            tok_kind[idx] = TOK_EOF
+            g[G_TOK_IDX] = start_b
+            bval := eval_const_expr(1)
+            tok_kind[idx] = saved_tk
+            if g[G_TOK_IDX] != idx || bval < 0 || bval > 255 {
+                die_cur("error: parse fault (@emit requires byte constant 0..255)")
+            }
+            emit_u8(bval)
+            if peek_kind() != TOK_COMMA { break }
+            g[G_TOK_IDX] += 1
+        }
+        expect_kind(TOK_RPAREN)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    // 3. Target-agnostic Silicon Bit, Endian, CRC32C, Cache, Fence, & CPUID Intrinsics
+    if sym == g[G_SYM_POPCNT] {
+        ip_eval_1_arg_rax()
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xB8)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_LZCNT] {
+        ip_eval_1_arg_rax()
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBD)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_TZCNT] {
+        ip_eval_1_arg_rax()
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBC)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_BSWAP16] {
+        ip_eval_1_arg_rax()
+        emit_bswap_for_ty(TY_U16)
+        g[G_LAST_EXPR_TY] = TY_U16
+        return
+    }
+    if sym == g[G_SYM_BSWAP32] {
+        ip_eval_1_arg_rax()
+        emit_bswap_for_ty(TY_U32)
+        g[G_LAST_EXPR_TY] = TY_U32
+        return
+    }
+    if sym == g[G_SYM_BSWAP64] {
+        ip_eval_1_arg_rax()
+        emit_bswap_for_ty(TY_U64)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_PDEP] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0xC4)  emit_u8(0xE2)  emit_u8(0xF3)  emit_u8(0xF5)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_PEXT] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0xC4)  emit_u8(0xE2)  emit_u8(0xF2)  emit_u8(0xF5)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_CRC32C] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0x48)  emit_u8(0x91) // xchg rax, rcx
+        emit_u8(0xF2)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0x38)  emit_u8(0xF1)  emit_u8(0xC1)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_PREFETCH] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x0F)  emit_u8(0x18)  emit_u8(0x08) // prefetcht0 [rax]
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_CLFLUSH] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x66)  emit_u8(0x0F)  emit_u8(0xAE)  emit_u8(0x38) // clflushopt [rax]
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_LFENCE] {
+        ip_expect_0_args()
+        emit_u8(0x0F)  emit_u8(0xAE)  emit_u8(0xE8)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_SFENCE] {
+        ip_expect_0_args()
+        emit_u8(0x0F)  emit_u8(0xAE)  emit_u8(0xF8)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_MFENCE] {
+        ip_expect_0_args()
+        emit_u8(0x0F)  emit_u8(0xAE)  emit_u8(0xF0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_MOVDIRI] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0x38)  emit_u8(0xF9)  emit_u8(0x01) // movdiri [rcx], rax
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_CPUID_ECX] || sym == g[G_SYM_CPUID_EBX] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        leaf_slot := alloc_temp_qword()
+        emit_store_local(leaf_slot)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC1) // mov rcx, rax (subleaf)
+        emit_load_local(leaf_slot)                  // rax = leaf
+        free_temp_qwords(1)
+        emit_u8(0x53)                               // push rbx
+        emit_u8(0x0F)  emit_u8(0xA2)                // cpuid
+        if sym == g[G_SYM_CPUID_ECX] {
+            emit_u8(0x89)  emit_u8(0xC8)            // mov eax, ecx
+        } else {
+            emit_u8(0x89)  emit_u8(0xD8)            // mov eax, ebx
+        }
+        emit_u8(0x5B)                               // pop rbx
+        g[G_LAST_EXPR_TY] = TY_U32
+        return
+    }
+
+    // 4. Custom `@UserPtrType(raw_expr)` constructor
+    ut_idx := find_user_type(sym)
+    if ut_idx >= 0 && ut_kind[ut_idx] == UKIND_PTR {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        g[G_LAST_EXPR_TY] = TY_PTR_BASE + ut_idx
+        return
+    }
+
+    // 5. Pinned Reactor ABI Intrinsics (`G_MODE_EFI == 1` & `G_IN_ISR_MODE == 0`)
+    if sym == g[G_SYM_RID] {
+        ip_require_efi_non_isr(at_line)
+        ip_expect_0_args()
+        emit_u8(0x4C)  emit_u8(0x89)  emit_u8(0xE0) // mov rax, r12
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_INBOX_BASE] {
+        ip_require_efi_non_isr(at_line)
+        ip_expect_0_args()
+        emit_u8(0x4C)  emit_u8(0x89)  emit_u8(0xE8) // mov rax, r13
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_SCRATCH_BASE] {
+        ip_require_efi_non_isr(at_line)
+        ip_expect_0_args()
+        emit_u8(0x4C)  emit_u8(0x89)  emit_u8(0xF0) // mov rax, r14
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_LOCAL_BASE] {
+        ip_require_efi_non_isr(at_line)
+        ip_expect_0_args()
+        emit_u8(0x4C)  emit_u8(0x89)  emit_u8(0xF8) // mov rax, r15
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_REACTOR_BIND] {
+        ip_require_efi_non_isr(at_line)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        id_s := alloc_temp_qword()
+        emit_store_local(id_s)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        inb_s := alloc_temp_qword()
+        emit_store_local(inb_s)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC6) // mov r14, rax (scratch)
+        emit_load_local(inb_s)
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC5) // mov r13, rax (inbox)
+        emit_load_local(id_s)
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC4) // mov r12, rax (id)
+        free_temp_qwords(2)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_WRGSBASE] {
+        ip_require_efi_non_isr(at_line)
+        ip_eval_1_arg_rax()
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC7)                   // mov r15, rax
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xAE)  emit_u8(0xD8) // wrgsbase rax
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_RDGSBASE] {
+        ip_require_efi_non_isr(at_line)
+        ip_expect_0_args()
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xAE)  emit_u8(0xC8) // rdgsbase rax
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    // 6. Ring-0 Hardware Intrinsics (`G_MODE_EFI == 1` required; allowed inside `@isr`/`@isr_ok`)
+    ip_require_efi(at_line)
+
+    if sym == g[G_SYM_EOI] {
+        ip_expect_0_args()
+        emit_u8(0x31)  emit_u8(0xC0)
+        emit_u8(0x31)  emit_u8(0xD2)
+        emit_u8(0xB9)  emit_u32(0x80B)
+        emit_u8(0x0F)  emit_u8(0x30)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_CLI] {
+        ip_expect_0_args()
+        emit_u8(0xFA)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_STI] {
+        ip_expect_0_args()
+        emit_u8(0xFB)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_HLT] {
+        ip_expect_0_args()
+        emit_u8(0xF4)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_HALT] {
+        ip_expect_0_args()
+        emit_u8(0xFA)  emit_u8(0xF4)  emit_u8(0xEB)  emit_u8(0xFD)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_PAUSE] {
+        ip_expect_0_args()
+        emit_u8(0xF3)  emit_u8(0x90)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_RDTSC] {
+        ip_expect_0_args()
+        emit_u8(0x0F)  emit_u8(0x31)
+        emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE2)  emit_u8(0x20)
+        emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xD0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_WRPKRU] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x31)  emit_u8(0xC9)
+        emit_u8(0x31)  emit_u8(0xD2)
+        emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0xEF)
+        emit_u8(0x31)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_LGDT] {
+        expect_kind(TOK_LPAREN)
+        ip_check_const_align8_before_comma(at_line)
+        ip_eval_2_args_after_lparen()
+        emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xEC)  emit_u8(0x10)
+        emit_u8(0x66)  emit_u8(0x89)  emit_u8(0x04)  emit_u8(0x24)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x4C)  emit_u8(0x24)  emit_u8(0x02)
+        emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0x14)  emit_u8(0x24)
+        emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xC4)  emit_u8(0x10)
+        emit_u8(0xB8)  emit_u32(0x10)
+        emit_u8(0x8E)  emit_u8(0xD8)
+        emit_u8(0x8E)  emit_u8(0xC0)
+        emit_u8(0x8E)  emit_u8(0xD0)
+        emit_u8(0x6A)  emit_u8(0x08)
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x05)  emit_u32(3)
+        emit_u8(0x50)
+        emit_u8(0x48)  emit_u8(0xCB)
+        emit_u8(0x31)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_LIDT] {
+        expect_kind(TOK_LPAREN)
+        ip_check_const_align8_before_comma(at_line)
+        ip_eval_2_args_after_lparen()
+        emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xEC)  emit_u8(0x10)
+        emit_u8(0x66)  emit_u8(0x89)  emit_u8(0x04)  emit_u8(0x24)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x4C)  emit_u8(0x24)  emit_u8(0x02)
+        emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0x1C)  emit_u8(0x24)
+        emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xC4)  emit_u8(0x10)
+        emit_u8(0x31)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_LTR] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x0F)  emit_u8(0x00)  emit_u8(0xD8)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_CR_READ] {
+        expect_kind(TOK_LPAREN)
+        crn := ip_eval_const_ring0_arg(TOK_RPAREN, at_line)
+        expect_kind(TOK_RPAREN)
+        modrm: i64 = -1
+        if crn == 0 { modrm = 0xC0 }
+        if crn == 3 { modrm = 0xD8 }
+        if crn == 4 { modrm = 0xE0 }
+        if modrm < 0 {
+            die_line("error: invalid or unaligned ring-0 intrinsic constant", at_line)
+        }
+        emit_u8(0x0F)  emit_u8(0x20)  emit_u8(modrm)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_CR_WRITE] {
+        expect_kind(TOK_LPAREN)
+        crn := ip_eval_const_ring0_arg(TOK_COMMA, at_line)
+        modrm: i64 = -1
+        if crn == 0 { modrm = 0xC0 }
+        if crn == 3 { modrm = 0xD8 }
+        if crn == 4 { modrm = 0xE0 }
+        if modrm < 0 {
+            die_line("error: invalid or unaligned ring-0 intrinsic constant", at_line)
+        }
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x0F)  emit_u8(0x22)  emit_u8(modrm)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_MSR_READ] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x89)  emit_u8(0xC1)
+        emit_u8(0x0F)  emit_u8(0x32)
+        emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE2)  emit_u8(0x20)
+        emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xD0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_MSR_WRITE] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2)
+        emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xEA)  emit_u8(0x20)
+        emit_u8(0x0F)  emit_u8(0x30)
+        emit_u8(0x31)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_XSETBV] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2)
+        emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xEA)  emit_u8(0x20)
+        emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0xD1)
+        emit_u8(0x31)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_PORT_IN8] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x89)  emit_u8(0xC2)
+        emit_u8(0x31)  emit_u8(0xC0)
+        emit_u8(0xEC)
+        g[G_LAST_EXPR_TY] = TY_U8
+        return
+    }
+    if sym == g[G_SYM_PORT_OUT8] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0x89)  emit_u8(0xCA)
+        emit_u8(0xEE)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_MM_READ32] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x8B)  emit_u8(0x00)
+        g[G_LAST_EXPR_TY] = TY_U32
+        return
+    }
+    if sym == g[G_SYM_MM_READ64] {
+        ip_eval_1_arg_rax()
+        emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x00)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_MM_WRITE32] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0x89)  emit_u8(0x01)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_MM_WRITE64] {
+        ip_eval_2_args_rcx_rax()
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x01)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+    if sym == g[G_SYM_ISR_STUB_BASE] {
+        ip_expect_0_args()
+        emit_isr_stub_base_rax()
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    die_line("error: parse fault (unknown '@' intrinsic)", at_line)
+}

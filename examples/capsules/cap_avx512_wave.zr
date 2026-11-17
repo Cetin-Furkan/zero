@@ -1,0 +1,25 @@
+// =============================================================================
+// ZeroOS Sealed Ring-0 AVX-512 Compute Capsule (`examples/capsules/cap_avx512_wave.zr`)
+// =============================================================================
+// Compiled via `zero2 --target=capsule` into a position-independent, CRC32C-signed
+// `.zcap` image streamed from NVMe Extent 1, sealed `PTE_RX` (`WX=0`), and
+// dispatched across `ZeroOS` Reactor worker cores via `MOVDIR64B` + `MWAIT`.
+// =============================================================================
+
+fn main(arg0: u64, arg1: u64) u64 {
+    rid:  u64 = @reactor_id()
+    seed: u64 = (arg0 * 131) + (arg1 * 17) + (rid * 257) + 0x1021
+
+    raw_sum: u64 = 0
+    tile {
+        lanes: u64x8 = @vec_iota64() + @vec_splat64(1)
+        vseed: u64x8 = @vec_splat64(seed)
+        vstep: u64x8 = @vec_splat64((arg1 + 3) | 1)
+        wave0: u64x8 = (lanes * vseed) ^ (lanes * vstep)
+        wave1: u64x8 = (wave0 + (wave0 >> 3)) ^ @vec_splat64(rid * 19 + 7)
+        raw_sum = @vec_sum64(wave1)
+    }
+
+    folded: u64 = (raw_sum ^ (raw_sum >> 24)) & 0x00FF_FFFF
+    return folded + 1000 + rid
+}

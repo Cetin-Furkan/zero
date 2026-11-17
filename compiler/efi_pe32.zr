@@ -1,0 +1,303 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — Bare-Metal UEFI PE32+ Image Builder (`compiler/efi_pe32.zr`)
+// =============================================================================
+// Emits standalone x86-64 UEFI Application (`PE32+`, `Machine = 0x8664`,
+// `Subsystem = 10`, `.text` RX @ RVA `0x1000`, `.reloc` block, `.bss` RW) with:
+//   1. MS x64 UEFI entry + GOP / ACPI 2.0 XSDT/RSDT / TSC calibration / `<1MiB`
+//      AP startup trampoline / coalesced `MemRange[]` / `ExitBootServices`
+//   2. BSP Reactor ABI initialization (`IA32_GS_BASE = &ReactorLocal[0]`, `r12..r15`)
+//   3. 256 x 16-byte hardware exception gate stubs (`@isr_stub_base()`)
+//   4. RIP-relative `.bss` displacement resolution — zero NASM at compile time!
+// =============================================================================
+
+fn emit_d4(d0: i64, d1: i64, d2: i64, d3: i64) {
+    emit_u32(d0)
+    emit_u32(d1)
+    emit_u32(d2)
+    emit_u32(d3)
+}
+
+// Verified position-independent UEFI harvest + AP trampoline machine bytes (1,778B)
+fn emit_efi_harvest_stub() {
+    emit_d4(0x48E58948, 0x48F0E483, 0x4970EC83, 0x8949CC89)
+    emit_d4(0x728B4CD5, 0x97894D60, 0x000000A0, 0xA89F894D)
+    emit_d4(0x48000000, 0x05400D8D, 0xD2310000, 0x24448D4C)
+    emit_d4(0x868B4920, 0x00000140, 0x8548D0FF, 0x09850FC0)
+    emit_d4(0x48000005, 0x20245C8B, 0x185B8B48, 0x08738B48)
+    emit_d4(0x407F8D49, 0x4E44B848, 0x524F4841, 0x89485A45)
+    emit_d4(0x0847C707, 0x00000001, 0x010C47C7, 0x48000000)
+    emit_d4(0x4818438B, 0x48104789, 0x48204B8B, 0x28244C89)
+    emit_d4(0x8904468B, 0x468B1847, 0x1C478908, 0xC120468B)
+    emit_d4(0x478902E0, 0x0C468B20, 0x0000FFBA, 0x01F88300)
+    emit_d4(0xC0853674, 0xF8832B74, 0x812F7502, 0x0000107E)
+    emit_d4(0x0B7500FF, 0xFF187E81, 0x74000000, 0x811BEB1B)
+    emit_d4(0x00FF107E, 0x12750000, 0x00187E81, 0x7500FF00)
+    emit_d4(0x0001BA09, 0x02EB0000, 0x5789D231, 0x4D8B4924)
+    emit_d4(0x758B4968, 0xC0314D70, 0x74C98548, 0x068B4845)
+    emit_d4(0x83053B48, 0x75000004, 0x468B4813, 0x053B4808)
+    emit_d4(0x0000047E, 0x8B4C0675, 0x26EB1046, 0x48068B48)
+    emit_d4(0x0474053B, 0x11750000, 0x08468B48, 0x6F053B48)
+    emit_d4(0x75000004, 0x468B4C04, 0xC6834810, 0xC9FF4818)
+    emit_d4(0x894CB6EB, 0xC7482847, 0x00003047, 0xC7480000)
+    emit_d4(0x00003847, 0x854D0000, 0xCF840FC0, 0x48000000)
+    emit_d4(0x445352B8, 0x52545020, 0x00394920, 0x00BC850F)
+    emit_d4(0x80410000, 0x72020F78, 0x708B495F, 0xF6854818)
+    emit_d4(0x3E815674, 0x54445358, 0x468B4E75, 0x24F88304)
+    emit_d4(0x0098820F, 0x8D480000, 0x8D48244E, 0x8D4C0614)
+    emit_d4(0x39490849, 0x83870FD1, 0x48000000, 0x8548018B)
+    emit_d4(0x441F74C0, 0x8141108B, 0x495041FA, 0x48067543)
+    emit_d4(0xEB304789, 0xFA81410D, 0x4746434D, 0x89480475)
+    emit_d4(0x83483847, 0xC6EB08C1, 0x10708B41, 0x74F68548)
+    emit_d4(0x523E814D, 0x75544453, 0x04468B45, 0x7224F883)
+    emit_d4(0x4E8D483D, 0x148D4824, 0x498D4C06, 0xD1394904)
+    emit_d4(0x018B2C77, 0x74C08548, 0x108B441F, 0x41FA8141)
+    emit_d4(0x75434950, 0x47894806, 0x410DEB30, 0x434DFA81)
+    emit_d4(0x04754746, 0x38478948, 0x04C18348, 0xC748CBEB)
+    emit_d4(0x00004047, 0xC7480000, 0x00004847, 0xC7480000)
+    emit_d4(0x00007047, 0x310F0000, 0x20E2C148, 0x48D00948)
+    emit_d4(0xE8B9C389, 0x49000003, 0x00F8868B, 0xD0FF0000)
+    emit_d4(0xC148310F, 0x094820E2, 0xD82948D0, 0x86A03D48)
+    emit_d4(0x05730001, 0x1E8480B8, 0x47894800, 0x7F834878)
+    emit_d4(0x840F0030, 0x000000FA, 0x2444C748, 0x09FFFF50)
+    emit_d4(0x0001B900, 0x02BA0000, 0x41000000, 0x000004B8)
+    emit_d4(0x4C8D4C00, 0x8B495024, 0xD0FF2846, 0x0FC08548)
+    emit_d4(0x0000CD85, 0x5C8B4800, 0x81485024, 0x001000FB)
+    emit_d4(0xBB820F00, 0x48000000, 0xC000FB81, 0x870F0009)
+    emit_d4(0x000000AE, 0x0FFFC3F7, 0x850F0000, 0x000000A2)
+    emit_d4(0x2444C748, 0x00000058, 0xBAC93100, 0x00000002)
+    emit_d4(0x0040B841, 0x8D4C0000, 0x4958244C, 0xFF28468B)
+    emit_d4(0xC08548D0, 0x83487C75, 0x0058247C, 0x89487474)
+    emit_d4(0xB9C031DF, 0x00000800, 0x48AB48F3, 0x8D48DF89)
+    emit_d4(0x00028D35, 0x0150B900, 0xA4F30000, 0x0100838D)
+    emit_d4(0x83890000, 0x00000122, 0x8924438D, 0x00012883)
+    emit_d4(0x60438D00, 0x01308389, 0x8D480000, 0x00200383)
+    emit_d4(0x83894800, 0x00001000, 0x03838D48, 0x48000030)
+    emit_d4(0x20008389, 0xC7480000, 0x00300083, 0x00008300)
+    emit_d4(0x7F8D4900, 0x448B4840, 0x89485824, 0x89484847)
+    emit_d4(0xC748705F, 0x00302444, 0x48000080, 0x30244C8D)
+    emit_d4(0x00978D49, 0x4C000040, 0x3824448D, 0x244C8D4C)
+    emit_d4(0x448D4840, 0x89484824, 0x49202444, 0xFF38468B)
+    emit_d4(0xC08548D0, 0x01A2850F, 0x8D490000, 0x004000B7)
+    emit_d4(0xF1894800, 0x244C0348, 0x4C8B4C30, 0x8D494024)
+    emit_d4(0x000100BF, 0x48DB3100, 0x830FCE39, 0x000000B3)
+    emit_d4(0x01FEFB81, 0x830F0000, 0x000000A7, 0x8B4C068B)
+    emit_d4(0x8B4C0856, 0xC149185E, 0x854D0CE3, 0x88840FDB)
+    emit_d4(0xBA000000, 0x00000004, 0x7407F883, 0x01F88331)
+    emit_d4(0xF8830572, 0x83277604, 0x1B7406F8, 0x7409F883)
+    emit_d4(0x0AF88316, 0xF8831174, 0x8305740B, 0x13750CF8)
+    emit_d4(0x000003BA, 0xBA0CEB00, 0x00000005, 0x01BA05EB)
+    emit_d4(0x85000000, 0x4C2474DB, 0x4DFF438D, 0x4218C06B)
+    emit_d4(0x75071439, 0x448B4A16, 0x034A0807, 0x4C100744)
+    emit_d4(0x0775D039, 0x075C014E, 0x4120EB10, 0x6B4DD889)
+    emit_d4(0x894218C0, 0xC7420714, 0x00040744, 0x4E000000)
+    emit_d4(0x08075489, 0x075C894E, 0x4CC3FF10, 0x44E9CE01)
+    emit_d4(0x41FFFFFF, 0x6B4DD889, 0xC74218C0, 0x00020704)
+    emit_d4(0xC7420000, 0x00040744, 0x49000000, 0x4A50478B)
+    emit_d4(0x08074489, 0x24448B48, 0xFF054828, 0x4800000F)
+    emit_d4(0xFFF00025, 0x44894AFF, 0xC3FF1007, 0x909F8941)
+    emit_d4(0x49000000, 0x0098BF89, 0x894C0000, 0x548B48E1)
+    emit_d4(0x8B493824, 0x0000E886, 0x48D0FF00, 0x850FC085)
+    emit_d4(0xFFFFFE8E, 0x87C741FA, 0x0001C040, 0xFFFFFFFF)
+    emit_d4(0x00A78D49, 0x4D0001C0, 0xE000AF8D, 0x01B80001)
+    emit_d4(0x31000000, 0xC1A20FC9, 0xE18303E9, 0x4D894901)
+    emit_d4(0x0007B820, 0xC9310000, 0xE9C1A20F, 0x01E1831C)
+    emit_d4(0x284D8949, 0x4CE8894C, 0xC148EA89, 0x01B920EA)
+    emit_d4(0x0FC00001, 0x7F8D4930, 0xEF894D40, 0x45E43145)
+    emit_d4(0x3145ED31, 0xE9DB31F6, 0x000001A6, 0x41EC8948)
+    emit_d4(0x415E415F, 0x5E5C415D, 0x485B5D5F, 0x000003B8)
+    emit_d4(0x00000000, 0x0000C380, 0xA9DE0000, 0x23DC9042)
+    emit_d4(0xFB964A38, 0x80D0DE7A, 0xE8716A51, 0xE4F18868)
+    emit_d4(0x22BC11D3, 0x3CC78000, 0x2D308188, 0x2D88EB9D)
+    emit_d4(0x169A11D3, 0x3F279000, 0x90904DC1, 0x90909090)
+    emit_d4(0xFCFA9090, 0xD88EC88C, 0x8CDB3166, 0xE3C166CB)
+    emit_d4(0x010F6604, 0x0F012016, 0x8366C020, 0x220F01C8)
+    emit_d4(0x2EFF66C0, 0xB8660128, 0xD88E0010, 0xD08EC08E)
+    emit_d4(0x83E0200F, 0x220F20C8, 0x00838DE0, 0x0F000010)
+    emit_d4(0x80B9D822, 0x0FC00000, 0x09000D32, 0x300F0000)
+    emit_d4(0x0DC0200F, 0x80010023, 0xFFC0220F, 0x000130AB)
+    emit_d4(0xC0319000, 0xC08ED88E, 0xE08ED08E, 0x8B48E88E)
+    emit_d4(0x00013883, 0xD8220F00, 0x48B38B48, 0x48000001)
+    emit_d4(0x3108668B, 0x268B4CED, 0x45ED3145, 0x8B4CF631)
+    emit_d4(0x894C287E, 0xFA894CF8, 0x20EAC148, 0x000101B9)
+    emit_d4(0x4C300FC0, 0x8B48E789, 0x00014083, 0x46C74800)
+    emit_d4(0x00000110, 0xFFDB3100, 0xEBF4FAD0, 0x909090FC)
+    emit_d4(0x90909090, 0x90909090, 0x90909090, 0x90909090)
+    emit_d4(0x90909090, 0x90909090, 0x90909090, 0x90909090)
+    emit_d4(0x90909090, 0x90909090, 0x90909090, 0x90909090)
+    emit_d4(0x90909090, 0x90909090, 0x90909090, 0x90909090)
+    emit_d4(0x00009090, 0x00000000, 0xFFFF0000, 0x9A000000)
+    emit_d4(0xFFFF00CF, 0x92000000, 0xFFFF00CF, 0x9A000000)
+    emit_d4(0x001F00AF, 0x00000000, 0x00000000, 0x00080000)
+    emit_d4(0x00000000, 0x00180000, 0x00000000, 0x00000000)
+    emit_d4(0x00000000, 0x00000000, 0x00000000, 0x00000000)
+    emit_u16(0x0000)
+}
+
+// Emits UEFI MS x64 entry prelude + `call main(&BootHandoff)` + 256 x 16B ISR stubs
+fn emit_efi_target_runtime(main_fn_idx: i64) {
+    g[G_CODE_OFF] = PE_HDR_FILE_SIZE
+
+    // 1. Save MS x64 non-volatile GPRs (`rbx, rbp, rdi, rsi, r12..r15`)
+    emit_u8(0x53)  emit_u8(0x55)  emit_u8(0x57)  emit_u8(0x56)
+    emit_u8(0x41)  emit_u8(0x54)
+    emit_u8(0x41)  emit_u8(0x55)
+    emit_u8(0x41)  emit_u8(0x56)
+    emit_u8(0x41)  emit_u8(0x57)
+
+    // 2. `lea r15, [rip + disp32]` -> runtime physical base of `.bss` (`bss_off = 0`)
+    emit_u8(0x4C)  emit_u8(0x8D)  emit_u8(0x3D)
+    emit_efi_bss_disp32(0)
+
+    // 2b. `lea r10, [rip + disp32]` -> physical base of `.text` (`PE_HDR_FILE_SIZE` / RVA `0x1000`)
+    emit_u8(0x4C)  emit_u8(0x8D)  emit_u8(0x15)
+    emit_u32(PE_HDR_FILE_SIZE - (g[G_CODE_OFF] + 4))
+
+    // `mov r11d, imm32` -> 4KiB-aligned `.text` span (`BootHandoff.code_bytes`)
+    emit_u8(0x41)  emit_u8(0xBB)
+    g[G_EFI_CODE_SPAN_PATCH] = g[G_CODE_OFF]
+    emit_u32(0)
+
+    // 3. Position-independent UEFI harvest + AP trampoline + ExitBootServices + BSP Reactor init
+    emit_efi_harvest_stub()
+
+    // 4. Call `.zr` `main(rdi = &BootHandoff)`
+    emit_call_fn_idx(main_fn_idx)
+
+    // 5. Post-main halt loop (`cli; .h: hlt; jmp .h`)
+    emit_u8(0xFA)  emit_u8(0xF4)  emit_u8(0xEB)  emit_u8(0xFD)
+
+    // 6. Align `.text` to 16 bytes and emit 256 x 16-byte exception gate stubs
+    cur_off := g[G_CODE_OFF]
+    aligned_off := (cur_off + 15) & (~15)
+    for p in cur_off..aligned_off {
+        emit_u8(0)
+    }
+    g[G_EFI_ISR_STUBS_OFF] = g[G_CODE_OFF]
+
+    for vec in 0..256 {
+        // 16B stub: `cli; mov dword [rip + isr_line], vec; hlt; jmp -3; nop2`
+        emit_u8(0xFA)
+        emit_u8(0xC7)  emit_u8(0x05)
+        // Next RIP after `C7 05 <disp32> <imm32>` is `disp_pos + 8`, so record `off - 4`!
+        emit_efi_bss_disp32(EFI_BSS_ISR_LINE_OFF - 4)
+        emit_u32(vec)
+        emit_u8(0xF4)
+        emit_u8(0xEB)  emit_u8(0xFD)
+        emit_u8(0x66)  emit_u8(0x90)
+    }
+}
+
+// Finalizes standalone PE32+ UEFI Application (`Subsystem = 10`) in `out_buf`
+fn finalize_efi_container() {
+    // 1. Compute `.text`, `.reloc`, and `.bss` geometry
+    code_end       := g[G_CODE_OFF]
+    text_virt_size := code_end - PE_HDR_FILE_SIZE
+    text_raw_size  := (text_virt_size + 0x1FF) & (~0x1FF)
+
+    pad_end := PE_HDR_FILE_SIZE + text_raw_size
+    for i in code_end..pad_end {
+        out_buf[i] = 0
+    }
+
+    text_rva_span := (text_virt_size + 0xFFF) & (~0xFFF)
+    patch_u32_at(g[G_EFI_CODE_SPAN_PATCH], text_rva_span)
+
+    reloc_rva := PE_TEXT_RVA + text_rva_span
+    bss_rva   := reloc_rva + 0x1000
+
+    // 2. Patch all RIP-relative `.bss` displacements (`target_rva - next_rip_rva`)
+    bf_cnt := g[G_BSS_FIX_CNT]
+    for i in 0..bf_cnt {
+        patch_pos: i64 = bss_fix_code[i]
+        b_off: i64     = bss_fix_off[i]
+        target_rva     := bss_rva + b_off
+        next_rip_rva   := (patch_pos + 4 - PE_HDR_FILE_SIZE) + PE_TEXT_RVA
+        patch_u32_at(patch_pos, target_rva - next_rip_rva)
+    }
+
+    // 3. Write 512-byte `.reloc` section at `PE_HDR_FILE_SIZE + text_raw_size`
+    reloc_file_off := PE_HDR_FILE_SIZE + text_raw_size
+    for i in 0..0x200 {
+        out_buf[reloc_file_off + i] = 0
+    }
+    patch_u32_at(reloc_file_off + 0, PE_TEXT_RVA)
+    patch_u32_at(reloc_file_off + 4, 12)
+    patch_u32_at(reloc_file_off + 8, 0)
+
+    g[G_TOTAL_OUT] = reloc_file_off + 0x200
+
+    // 4. Stamp 512-byte PE32+ UEFI Application Header (`0x000 .. 0x1FF`)
+    for i in 0..PE_HDR_FILE_SIZE {
+        out_buf[i] = 0
+    }
+
+    // MZ stub (`0x00`..`0x3F`) -> PE header at `0x40`
+    out_buf[0x00] = 0x4D
+    out_buf[0x01] = 0x5A
+    patch_u32_at(0x3C, 0x40)
+
+    // COFF File Header (`0x40`..`0x57`)
+    patch_u32_at(0x40, 0x00004550)              // "PE\0\0"
+    out_buf[0x44] = 0x64
+    out_buf[0x45] = 0x86                        // Machine = 0x8664 (x86-64)
+    out_buf[0x46] = 3                           // NumberOfSections = 3 (.text, .reloc, .bss)
+    out_buf[0x54] = 240                         // SizeOfOptionalHeader = 240
+    out_buf[0x56] = 0x22                        // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+    // Optional Header (`0x58`..`0x147`)
+    bss_raw := g[G_BSS_OFF]
+    if bss_raw < EFI_BSS_USER_START {
+        bss_raw = EFI_BSS_USER_START
+    }
+    bss_virt_size := (bss_raw + 0xFFF) & (~0xFFF)
+
+    out_buf[0x58 + 0x00] = 0x0B
+    out_buf[0x58 + 0x01] = 0x02                 // PE32+ Magic = 0x020B
+    out_buf[0x58 + 0x02] = 1                    // MajorLinkerVersion = 1
+    patch_u32_at(0x58 + 0x04, text_raw_size)    // SizeOfCode
+    patch_u32_at(0x58 + 0x08, 0x200)            // SizeOfInitializedData
+    patch_u32_at(0x58 + 0x0C, bss_virt_size)    // SizeOfUninitializedData
+    patch_u32_at(0x58 + 0x10, PE_TEXT_RVA)      // AddressOfEntryPoint = 0x1000
+    patch_u32_at(0x58 + 0x14, PE_TEXT_RVA)      // BaseOfCode = 0x1000
+    patch_u64_at(0x58 + 0x18, 0x00400000)       // Preferred ImageBase
+    patch_u32_at(0x58 + 0x20, 0x1000)           // SectionAlignment
+    patch_u32_at(0x58 + 0x24, 0x0200)           // FileAlignment
+
+    patch_u32_at(0x58 + 0x38, bss_rva + bss_virt_size) // SizeOfImage
+    patch_u32_at(0x58 + 0x3C, PE_HDR_FILE_SIZE)        // SizeOfHeaders = 0x200
+    out_buf[0x58 + 0x44] = 10                   // Subsystem = EFI_APPLICATION (10)
+    patch_u64_at(0x58 + 0x48, 0x100000)         // SizeOfStackReserve
+    patch_u64_at(0x58 + 0x50, 0x10000)          // SizeOfStackCommit
+    patch_u64_at(0x58 + 0x58, 0x100000)         // SizeOfHeapReserve
+    patch_u64_at(0x58 + 0x60, 0x1000)           // SizeOfHeapCommit
+    patch_u32_at(0x58 + 0x6C, 16)               // NumberOfRvaAndSizes = 16
+
+    // DataDirectory[5] = Base Relocation Table (`0xF0`)
+    patch_u32_at(0xF0 + 0, reloc_rva)
+    patch_u32_at(0xF0 + 4, 12)
+
+    // Section 0: `.text` (`0x148`, 40B, `CNT_CODE | MEM_EXECUTE | MEM_READ`)
+    patch_u32_at(0x148 + 0,  0x7865742E)        // ".tex"
+    out_buf[0x148 + 4] = 't'
+    patch_u32_at(0x148 + 8,  text_virt_size)
+    patch_u32_at(0x148 + 12, PE_TEXT_RVA)
+    patch_u32_at(0x148 + 16, text_raw_size)
+    patch_u32_at(0x148 + 20, PE_HDR_FILE_SIZE)
+    patch_u32_at(0x148 + 36, 0x60000020)
+
+    // Section 1: `.reloc` (`0x170`, 40B, `INITIALIZED_DATA | DISCARDABLE | READ`)
+    patch_u32_at(0x170 + 0,  0x6C65722E)        // ".rel"
+    out_buf[0x170 + 4] = 'o'
+    out_buf[0x170 + 5] = 'c'
+    patch_u32_at(0x170 + 8,  12)
+    patch_u32_at(0x170 + 12, reloc_rva)
+    patch_u32_at(0x170 + 16, 0x200)
+    patch_u32_at(0x170 + 20, reloc_file_off)
+    patch_u32_at(0x170 + 36, 0x42000040)
+
+    // Section 2: `.bss` (`0x198`, 40B, `UNINITIALIZED_DATA | READ | WRITE`)
+    patch_u32_at(0x198 + 0,  0x7373622E)        // ".bss"
+    patch_u32_at(0x198 + 8,  bss_virt_size)
+    patch_u32_at(0x198 + 12, bss_rva)
+    patch_u32_at(0x198 + 36, 0xC0000080)
+}

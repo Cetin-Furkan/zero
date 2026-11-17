@@ -1,5 +1,5 @@
 // =============================================================================
-// Zero Stage-1 Self-Hosted Compiler — Types, Constants, & Expressions (`compiler/parser_expr.zr`)
+// Zero Stage-1 Self-Hosted Compiler — Expressions & Postfix (`compiler/parser_expr.zr`)
 // =============================================================================
 
 fn peek_kind() i64 => tok_kind[g[G_TOK_IDX]]
@@ -31,7 +31,7 @@ fn expect_ident() i64 {
     return id
 }
 
-// --- Lookup Helpers (`const`, `bitpack`, `@slab`/`@arena`, `fn`, `local`) ---
+// --- Lookup Helpers (`const`, `bitpack`, `space`, `fn`, `local`) ---
 
 fn find_const(sym: i64) i64 {
     cnt := g[G_CST_CNT]
@@ -42,6 +42,12 @@ fn find_const(sym: i64) i64 {
 }
 
 fn find_bitpack(sym: i64) i64 {
+    ut_cnt := g[G_UT_CNT]
+    for i in 0..ut_cnt {
+        if ut_sym[i] == sym && ut_kind[i] == UKIND_BITPACK {
+            return i
+        }
+    }
     cnt := g[G_BP_CNT]
     for i in 0..cnt {
         if bp_sym[i] == sym { return i }
@@ -49,11 +55,11 @@ fn find_bitpack(sym: i64) i64 {
     return -1
 }
 
-fn find_bp_field(bp_idx: i64, fld_sym: i64) i64 {
+fn find_bp_field(bp_idx: i64, target_fsym: i64) i64 {
     fstart: i64 = bp_fstart[bp_idx]
     fcnt: i64   = bp_fcnt[bp_idx]
     for i in 0..fcnt {
-        if bpf_sym[fstart + i] == fld_sym {
+        if bpf_sym[fstart + i] == target_fsym {
             return fstart + i
         }
     }
@@ -73,17 +79,19 @@ fn find_or_add_fn(sym: i64) i64 {
     for i in 0..cnt {
         if fn_sym[i] == sym { return i }
     }
-    fn_sym[cnt]     = sym
-    fn_defined[cnt] = 0
-    fn_ret_ty[cnt]  = TY_VOID
-    fn_arity[cnt]   = 0
-    g[G_FN_CNT]     = cnt + 1
+    fn_sym[cnt]      = sym
+    fn_defined[cnt]  = 0
+    fn_isr_attr[cnt] = 0
+    fn_ret_ty[cnt]   = TY_VOID
+    fn_arity[cnt]    = 0
+    fn_code_len[cnt] = 0
+    g[G_FN_CNT]      = cnt + 1
     return cnt
 }
 
 fn find_local(sym: i64) i64 {
     i := g[G_LOC_CNT] - 1
-    loop <max: 2048 | until: i < 0> {
+    loop <max: 4096 | until: i < 0> {
         if loc_sym[i] == sym { return i }
         i -= 1
     }
@@ -94,7 +102,7 @@ fn alloc_local(sym: i64, ty: i64, line: i64) i64 {
     // Reject duplicate declaration in the same lexical `{}` block
     cur_depth := g[G_SCOPE_DEPTH]
     i := g[G_LOC_CNT] - 1
-    loop <max: 2048 | until: i < 0> {
+    loop <max: 4096 | until: i < 0> {
         if loc_depth[i] < cur_depth { break }
         if loc_sym[i] == sym {
             die_line("error: duplicate variable in same block", line)
@@ -102,8 +110,17 @@ fn alloc_local(sym: i64, ty: i64, line: i64) i64 {
         i -= 1
     }
 
-    qwords: i64 = 1
-    if (ty & TY_FLAG_SPAN) != 0 { qwords = 2 }
+    if is_ty_vec(ty) == 1 {
+        check_avx512_context(line)
+        rem_qw := (g[G_FRAME_QW] + g[G_TEMP_DEPTH]) & 7
+        if rem_qw != 0 {
+            g[G_FRAME_QW] += (8 - rem_qw)
+        }
+    }
+
+    sz     := ty_byte_size(ty)
+    qwords := (sz + 7) >> 3
+    if qwords < 1 { qwords = 1 }
     disp := alloc_anon_qwords(qwords)
 
     idx := g[G_LOC_CNT]
@@ -115,7 +132,7 @@ fn alloc_local(sym: i64, ty: i64, line: i64) i64 {
     return disp
 }
 
-// --- Builtin & User Type Parser ---
+// --- Builtin & User Type Parser & Compile-Time Constant Delegation ---
 
 fn sym_eq_str(sym: i64, s: str) i64 {
     slen: i64 = sym_len[sym]
@@ -127,173 +144,29 @@ fn sym_eq_str(sym: i64, s: str) i64 {
     return 1
 }
 
-fn parse_type_tag() i64 {
-    // `!Fault` error-returning scalar shorthand -> `TY_I64`
-    if peek_kind() == TOK_BANG {
-        g[G_TOK_IDX] += 1
-        expect_ident()
-        return TY_I64
-    }
-    // `[]T` bounded span
-    if peek_kind() == TOK_LBRACK {
-        g[G_TOK_IDX] += 1
-        expect_kind(TOK_RBRACK)
-        elem := parse_type_tag()
-        return (elem & TY_BASE_MASK) | TY_FLAG_SPAN
-    }
-    // `@T` single overlay pointer
-    if peek_kind() == TOK_AT {
-        g[G_TOK_IDX] += 1
-        elem := parse_type_tag()
-        return (elem & TY_BASE_MASK) | TY_FLAG_VIEW1
-    }
-
-    sym := expect_ident()
-    if sym_eq_str(sym, "i64") == 1   { return TY_I64 }
-    if sym_eq_str(sym, "u64") == 1   { return TY_U64 }
-    if sym_eq_str(sym, "i32") == 1   { return TY_I32 }
-    if sym_eq_str(sym, "u32") == 1   { return TY_U32 }
-    if sym_eq_str(sym, "i16") == 1   { return TY_I16 }
-    if sym_eq_str(sym, "u16") == 1   { return TY_U16 }
-    if sym_eq_str(sym, "i8") == 1    { return TY_I8 }
-    if sym_eq_str(sym, "u8") == 1    { return TY_U8 }
-    if sym_eq_str(sym, "str") == 1   { return TY_U8 | TY_FLAG_SPAN }
-    if sym_eq_str(sym, "bytes") == 1 { return TY_U8 | TY_FLAG_SPAN }
-
-    bp := find_bitpack(sym)
-    if bp >= 0 {
-        return TY_BP_BASE + bp
-    }
-    die_cur("error: unknown type")
-    return TY_I64
-}
+fn parse_type_tag() i64 => parse_full_type_tag()
 
 fn parse_bitwidth_ident(sym: i64) i64 {
     slen: i64 = sym_len[sym]
     soff: i64 = sym_off[sym]
     if slen < 2 || str_pool[soff] != 'u' {
-        die_cur("error: expected u1..u64 width in bit-layout")
+        die_cur("error: parse fault (expected u1..u64 width in bit-layout)")
     }
     w: i64 = 0
     for i in 1..slen {
         c: u8 = str_pool[soff + i]
         if c < '0' || c > '9' {
-            die_cur("error: invalid bit-layout width")
+            die_cur("error: parse fault (invalid bit-layout width)")
         }
         w = w * 10 + (c - '0')
     }
     if w < 1 || w > 64 {
-        die_cur("error: bit-layout field width out of 1..64")
+        die_cur("error: parse fault (bit-layout field width out of 1..64)")
     }
     return w
 }
 
-// --- Compile-Time Constant Expression Evaluator (`NAME :: expr`) ---
-
-fn const_prec(k: i64) i64 {
-    if k == TOK_PIPE    { return 1 }
-    if k == TOK_CARET   { return 2 }
-    if k == TOK_AMP     { return 3 }
-    if k == TOK_SHL || k == TOK_SHR || k == TOK_ROL || k == TOK_ROR { return 4 }
-    if k == TOK_PLUS || k == TOK_MINUS { return 5 }
-    if k == TOK_STAR || k == TOK_SLASH || k == TOK_PERCENT { return 6 }
-    return 0
-}
-
-fn eval_const_unary() i64 {
-    k := peek_kind()
-    if k == TOK_MINUS {
-        g[G_TOK_IDX] += 1
-        return -eval_const_unary()
-    }
-    if k == TOK_TILDE {
-        g[G_TOK_IDX] += 1
-        return ~eval_const_unary()
-    }
-    if k == TOK_LPAREN {
-        g[G_TOK_IDX] += 1
-        v := eval_const_expr(1)
-        expect_kind(TOK_RPAREN)
-        return v
-    }
-    if k == TOK_INT || k == TOK_CHAR {
-        v := peek_val()
-        g[G_TOK_IDX] += 1
-        return v
-    }
-    if k == TOK_AT {
-        g[G_TOK_IDX] += 1
-        isym := expect_ident()
-        if isym == g[G_SYM_SIZEOF] {
-            expect_kind(TOK_LPAREN)
-            ty := parse_type_tag()
-            expect_kind(TOK_RPAREN)
-            return ty_byte_size(ty)
-        }
-        if isym == g[G_SYM_ALIGNOF] {
-            expect_kind(TOK_LPAREN)
-            ty := parse_type_tag()
-            expect_kind(TOK_RPAREN)
-            sz := ty_byte_size(ty)
-            if sz > 8 { return 8 }
-            return sz
-        }
-        die_cur("error: unsupported @ intrinsic in constant expression")
-    }
-    if k == TOK_IDENT {
-        sym := expect_ident()
-        ci := find_const(sym)
-        if ci < 0 {
-            die_cur("error: undefined constant identifier")
-        }
-        if cst_done[ci] == 0 {
-            if g[G_CST_TRIAL] == 1 {
-                g[G_CST_UNRES] = 1
-                return 0
-            }
-            die_cur("error: unresolved or cyclic constant")
-        }
-        return cst_val[ci]
-    }
-    die_cur("error: invalid constant expression")
-    return 0
-}
-
-fn eval_const_expr(min_prec: i64) i64 {
-    lhs := eval_const_unary()
-    loop <max: 1024 | until: 0 == 1> {
-        op := peek_kind()
-        prec := const_prec(op)
-        if prec < min_prec { break }
-        g[G_TOK_IDX] += 1
-        rhs := eval_const_expr(prec + 1)
-        if op == TOK_PLUS    { lhs = lhs + rhs }
-        if op == TOK_MINUS   { lhs = lhs - rhs }
-        if op == TOK_STAR    { lhs = lhs * rhs }
-        if op == TOK_SLASH {
-            if rhs == 0 {
-                if g[G_CST_TRIAL] == 1 { return 0 }
-                die_cur("error: division by zero in constant")
-            }
-            lhs = lhs / rhs
-        }
-        if op == TOK_PERCENT {
-            if rhs == 0 {
-                if g[G_CST_TRIAL] == 1 { return 0 }
-                die_cur("error: remainder by zero in constant")
-            }
-            lhs = lhs % rhs
-        }
-        if op == TOK_SHL   { lhs = lhs << rhs }
-        if op == TOK_SHR   { lhs = lhs >> rhs }
-        if op == TOK_ROL   { lhs = lhs <<< rhs }
-        if op == TOK_ROR   { lhs = lhs >>> rhs }
-        if op == TOK_AMP   { lhs = lhs & rhs }
-        if op == TOK_PIPE  { lhs = lhs | rhs }
-        if op == TOK_CARET { lhs = lhs ^ rhs }
-    }
-    return lhs
-}
+fn eval_const_expr(min_prec: i64) i64 => eval_ts_const_expr(min_prec)
 
 // --- Context-Exact `< ... >` Clause Delimiter Helpers (§5.4) ---
 
@@ -337,7 +210,7 @@ fn scan_bitpack_clause_end() i64 {
     idx := g[G_TOK_IDX]
     loop <max: 65536 | until: 0 == 1> {
         k := tok_kind[idx]
-        if k == TOK_EOF { die_cur("error: unclosed bitpack literal") }
+        if k == TOK_EOF { die_cur("error: parse fault (unclosed bitpack literal)") }
         if k == TOK_LPAREN { pdepth += 1  idx += 1  continue }
         if k == TOK_RPAREN { pdepth -= 1  idx += 1  continue }
         if pdepth == 0 {
@@ -354,7 +227,7 @@ fn scan_loop_lens_clause_end() i64 {
     idx := g[G_TOK_IDX]
     loop <max: 65536 | until: 0 == 1> {
         k := tok_kind[idx]
-        if k == TOK_EOF { die_cur("error: unclosed loop lens") }
+        if k == TOK_EOF { die_cur("error: parse fault (unclosed loop lens)") }
         if k == TOK_LPAREN { pdepth += 1  idx += 1  continue }
         if k == TOK_RPAREN { pdepth -= 1  idx += 1  continue }
         if pdepth == 0 {
@@ -372,7 +245,7 @@ fn parse_bounded_expr(end_idx: i64) {
     parse_expr(1)
     tok_kind[end_idx] = saved_k
     if g[G_TOK_IDX] != end_idx {
-        die_cur("error: trailing tokens inside <...> clause")
+        die_cur("error: parse fault (trailing tokens inside <...> clause)")
     }
 }
 
@@ -426,6 +299,20 @@ fn emit_load_arg_regs_hi(cnt: i64, d3: i64, d4: i64, d5: i64) {
     if cnt >= 6 { emit_load_local(d5)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC1) } // r9
 }
 
+fn emit_finish_fn_call(fn_idx: i64) {
+    emit_call_fn_idx(fn_idx)
+    emit_check_call_fault()
+    rty: i64 = fn_ret_ty[fn_idx]
+    if rty == TY_VOID { rty = TY_I64 }
+    if is_ty_vec(rty) == 1 {
+        check_avx512_context(peek_line())
+    }
+    if (rty & TY_FLAG_SPAN) != 0 {
+        emit_unpack_span_ret_rax_rdx()
+    }
+    g[G_LAST_EXPR_TY] = rty
+}
+
 fn parse_fn_call_expr(fn_idx: i64) {
     expect_kind(TOK_LPAREN)
     d0: i64 = 0  d1: i64 = 0  d2: i64 = 0
@@ -433,8 +320,14 @@ fn parse_fn_call_expr(fn_idx: i64) {
     acnt: i64 = 0
     if peek_kind() != TOK_RPAREN {
         loop <max: 8 | until: 0 == 1> {
-            if acnt >= 6 { die_cur("error: maximum 6 call arguments") }
+            if acnt >= 6 { die_cur("error: parse fault (maximum 6 call arguments)") }
             parse_expr(1)
+            if is_ty_vec(g[G_LAST_EXPR_TY]) == 1 {
+                check_avx512_context(peek_line())
+                varg := alloc_anon_qwords(8)
+                emit_zmm0_store_rbp(varg)
+                emit_lea_local(varg)
+            }
             slot := alloc_temp_qword()
             emit_store_local(slot)
             if acnt == 0 { d0 = slot }
@@ -454,222 +347,7 @@ fn parse_fn_call_expr(fn_idx: i64) {
     emit_load_arg_regs_hi(acnt, d3, d4, d5)
     if acnt > 0 { free_temp_qwords(acnt) }
 
-    emit_call_fn_idx(fn_idx)
-    emit_check_call_fault()
-    rty: i64 = fn_ret_ty[fn_idx]
-    if rty == TY_VOID { rty = TY_I64 }
-    g[G_LAST_EXPR_TY] = rty
-}
-
-fn parse_at_expr() {
-    expect_kind(TOK_AT)
-    if peek_kind() == TOK_KW && peek_kw() == KW_SYSCALL {
-        if g[G_MODE_CAPSULE] == 1 {
-            die_cur("error: @syscall unavailable in --target=capsule")
-        }
-        g[G_TOK_IDX] += 1
-        expect_kind(TOK_LPAREN)
-        s0: i64 = 0  s1: i64 = 0  s2: i64 = 0  s3: i64 = 0
-        s4: i64 = 0  s5: i64 = 0  s6: i64 = 0
-        scnt: i64 = 0
-        loop <max: 8 | until: 0 == 1> {
-            if scnt >= 7 { die_cur("error: too many @syscall arguments") }
-            parse_expr(1)
-            slot := alloc_temp_qword()
-            emit_store_local(slot)
-            if scnt == 0 { s0 = slot }
-            if scnt == 1 { s1 = slot }
-            if scnt == 2 { s2 = slot }
-            if scnt == 3 { s3 = slot }
-            if scnt == 4 { s4 = slot }
-            if scnt == 5 { s5 = slot }
-            if scnt == 6 { s6 = slot }
-            scnt += 1
-            if peek_kind() != TOK_COMMA { break }
-            g[G_TOK_IDX] += 1
-        }
-        expect_kind(TOK_RPAREN)
-        if scnt >= 2 { emit_load_local(s1)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC7) } // rdi
-        if scnt >= 3 { emit_load_local(s2)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC6) } // rsi
-        if scnt >= 4 { emit_load_local(s3)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2) } // rdx
-        if scnt >= 5 { emit_load_local(s4)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC2) } // r10
-        if scnt >= 6 { emit_load_local(s5)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0) } // r8
-        if scnt >= 7 { emit_load_local(s6)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC1) } // r9
-        emit_load_local(s0)                                                               // rax = nr
-        free_temp_qwords(scnt)
-        emit_u8(0x0F)  emit_u8(0x05)                                                      // syscall
-        g[G_LAST_EXPR_TY] = TY_I64
-        return
-    }
-
-    sym := expect_ident()
-
-    // `@view<T>(base [, len])`
-    if sym == g[G_SYM_VIEW] {
-        expect_kind(TOK_LT)
-        elem_ty := parse_type_tag() & TY_BASE_MASK
-        expect_kind(TOK_GT)
-        expect_kind(TOK_LPAREN)
-        parse_expr(1)
-        if peek_kind() != TOK_COMMA {
-            expect_kind(TOK_RPAREN)
-            // Null guard: `test rax, rax; jnz ok; fail 3`
-            ok_p := emit_jnz_rel32()
-            emit_raise_fault_imm(3)
-            patch_rel32_here(ok_p)
-            g[G_LAST_EXPR_TY] = elem_ty | TY_FLAG_VIEW1
-            return
-        }
-        g[G_TOK_IDX] += 1
-        span_slot := alloc_anon_qwords(2)
-        emit_store_local(span_slot)
-        parse_expr(1)
-        expect_kind(TOK_RPAREN)
-        // If `len != 0 && base == 0 -> fail 3`
-        zlen_p := emit_jz_rel32()
-        emit_load_local_rcx(span_slot)
-        emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9) // test rcx, rcx
-         emit_u8(0x0F)  emit_u8(0x85)
-        nz_p := g[G_CODE_OFF]
-        emit_u32(0)
-        emit_raise_fault_imm(3)
-        patch_rel32_here(nz_p)
-        patch_rel32_here(zlen_p)
-        emit_store_local(span_slot + 8)
-        emit_lea_local(span_slot)
-        g[G_LAST_EXPR_TY] = elem_ty | TY_FLAG_SPAN
-        return
-    }
-
-    if sym == g[G_SYM_RSP_ALIGN] {
-        expect_kind(TOK_LPAREN)
-        expect_kind(TOK_RPAREN)
-        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xE0)
-        emit_u8(0x83)  emit_u8(0xE0)  emit_u8(0x0F)
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    if sym == g[G_SYM_CRC32C] {
-        expect_kind(TOK_LPAREN)
-        parse_expr(1)
-        t := alloc_temp_qword()
-        emit_store_local(t)
-        expect_kind(TOK_COMMA)
-        parse_expr(1)
-        expect_kind(TOK_RPAREN)
-        emit_load_local_rcx(t)
-        free_temp_qwords(1)
-        emit_u8(0x48)  emit_u8(0x91)                                        // xchg rax, rcx
-        emit_u8(0xF2)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0x38)  emit_u8(0xF1)  emit_u8(0xC1)
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    if sym == g[G_SYM_POPCNT] {
-        expect_kind(TOK_LPAREN)
-        parse_expr(1)
-        expect_kind(TOK_RPAREN)
-        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xB8)  emit_u8(0xC0)
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    if sym == g[G_SYM_LZCNT] {
-        expect_kind(TOK_LPAREN)
-        parse_expr(1)
-        expect_kind(TOK_RPAREN)
-        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBD)  emit_u8(0xC0)
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    if sym == g[G_SYM_TZCNT] {
-        expect_kind(TOK_LPAREN)
-        parse_expr(1)
-        expect_kind(TOK_RPAREN)
-        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBC)  emit_u8(0xC0)
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    if sym == g[G_SYM_RID] {
-        if g[G_MODE_CAPSULE] == 0 {
-            die_cur("error: @reactor_id requires --target=capsule")
-        }
-        expect_kind(TOK_LPAREN)
-        expect_kind(TOK_RPAREN)
-        emit_u8(0x4C)  emit_u8(0x89)  emit_u8(0xE0) // mov rax, r12
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    if sym == g[G_SYM_FN_ADDR] {
-        expect_kind(TOK_LPAREN)
-        fsym := expect_ident()
-        fidx := find_or_add_fn(fsym)
-        expect_kind(TOK_RPAREN)
-        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x05) // lea rax, [rip + rel32]
-        fx := g[G_CALL_FIX_CNT]
-        call_fix_off[fx] = g[G_CODE_OFF]
-        call_fix_fn[fx]  = fidx
-        g[G_CALL_FIX_CNT] = fx + 1
-        emit_u32(0)
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    if sym == g[G_SYM_CALL] {
-        expect_kind(TOK_LPAREN)
-        parse_expr(1)
-        fn_ptr_slot := alloc_temp_qword()
-        emit_store_local(fn_ptr_slot)
-        d0: i64 = 0  d1: i64 = 0  d2: i64 = 0
-        d3: i64 = 0  d4: i64 = 0  d5: i64 = 0
-        acnt: i64 = 0
-        if peek_kind() == TOK_COMMA {
-            g[G_TOK_IDX] += 1
-            loop <max: 8 | until: 0 == 1> {
-                if acnt >= 6 { die_cur("error: maximum 6 @call arguments") }
-                parse_expr(1)
-                slot := alloc_temp_qword()
-                emit_store_local(slot)
-                if acnt == 0 { d0 = slot }
-                if acnt == 1 { d1 = slot }
-                if acnt == 2 { d2 = slot }
-                if acnt == 3 { d3 = slot }
-                if acnt == 4 { d4 = slot }
-                if acnt == 5 { d5 = slot }
-                acnt += 1
-                if peek_kind() != TOK_COMMA { break }
-                g[G_TOK_IDX] += 1
-            }
-        }
-        expect_kind(TOK_RPAREN)
-        emit_load_local(fn_ptr_slot)
-        ok_fn := emit_jnz_rel32()
-        emit_raise_fault_imm(3)
-        patch_rel32_here(ok_fn)
-        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC3) // mov r11, rax
-        emit_load_arg_regs_lo(acnt, d0, d1, d2)
-        emit_load_arg_regs_hi(acnt, d3, d4, d5)
-        free_temp_qwords(acnt + 1)
-        emit_u8(0x41)  emit_u8(0xFF)  emit_u8(0xD3) // call r11
-        emit_check_call_fault()
-        g[G_LAST_EXPR_TY] = TY_I64
-        return
-    }
-
-    if sym == g[G_SYM_SIZEOF] {
-        expect_kind(TOK_LPAREN)
-        ty := parse_type_tag()
-        expect_kind(TOK_RPAREN)
-        emit_mov_rax_imm64(ty_byte_size(ty))
-        g[G_LAST_EXPR_TY] = TY_U64
-        return
-    }
-
-    die_cur("error: unknown @ intrinsic")
+    emit_finish_fn_call(fn_idx)
 }
 
 fn parse_primary() {
@@ -696,16 +374,16 @@ fn parse_primary() {
         if kw == KW_TRUE {
             g[G_TOK_IDX] += 1
             emit_mov_rax_imm64(1)
-            g[G_LAST_EXPR_TY] = TY_I64
+            g[G_LAST_EXPR_TY] = TY_U8
             return
         }
         if kw == KW_FALSE {
             g[G_TOK_IDX] += 1
             emit_mov_rax_imm64(0)
-            g[G_LAST_EXPR_TY] = TY_I64
+            g[G_LAST_EXPR_TY] = TY_U8
             return
         }
-        die_cur("error: unexpected keyword in expression")
+        die_cur("error: parse fault (unexpected keyword in expression)")
     }
 
     if k == TOK_LPAREN {
@@ -721,108 +399,96 @@ fn parse_primary() {
     }
 
     if k == TOK_IDENT {
-        sym := expect_ident()
+        id_line := peek_line()
+        sym     := expect_ident()
 
-        // 1. Direct function call `fn_name(...)`
+        // 1. Direct call (`publish(...)`, `wait(...)`, or `fn_name(...)`)
         if peek_kind() == TOK_LPAREN {
+            if sym == g[G_SYM_PUBLISH] {
+                parse_publish_call(id_line)
+                return
+            }
+            if sym == g[G_SYM_WAIT] {
+                parse_wait_call(id_line)
+                return
+            }
             fidx := find_or_add_fn(sym)
             parse_fn_call_expr(fidx)
             return
         }
 
-        // 2. BitPack constructor `BpType<f0: e0 | f1: e1>`
-        bp := find_bitpack(sym)
-        if bp >= 0 && is_descriptor_lt_at(g[G_TOK_IDX]) == 1 {
-            expect_kind(TOK_LT)
-            acc_slot := alloc_temp_qword()
-            emit_mov_rax_imm64(0)
-            emit_store_local(acc_slot)
-            loop <max: 64 | until: 0 == 1> {
-                fsym := expect_ident()
-                expect_kind(TOK_COLON)
-                fidx := find_bp_field(bp, fsym)
-                if fidx < 0 { die_cur("error: unknown bitpack field") }
-                end_i := scan_bitpack_clause_end()
-                parse_bounded_expr(end_i)
-                f_w: i64  = bpf_width[fidx]
-                f_sh: i64 = bpf_shift[fidx]
-                if f_w < 64 {
-                    emit_mov_rcx_imm64(width_mask64(f_w))
-                    emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8)
-                }
-                if f_sh > 0 {
-                    emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(f_sh)
-                }
-                emit_load_local_rcx(acc_slot)
-                emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xC8)     // or rax, rcx
-                emit_store_local(acc_slot)
-                if peek_kind() != TOK_PIPE { break }
-                g[G_TOK_IDX] += 1
+        // 2. User Type Literals: `Struct{ ... }` or `BitPack<f0: e0 | ...>`
+        ut_idx := find_user_type(sym)
+        if ut_idx >= 0 {
+            uk: i64 = ut_kind[ut_idx]
+            if (uk == UKIND_STRUCT || uk == UKIND_CELL64) && peek_kind() == TOK_LBRACE {
+                parse_struct_literal_expr(ut_idx)
+                return
             }
-            expect_kind(TOK_GT)
-            emit_load_local(acc_slot)
-            free_temp_qwords(1)
-            g[G_LAST_EXPR_TY] = TY_BP_BASE + bp
-            return
+            if uk == UKIND_BITPACK && is_descriptor_lt_at(g[G_TOK_IDX]) == 1 {
+                expect_kind(TOK_LT)
+                acc_slot := alloc_temp_qword()
+                emit_mov_rax_imm64(0)
+                emit_store_local(acc_slot)
+                loop <max: 64 | until: 0 == 1> {
+                    fsym := expect_ident()
+                    expect_kind(TOK_COLON)
+                    fidx := find_bp_field(ut_idx, fsym)
+                    if fidx < 0 { die_cur("error: parse fault (unknown bitpack field)") }
+                    end_i := scan_bitpack_clause_end()
+                    parse_bounded_expr(end_i)
+                    f_w: i64  = bpf_width[fidx]
+                    f_sh: i64 = bpf_shift[fidx]
+                    if f_w < 64 {
+                        emit_mov_rcx_imm64(width_mask64(f_w))
+                        emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8)
+                    }
+                    if f_sh > 0 {
+                        emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(f_sh)
+                    }
+                    emit_load_local_rcx(acc_slot)
+                    emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xC8) // or rax, rcx
+                    emit_store_local(acc_slot)
+                    if peek_kind() != TOK_PIPE { break }
+                    g[G_TOK_IDX] += 1
+                }
+                expect_kind(TOK_GT)
+                emit_load_local(acc_slot)
+                free_temp_qwords(1)
+                g[G_LAST_EXPR_TY] = TY_BP_BASE + ut_idx
+                return
+            }
         }
 
-        // 3. Local variable
+        // 3. Lexically scoped local variable (respects shadowing over spaces & constants)
         li := find_local(sym)
         if li >= 0 {
             lty: i64   = loc_ty[li]
             ldisp: i64 = loc_disp[li]
-            if (lty & TY_FLAG_SPAN) != 0 {
-                emit_lea_local(ldisp)
-            } else {
-                emit_load_local(ldisp)
+            if is_ty_vec(lty) == 1 {
+                check_avx512_context(id_line)
+                emit_zmm0_load_rbp(ldisp)
+                g[G_LAST_EXPR_TY] = lty
+                return
             }
+            if (lty & TY_FLAG_SPAN) != 0 || is_struct_value_ty(lty) == 1 {
+                emit_lea_local(ldisp)
+                g[G_LAST_EXPR_TY] = lty
+                return
+            }
+            emit_load_local(ldisp)
             g[G_LAST_EXPR_TY] = lty
             return
         }
 
-        // 4. `@slab` / `@arena` space
+        // 4. Topological Space (`@slab`, `@arena`, `@capsule`, `@ring`, `@dma_queue`, `@port`)
         si := find_space(sym)
         if si >= 0 {
-            if peek_kind() == TOK_DOT {
-                g[G_TOK_IDX] += 1
-                psym := expect_ident()
-                if psym == g[G_SYM_BASE] {
-                    emit_mov_rax_imm64(sp_vaddr[si])
-                    g[G_LAST_EXPR_TY] = TY_U64
-                    return
-                }
-                if psym == g[G_SYM_CAP] || psym == g[G_SYM_MAX] || psym == g[G_SYM_LEN] {
-                    emit_mov_rax_imm64(sp_cap[si])
-                    g[G_LAST_EXPR_TY] = TY_U64
-                    return
-                }
-                die_cur("error: unknown space property")
-            }
-            expect_kind(TOK_LBRACK)
-            parse_expr(1)
-            expect_kind(TOK_RBRACK)
-            // Unsigned bounds check `idx >= cap -> fail 2`
-            emit_mov_rcx_imm64(sp_cap[si])
-            emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
-            emit_u8(0x0F)  emit_u8(0x82)                // jb .in_bounds
-            ib_p := g[G_CODE_OFF]
-            emit_u32(0)
-            emit_raise_fault_imm(2)
-            patch_rel32_here(ib_p)
-
-            esz: i64 = sp_elem_sz[si]
-            if esz == 2 { emit_u8(0x48)  emit_u8(0xD1)  emit_u8(0xE0) }
-            if esz == 4 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(2) }
-            if esz == 8 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(3) }
-            emit_mov_rcx_imm64(sp_vaddr[si])
-            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
-            ety: i64 = sp_elem_ty[si]
-            emit_load_mem_typed(ety)
-            g[G_LAST_EXPR_TY] = ety
+            parse_space_rval_expr(si)
             return
         }
 
-        // 5. Compile-time constant
+        // 5. Compile-time `::` constant
         ci := find_const(sym)
         if ci >= 0 {
             emit_mov_rax_imm64(cst_val[ci])
@@ -830,107 +496,256 @@ fn parse_primary() {
             return
         }
 
-        die_cur("error: undefined identifier")
+        die_line("error: parse fault (undefined identifier)", id_line)
     }
 
     die_cur("error: parse fault in primary expression")
 }
 
+// Walks one `.field` step on a struct address in `rax` (`ut_idx = struct index`)
+fn pe_emit_struct_field_step(ut_idx: i64, fsym: i64) {
+    fi := find_struct_field(ut_idx, fsym)
+    if fi < 0 {
+        die_cur("error: parse fault (unknown struct field)")
+    }
+    foff: i64 = fld_off[fi]
+    fty: i64  = fld_ty[fi]
+    if foff != 0 {
+        emit_add_rax_imm(foff)
+    }
+    if is_ty_vec(fty) == 1 {
+        check_avx512_context(peek_line())
+    }
+    if (fty & TY_FLAG_SPAN) == 0 {
+        emit_load_mem_typed(fty)
+    }
+    g[G_LAST_EXPR_TY] = fty
+}
+
+// Lookahead for inline `@view<Struct>(addr).field = ...` statement lvalues
+fn pe_is_dot_chain_assign_ahead() i64 {
+    idx: i64 = g[G_TOK_IDX]
+    cnt: i64 = g[G_TOK_CNT]
+    if idx >= cnt || tok_kind[idx] != TOK_DOT { return 0 }
+    loop <max: 64 | until: idx >= cnt> {
+        tk: i64 = tok_kind[idx]
+        if tk == TOK_DOT {
+            idx += 1
+            if idx >= cnt { return 0 }
+            tk2: i64 = tok_kind[idx]
+            if tk2 != TOK_IDENT && tk2 != TOK_KW { return 0 }
+            idx += 1
+            continue
+        }
+        if tk == TOK_LBRACK {
+            bdep: i64 = 1
+            idx += 1
+            loop <max: 256 | until: idx >= cnt || bdep == 0> {
+                bk: i64 = tok_kind[idx]
+                if bk == TOK_LBRACK { bdep += 1 }
+                if bk == TOK_RBRACK { bdep -= 1 }
+                idx += 1
+            }
+            if bdep != 0 { return 0 }
+            continue
+        }
+        if tk == TOK_ASSIGN || (tk >= TOK_PLUS_EQ && tk <= TOK_ROR_EQ) {
+            return 1
+        }
+        return 0
+    }
+    return 0
+}
+
 fn parse_postfix() {
     parse_primary()
     loop <max: 64 | until: 0 == 1> {
-        ty := g[G_LAST_EXPR_TY]
-        k  := peek_kind()
+        ty   := g[G_LAST_EXPR_TY]
+        base := ty & TY_BASE_MASK
+        k    := peek_kind()
 
         if k == TOK_DOT {
+            if (ty & TY_FLAG_VIEW1) != 0 && base >= TY_STRUCT_BASE && base < TY_PTR_BASE {
+                if pe_is_dot_chain_assign_ahead() == 1 {
+                    return
+                }
+            }
             g[G_TOK_IDX] += 1
+
+            // 1. `@atomic<T>` method (`.load()`, `.store(v)`, `.swap(v)`, `.add(v)`, `.sub(v)`, `.cas(e, d)`)
+            if (ty & TY_FLAG_ATOMIC) != 0 {
+                parse_atomic_method_from_rax(ty)
+                continue
+            }
+
             fsym := expect_ident()
+
+            // 2. Bounded span (`str`, `bytes`, `[]T`, `@view(a,n)`, `@mmio(a,n)`, `@stream(a,n)`)
             if (ty & TY_FLAG_SPAN) != 0 {
                 if fsym == g[G_SYM_PTR] || fsym == g[G_SYM_BASE] {
                     emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x00) // mov rax, [rax]
                     g[G_LAST_EXPR_TY] = TY_U64
                     continue
                 }
-                if fsym == g[G_SYM_LEN] {
+                if fsym == g[G_SYM_LEN] || fsym == g[G_SYM_MAX] || fsym == g[G_SYM_CAP] {
                     emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x40)  emit_u8(8) // mov rax, [rax+8]
                     g[G_LAST_EXPR_TY] = TY_U64
                     continue
                 }
-                die_cur("error: unknown span property")
+                die_cur("error: parse fault (unknown span property)")
             }
-            base := ty & TY_BASE_MASK
+
+            // 3. 1-arg `@Type` / `@view<T>(addr)` / `@mmio<T>(addr)` overlay
+            if (ty & TY_FLAG_VIEW1) != 0 {
+                if (ty & TY_FLAG_MMIO) == 0 {
+                    emit_null_check_rax()
+                }
+                if base >= TY_STRUCT_BASE && base < TY_PTR_BASE {
+                    pe_emit_struct_field_step(base - TY_STRUCT_BASE, fsym)
+                    continue
+                }
+                if fsym == g[G_SYM_READ] {
+                    expect_kind(TOK_LPAREN)
+                    expect_kind(TOK_RPAREN)
+                    if is_ty_vec(base) == 1 {
+                        check_avx512_context(peek_line())
+                    }
+                    emit_load_mem_typed(base)
+                    g[G_LAST_EXPR_TY] = base
+                    continue
+                }
+                if fsym == g[G_SYM_WRITE] {
+                    if is_ty_vec(base) == 1 {
+                        check_avx512_context(peek_line())
+                    }
+                    addr_t := alloc_temp_qword()
+                    emit_store_local(addr_t)
+                    expect_kind(TOK_LPAREN)
+                    parse_expr(1)
+                    expect_kind(TOK_RPAREN)
+                    emit_load_local_rcx(addr_t)
+                    free_temp_qwords(1)
+                    emit_store_mem_typed(base)
+                    g[G_LAST_EXPR_TY] = TY_U64
+                    continue
+                }
+                die_cur("error: parse fault (unknown @view/@mmio method)")
+            }
+
+            // 4. Custom `@ptr<...>` `.raw`
+            if base >= TY_PTR_BASE {
+                if fsym != g[G_SYM_RAW] {
+                    die_cur("error: parse fault (unknown @ptr property)")
+                }
+                g[G_LAST_EXPR_TY] = TY_U64
+                continue
+            }
+
+            // 5. Struct / `@cell64` value `.field` (`rax` = `&struct`)
+            if base >= TY_STRUCT_BASE {
+                pe_emit_struct_field_step(base - TY_STRUCT_BASE, fsym)
+                continue
+            }
+
+            // 6. BitPack `.field` extraction
             if base >= TY_BP_BASE {
                 fidx := find_bp_field(base - TY_BP_BASE, fsym)
-                if fidx < 0 { die_cur("error: unknown bitpack field") }
+                if fidx < 0 { die_cur("error: parse fault (unknown bitpack field)") }
                 emit_extract_bits(bpf_shift[fidx], bpf_width[fidx])
                 continue
             }
-            die_cur("error: invalid member access")
+
+            die_cur("error: parse fault (invalid member access)")
         }
 
         if k == TOK_LBRACK {
+            // 1. Span element `span[idx]` or sub-slice `span[lo..hi]`
             if (ty & TY_FLAG_SPAN) != 0 {
                 span_ptr_t := alloc_temp_qword()
                 emit_store_local(span_ptr_t)
                 g[G_TOK_IDX] += 1
                 parse_expr(1)
+                if peek_kind() == TOK_DOT2 {
+                    parse_span_subslice_from_slot(span_ptr_t, ty)
+                    continue
+                }
                 expect_kind(TOK_RBRACK)
-                // `rcx = span_ptr`, check `rax < [rcx + 8]` (`fail 2`)
+
                 emit_load_local_rcx(span_ptr_t)
                 emit_u8(0x48)  emit_u8(0x3B)  emit_u8(0x41)  emit_u8(8) // cmp rax, [rcx+8]
-                emit_u8(0x0F)  emit_u8(0x82)
+                emit_u8(0x0F)  emit_u8(0x82)                            // jb .ok
                 ok_b := g[G_CODE_OFF]
                 emit_u32(0)
                 emit_raise_fault_imm(2)
                 patch_rel32_here(ok_b)
 
-                ety := ty & TY_BASE_MASK
-                esz := ty_byte_size(ety)
-                if esz == 2 { emit_u8(0x48)  emit_u8(0xD1)  emit_u8(0xE0) }
-                if esz == 4 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(2) }
-                if esz == 8 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(3) }
+                esz := ty_byte_size(base)
+                emit_scale_rax(esz)
                 emit_load_local_rcx(span_ptr_t)
                 free_temp_qwords(1)
-                emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x09)             // mov rcx, [rcx]
-                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)             // add rax, rcx
-                emit_load_mem_typed(ety)
-                g[G_LAST_EXPR_TY] = ety
+                emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x09) // mov rcx, [rcx]
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+                if is_ty_vec(base) == 1 {
+                    check_avx512_context(peek_line())
+                }
+                if (base & TY_FLAG_SPAN) == 0 {
+                    emit_load_mem_typed(base)
+                }
+                g[G_LAST_EXPR_TY] = base
                 continue
             }
 
+            // 2. 1-arg `@view<T>(addr)` / `@mmio<T>(addr)` indexed access
             if (ty & TY_FLAG_VIEW1) != 0 {
+                if (ty & TY_FLAG_MMIO) == 0 {
+                    emit_null_check_rax()
+                }
                 ptr_t := alloc_temp_qword()
                 emit_store_local(ptr_t)
                 g[G_TOK_IDX] += 1
                 parse_expr(1)
                 expect_kind(TOK_RBRACK)
-                ety := ty & TY_BASE_MASK
-                esz := ty_byte_size(ety)
-                if esz == 2 { emit_u8(0x48)  emit_u8(0xD1)  emit_u8(0xE0) }
-                if esz == 4 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(2) }
-                if esz == 8 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(3) }
+                esz := ty_byte_size(base)
+                emit_scale_rax(esz)
                 emit_load_local_rcx(ptr_t)
                 free_temp_qwords(1)
                 emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                if is_ty_vec(base) == 1 {
+                    check_avx512_context(peek_line())
+                }
+                emit_load_mem_typed(base)
+                g[G_LAST_EXPR_TY] = base
+                continue
+            }
+
+            // 3. Custom `@ptr<...>` indexed load (`mask` + `wrap` + `stride` + `bswap`)
+            if is_custom_ptr_ty(ty) == 1 {
+                ut_p := base - TY_PTR_BASE
+                emit_custom_ptr_elem_addr_from_rax(ut_p)
+                ety: i64 = ptr_elem_ty[ut_p]
+                if is_ty_vec(ety) == 1 {
+                    check_avx512_context(peek_line())
+                }
                 emit_load_mem_typed(ety)
+                if is_struct_value_ty(ety) == 0 && is_ty_vec(ety) == 0 && ptr_bswap[ut_p] == 1 {
+                    emit_bswap_for_ty(ety)
+                }
                 g[G_LAST_EXPR_TY] = ety
                 continue
             }
 
-            // Hardware integer bit-slice `val[hi:lo]`
+            // 4. Reject `[...]` on bare structs, SIMD vectors, or `@atomic`
+            if (ty & TY_FLAG_ATOMIC) != 0 || base >= TY_STRUCT_BASE || is_ty_vec(ty) == 1 {
+                die_cur("error: parse fault (cannot index struct, SIMD vector, or @atomic)")
+            }
+
+            // 5. Hardware scalar bit-slice `val[hi:lo]`
             val_t := alloc_temp_qword()
             emit_store_local(val_t)
-            g[G_TOK_IDX] += 1
-            hi := eval_const_expr(1)
-            expect_kind(TOK_COLON)
-            lo := eval_const_expr(1)
-            expect_kind(TOK_RBRACK)
-            if lo < 0 || hi > 63 || hi < lo {
-                die_cur("error: invalid [hi:lo] bit-slice bounds")
-            }
+            packed_bs := parse_bitslice_bounds()
             emit_load_local(val_t)
             free_temp_qwords(1)
-            emit_extract_bits(lo, hi - lo + 1)
+            emit_extract_bits(packed_bs & 0xFF, packed_bs >> 8)
             continue
         }
 
@@ -941,21 +756,47 @@ fn parse_postfix() {
 fn parse_unary() {
     k := peek_kind()
     if k == TOK_MINUS {
+        uline := peek_line()
         g[G_TOK_IDX] += 1
         parse_unary()
+        uty := g[G_LAST_EXPR_TY]
+        if is_ty_vec(uty) == 1 {
+            check_avx512_context(uline)
+            is_64 := 0
+            if uty == TY_U64X8 { is_64 = 1 }
+            emit_zmm1_from_zmm0()
+            emit_zmm_binop(TOK_CARET, 1, 0, 0, 0) // vpxorq zmm0, zmm0, zmm0
+            emit_zmm0_binop(TOK_MINUS, is_64)     // zmm0 = 0 - zmm1
+            g[G_LAST_EXPR_TY] = uty
+            return
+        }
         emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD8) // neg rax
         g[G_LAST_EXPR_TY] = TY_I64
         return
     }
     if k == TOK_TILDE {
+        uline := peek_line()
         g[G_TOK_IDX] += 1
         parse_unary()
-        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD0) // not rax
+        uty := g[G_LAST_EXPR_TY]
+        if is_ty_vec(uty) == 1 {
+            check_avx512_context(uline)
+            emit_zmm1_from_zmm0()
+            emit_mov_rax_imm64(-1)
+            emit_zmm0_splat64_rax()
+            emit_zmm0_binop(TOK_CARET, 1)         // vpxorq zmm0, all1s, zmm1
+            g[G_LAST_EXPR_TY] = uty
+            return
+        }
+        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD0) // not rax (preserves signedness)
         return
     }
     if k == TOK_BANG {
         g[G_TOK_IDX] += 1
         parse_unary()
+        if is_ty_vec(g[G_LAST_EXPR_TY]) == 1 {
+            die_cur("error: parse fault (logical '!' unsupported on SIMD vector)")
+        }
         emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0) // test rax, rax
         emit_u8(0x0F)  emit_u8(0x94)  emit_u8(0xC0) // sete al
         emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0xC0) // movzx eax, al
@@ -967,8 +808,8 @@ fn parse_unary() {
 
 fn emit_div_or_mod(is_mod: i64, both_uns: i64) {
     // `rax` = dividend, `rcx` = divisor; `rcx == 0 -> fail 1`
-    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9)     // test rcx, rcx
-    emit_u8(0x0F)  emit_u8(0x85)                    // jnz .ok
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9) // test rcx, rcx
+    emit_u8(0x0F)  emit_u8(0x85)                // jnz .ok
     nz_pos := g[G_CODE_OFF]
     emit_u32(0)
     emit_raise_fault_imm(1)
@@ -988,17 +829,116 @@ fn emit_div_or_mod(is_mod: i64, both_uns: i64) {
         if is_mod == 1 {
             emit_mov_rax_imm64(0)
         } else {
-            emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD8)            // neg rax
+            emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD8) // neg rax
         }
         done_p := emit_jmp_rel32()
         patch_rel32_here(idiv_p)
-        emit_u8(0x48)  emit_u8(0x99)                               // cqo
-        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xF9)                // idiv rcx
+        emit_u8(0x48)  emit_u8(0x99)                    // cqo
+        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xF9)     // idiv rcx
         if is_mod == 1 {
-            emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xD0)            // mov rax, rdx
+            emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xD0) // mov rax, rdx
         }
         patch_rel32_here(done_p)
     }
+}
+
+fn pe_try_vec_shift_imm(op: i64, prec: i64, is_64: i64) i64 {
+    idx := g[G_TOK_IDX]
+    tk  := tok_kind[idx]
+    nk  := tok_kind[idx + 1]
+    imm: i64 = 0
+
+    if nk == TOK_LPAREN || nk == TOK_LBRACK || nk == TOK_DOT || nk == TOK_LBRACE {
+        return 0
+    }
+    if tk == TOK_INT || tk == TOK_CHAR {
+        imm = tok_val[idx]
+    } else {
+        if tk != TOK_IDENT || nk == TOK_LT { return 0 }
+        sym := tok_val[idx]
+        if find_local(sym) >= 0 { return 0 }
+        if find_space(sym) >= 0 { return 0 }
+        ci := find_const(sym)
+        if ci < 0 || cst_done[ci] == 0 { return 0 }
+        imm = cst_val[ci]
+    }
+    if binop_prec(idx + 1) > prec { return 0 }
+    if imm < 0 || imm > 63 { return 0 }
+
+    if op == TOK_SHL {
+        emit_zmm0_shl_imm(imm, is_64)
+    } else {
+        emit_zmm0_shr_imm(imm, is_64)
+    }
+    g[G_TOK_IDX] = idx + 1
+    return 1
+}
+
+fn pe_emit_vec_binop_step(op: i64, prec: i64, lhs_ty: i64) {
+    is_64 := 0
+    if lhs_ty == TY_U64X8 { is_64 = 1 }
+
+    // 1. Shifts `<<` / `>>`: immediate `0..63`, per-lane vector, or dynamic scalar count
+    if op == TOK_SHL || op == TOK_SHR {
+        if pe_try_vec_shift_imm(op, prec, is_64) == 1 {
+            g[G_LAST_EXPR_TY] = lhs_ty
+            return
+        }
+        vslot := alloc_temp_vec()
+        emit_zmm0_store_rbp(vslot)
+        parse_expr(prec + 1)
+        rty := g[G_LAST_EXPR_TY]
+        if rty == lhs_ty {
+            emit_zmm1_from_zmm0()
+            emit_zmm0_load_rbp(vslot)
+            free_temp_vec()
+            if op == TOK_SHL { emit_zmm0_shlv(is_64) } else { emit_zmm0_shrv(is_64) }
+            g[G_LAST_EXPR_TY] = lhs_ty
+            return
+        }
+        if is_ty_vec(rty) == 1 || (rty & TY_FLAG_SPAN) != 0 || is_struct_value_ty(rty) == 1 {
+            die_cur("error: parse fault (invalid SIMD vector shift count type)")
+        }
+        emit_zmm0_load_rbp(vslot)
+        free_temp_vec()
+        if op == TOK_SHL { emit_zmm0_shl_rax(is_64) } else { emit_zmm0_shr_rax(is_64) }
+        g[G_LAST_EXPR_TY] = lhs_ty
+        return
+    }
+
+    // 2. Lane-wise vector ALU (`+`, `-`, `*`, `&`, `|`, `^`)
+    if op == TOK_PLUS || op == TOK_MINUS || op == TOK_STAR || op == TOK_AMP || op == TOK_PIPE || op == TOK_CARET {
+        idx := g[G_TOK_IDX]
+        if tok_kind[idx] == TOK_IDENT {
+            nk := tok_kind[idx + 1]
+            if nk != TOK_LPAREN && nk != TOK_LBRACK && nk != TOK_DOT && nk != TOK_LBRACE && nk != TOK_LT {
+                if binop_prec(idx + 1) <= prec {
+                    rli := find_local(tok_val[idx])
+                    if rli >= 0 && loc_ty[rli] == lhs_ty {
+                        g[G_TOK_IDX] = idx + 1
+                        emit_zmm1_load_rbp(loc_disp[rli])
+                        emit_zmm0_binop(op, is_64)
+                        g[G_LAST_EXPR_TY] = lhs_ty
+                        return
+                    }
+                }
+            }
+        }
+        vslot := alloc_temp_vec()
+        emit_zmm0_store_rbp(vslot)
+        parse_expr(prec + 1)
+        if g[G_LAST_EXPR_TY] != lhs_ty {
+            die_cur("error: parse fault (mismatched SIMD vector types in binary expression)")
+        }
+        emit_zmm1_from_zmm0()
+        emit_zmm0_load_rbp(vslot)
+        free_temp_vec()
+        emit_zmm0_binop(op, is_64)
+        g[G_LAST_EXPR_TY] = lhs_ty
+        return
+    }
+
+    die_cur("error: parse fault (unsupported binary operator on SIMD vector)")
 }
 
 fn parse_expr(min_prec: i64) {
@@ -1014,6 +954,12 @@ fn parse_expr(min_prec: i64) {
 
         // 1. Pipeline `lhs |> fn_name[(arg1, ...)]`
         if op == TOK_PIPE_GT {
+            if is_ty_vec(lhs_ty) == 1 {
+                check_avx512_context(tok_line[cur_i])
+                vp0 := alloc_anon_qwords(8)
+                emit_zmm0_store_rbp(vp0)
+                emit_lea_local(vp0)
+            }
             d0 := alloc_temp_qword()
             emit_store_local(d0)
             d1: i64 = 0  d2: i64 = 0  d3: i64 = 0  d4: i64 = 0  d5: i64 = 0
@@ -1024,8 +970,14 @@ fn parse_expr(min_prec: i64) {
                 g[G_TOK_IDX] += 1
                 if peek_kind() != TOK_RPAREN {
                     loop <max: 8 | until: 0 == 1> {
-                        if acnt >= 6 { die_cur("error: maximum 6 |> arguments") }
+                        if acnt >= 6 { die_cur("error: parse fault (maximum 6 |> arguments)") }
                         parse_expr(2)
+                        if is_ty_vec(g[G_LAST_EXPR_TY]) == 1 {
+                            check_avx512_context(peek_line())
+                            vpa := alloc_anon_qwords(8)
+                            emit_zmm0_store_rbp(vpa)
+                            emit_lea_local(vpa)
+                        }
                         slot := alloc_temp_qword()
                         emit_store_local(slot)
                         if acnt == 1 { d1 = slot }
@@ -1043,11 +995,14 @@ fn parse_expr(min_prec: i64) {
             emit_load_arg_regs_lo(acnt, d0, d1, d2)
             emit_load_arg_regs_hi(acnt, d3, d4, d5)
             free_temp_qwords(acnt)
-            emit_call_fn_idx(fidx)
-            emit_check_call_fault()
-            rty: i64 = fn_ret_ty[fidx]
-            if rty == TY_VOID { rty = TY_I64 }
-            g[G_LAST_EXPR_TY] = rty
+            emit_finish_fn_call(fidx)
+            continue
+        }
+
+        // 1b. 512-bit AVX-512 (`u32x16` / `u64x8`) vector binary operators
+        if is_ty_vec(lhs_ty) == 1 {
+            check_avx512_context(tok_line[cur_i])
+            pe_emit_vec_binop_step(op, prec, lhs_ty)
             continue
         }
 
@@ -1081,11 +1036,22 @@ fn parse_expr(min_prec: i64) {
             continue
         }
 
-        // 4. General binary operator: save LHS in temp slot, evaluate RHS -> `rcx`, reload LHS -> `rax`
+        // 4. Precedence-safe compact immediate-RHS & local-RHS instruction selectors
+        if try_emit_imm_rhs_binop(op, prec, lhs_ty) == 1 {
+            continue
+        }
+        if try_emit_local_rhs_binop(op, prec, lhs_ty) == 1 {
+            continue
+        }
+
+        // 5. General binary operator: save LHS in temp slot, evaluate RHS -> `rcx`, reload LHS -> `rax`
         lhs_slot := alloc_temp_qword()
         emit_store_local(lhs_slot)
         parse_expr(prec + 1)
         rhs_ty := g[G_LAST_EXPR_TY]
+        if is_ty_vec(rhs_ty) == 1 {
+            die_cur("error: parse fault (cannot mix scalar LHS and SIMD vector RHS)")
+        }
         emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC1) // mov rcx, rax (RHS)
         emit_load_local(lhs_slot)                   // rax = LHS
         free_temp_qwords(1)
@@ -1099,17 +1065,17 @@ fn parse_expr(min_prec: i64) {
         if both_u == 1 { out_ty = TY_U64 }
 
         if op == TOK_PLUS {
-            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
             g[G_LAST_EXPR_TY] = out_ty
             continue
         }
         if op == TOK_MINUS {
-            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx
+            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8)
             g[G_LAST_EXPR_TY] = out_ty
             continue
         }
         if op == TOK_STAR {
-            emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xAF)  emit_u8(0xC1) // imul rax, rcx
+            emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xAF)  emit_u8(0xC1)
             g[G_LAST_EXPR_TY] = out_ty
             continue
         }
@@ -1124,22 +1090,22 @@ fn parse_expr(min_prec: i64) {
             continue
         }
         if op == TOK_AMP {
-            emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8) // and rax, rcx
+            emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8)
             g[G_LAST_EXPR_TY] = out_ty
             continue
         }
         if op == TOK_PIPE {
-            emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xC8) // or rax, rcx
+            emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xC8)
             g[G_LAST_EXPR_TY] = out_ty
             continue
         }
         if op == TOK_CARET {
-            emit_u8(0x48)  emit_u8(0x31)  emit_u8(0xC8) // xor rax, rcx
+            emit_u8(0x48)  emit_u8(0x31)  emit_u8(0xC8)
             g[G_LAST_EXPR_TY] = out_ty
             continue
         }
         if op == TOK_SHL {
-            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xE0) // shl rax, cl
+            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xE0)
             if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
             continue
         }
@@ -1154,36 +1120,35 @@ fn parse_expr(min_prec: i64) {
             continue
         }
         if op == TOK_ROL {
-            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xC0) // rol rax, cl
-            if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
+            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xC0)
+            g[G_LAST_EXPR_TY] = TY_U64
             continue
         }
         if op == TOK_ROR {
-            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xC8) // ror rax, cl
-            if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
+            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xC8)
+            g[G_LAST_EXPR_TY] = TY_U64
             continue
         }
 
         // Relational & Equality (`cmp rax, rcx` + `setcc al` + `movzx eax, al`)
         emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8)
         set_op: i64 = 0x94
-        if op == TOK_EQ { set_op = 0x94 } // sete
-        if op == TOK_NE { set_op = 0x95 } // setne
+        if op == TOK_EQ { set_op = 0x94 }
+        if op == TOK_NE { set_op = 0x95 }
         if op == TOK_LT {
-            if both_u == 1 { set_op = 0x92 } else { set_op = 0x9C } // setb vs setl
+            if both_u == 1 { set_op = 0x92 } else { set_op = 0x9C }
         }
         if op == TOK_LE {
-            if both_u == 1 { set_op = 0x96 } else { set_op = 0x9E } // setbe vs setle
+            if both_u == 1 { set_op = 0x96 } else { set_op = 0x9E }
         }
         if op == TOK_GT {
-            if both_u == 1 { set_op = 0x97 } else { set_op = 0x9F } // seta vs setg
+            if both_u == 1 { set_op = 0x97 } else { set_op = 0x9F }
         }
         if op == TOK_GE {
-            if both_u == 1 { set_op = 0x93 } else { set_op = 0x9D } // setae vs setge
+            if both_u == 1 { set_op = 0x93 } else { set_op = 0x9D }
         }
         emit_u8(0x0F)  emit_u8(set_op)  emit_u8(0xC0)
         emit_u8(0x0F)  emit_u8(0xB6)    emit_u8(0xC0)
         g[G_LAST_EXPR_TY] = TY_I64
     }
 }
-

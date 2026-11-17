@@ -1,0 +1,2129 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — Loops, `match`, Comptime `if`, & Reactor (`compiler/loops_match.zr`)
+// =============================================================================
+// Implements hardware-direct control flow & Ring-0/Reactor statement primitives:
+//   1. `publish(slot_addr, cell64_expr)` -> validated `MOVDIR64B` (`66 0F 38 F8 08`)
+//   2. `wait(monitor_addr, deadline_tsc [, expected_old_u64])` -> `MONITOR`/`MWAIT`
+//   3. `match expr { p1, p2 => ...  lo..hi => ...  _ => ... }`
+//   4. Compile-time constant `if` / `else if` / `else` dead-branch elimination
+//   5. Hardware `for` loops (`..`, `<bits>`, spans, `@slab`/`@arena`, struct elems,
+//      `<tile>`, `<rev>`, `<stride: S>`, `<prefetch: D>`, `<unroll: K>`, and
+//      512-bit AVX-512 `EVEX` `<simd: 8|16>` + branchless `k1`-masked tails)
+// =============================================================================
+
+@slab lm_lens_tmp : <i64 | max: 16>
+@slab lm_simd_st  : <i64 | max: 16>
+
+LMS_WIDTH      :: 0
+LMS_IS64       :: 1
+LMS_IS_TAIL    :: 2
+LMS_VAR_SYM    :: 3
+LMS_CUR_DISP   :: 4
+LMS_REM_DISP   :: 5
+LMS_VEC_I_DISP :: 6
+LMS_OUTER_LOC  :: 7
+LMS_LINE       :: 8
+
+// --- Type Geometry & `.bss` Space Base Helpers ---
+
+fn lm_ty_size(ty: i64) i64 {
+    if (ty & TY_FLAG_SPAN) != 0 { return 16 }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    base := ty & TY_BASE_MASK
+    if base == TY_U32X16 || base == TY_U64X8 { return 64 }
+    if base >= TY_PTR_BASE    { return 8 }
+    if base >= TY_STRUCT_BASE { return ut_size[base - TY_STRUCT_BASE] }
+    if base >= TY_BP_BASE     { return bp_bytes[base - TY_BP_BASE] }
+    if base == TY_U8  || base == TY_I8  { return 1 }
+    if base == TY_U16 || base == TY_I16 { return 2 }
+    if base == TY_U32 || base == TY_I32 { return 4 }
+    return 8
+}
+
+fn lm_ty_align(ty: i64) i64 {
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    base := ty & TY_BASE_MASK
+    if base == TY_U32X16 || base == TY_U64X8 { return 64 }
+    if base >= TY_PTR_BASE    { return 8 }
+    if base >= TY_STRUCT_BASE { return ut_align[base - TY_STRUCT_BASE] }
+    if base >= TY_BP_BASE     { return bp_bytes[base - TY_BP_BASE] }
+    if base == TY_U8  || base == TY_I8  { return 1 }
+    if base == TY_U16 || base == TY_I16 { return 2 }
+    if base == TY_U32 || base == TY_I32 { return 4 }
+    return 8
+}
+
+fn lm_is_struct_val(ty: i64) i64 {
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 0 }
+    base := ty & TY_BASE_MASK
+    if base >= TY_STRUCT_BASE && base < TY_PTR_BASE { return 1 }
+    return 0
+}
+
+fn lm_emit_lea_local_rcx(disp: i64) {
+    if disp >= -128 && disp <= 127 {
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x4D)  emit_u8(disp)
+    } else {
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x8D)  emit_u32(disp)
+    }
+}
+
+fn lm_emit_space_base_rax(si: i64) {
+    if g[G_MODE_EFI] == 1 && g[G_MODE_CAPSULE] == 0 {
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x05) // lea rax, [rip + disp32]
+        fx := g[G_BSS_FIX_CNT]
+        bss_fix_code[fx] = g[G_CODE_OFF]
+        bss_fix_off[fx]  = sp_bss_off[si]
+        g[G_BSS_FIX_CNT] = fx + 1
+        emit_u32(0)
+        return
+    }
+    emit_mov_rax_imm64(sp_vaddr[si])
+}
+
+fn lm_emit_space_base_rcx(si: i64) {
+    if g[G_MODE_EFI] == 1 && g[G_MODE_CAPSULE] == 0 {
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x0D) // lea rcx, [rip + disp32]
+        fx := g[G_BSS_FIX_CNT]
+        bss_fix_code[fx] = g[G_CODE_OFF]
+        bss_fix_off[fx]  = sp_bss_off[si]
+        g[G_BSS_FIX_CNT] = fx + 1
+        emit_u32(0)
+        return
+    }
+    emit_mov_rcx_imm64(sp_vaddr[si])
+}
+
+// --- `<tile>` Quantum Checked Entry & Exit ---
+
+fn emit_tile_enter_checked(line: i64) {
+    if g[G_MODE_EFI] == 0 {
+        die_line("error: ring-0 intrinsic requires --target=efi-os", line)
+    }
+    if g[G_IN_ISR_MODE] != 0 {
+        die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", line)
+    }
+    emit_tile_enter_seq()
+    g[G_TILE_DEPTH] += 1
+}
+
+fn emit_tile_exit_one() {
+    g[G_TILE_DEPTH] -= 1
+    emit_tile_exit_seq()
+}
+
+// --- `publish(slot_addr, cell64_expr)` (`MOVDIR64B` `66 0F 38 F8 08`) ---
+
+fn parse_publish_call(line: i64) {
+    if g[G_IN_ISR_MODE] != 0 {
+        die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", line)
+    }
+    expect_kind(TOK_LPAREN)
+
+    // 1. Evaluate `slot_addr` -> `rax`; require non-null & 64B-aligned (`fail 3`)
+    parse_expr(1)
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0) // test rax, rax
+    emit_u8(0x0F)  emit_u8(0x84)                // jz .bad_dst
+    bad_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    emit_u8(0xA8)  emit_u8(0x3F)                // test al, 63
+    emit_u8(0x0F)  emit_u8(0x84)                // jz .dst_ok
+    ok_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    patch_rel32_here(bad_p)
+    emit_raise_fault_imm(3)
+    patch_rel32_here(ok_p)
+
+    dst_slot := alloc_temp_qword()
+    emit_store_local(dst_slot)
+
+    // 2. Parse `,` + `cell64_expr` -> `rax` = `&cell`
+    expect_kind(TOK_COMMA)
+    parse_expr(1)
+    cty := g[G_LAST_EXPR_TY]
+
+    if (cty & (TY_FLAG_SPAN | TY_FLAG_ATOMIC)) != 0 {
+        die_line("error: publish requires 64-byte @cell64 with 64B alignment", line)
+    }
+    cbase := cty & TY_BASE_MASK
+    if cbase < TY_STRUCT_BASE || cbase >= TY_PTR_BASE {
+        die_line("error: publish requires 64-byte @cell64 with 64B alignment", line)
+    }
+    ut_i := cbase - TY_STRUCT_BASE
+    if ut_size[ut_i] != 64 || ut_align[ut_i] != 64 {
+        die_line("error: publish requires 64-byte @cell64 with 64B alignment", line)
+    }
+
+    if (cty & TY_FLAG_VIEW1) != 0 && (cty & TY_FLAG_MMIO) == 0 {
+        ok_cell := emit_jnz_rel32()
+        emit_raise_fault_imm(3)
+        patch_rel32_here(ok_cell)
+    }
+
+    expect_kind(TOK_RPAREN)
+
+    // `rcx` = `slot_addr` (64B-aligned dst), `rax` = `&cell` (src)
+    // `movdir64b rcx, [rax]` = `66 0F 38 F8 08`
+    emit_load_local_rcx(dst_slot)
+    free_temp_qwords(1)
+    emit_u8(0x66)  emit_u8(0x0F)  emit_u8(0x38)  emit_u8(0xF8)  emit_u8(0x08)
+    g[G_LAST_EXPR_TY] = TY_U64
+}
+
+// --- `wait(monitor_addr, deadline_tsc [, expected_old_u64])` (`MONITOR`/`MWAIT`) ---
+
+fn lm_emit_wait_deadline_prefix() {
+    // Input: `rcx` = `deadline_tsc`, `rax` = `monitor_addr`
+    // If `rcx != 0`, arm `IA32_TSC_DEADLINE` (`0x6E0`) preserving `rax`!
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9)                 // test rcx, rcx
+    emit_u8(0x74)  emit_u8(0x13)                                // je +19 (.chk_mwait)
+    emit_u8(0x50)                                               // push rax
+    emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC8)                 // mov rax, rcx
+    emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xCA)                 // mov rdx, rcx
+    emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xEA)  emit_u8(0x20)  // shr rdx, 32
+    emit_u8(0xB9)  emit_u32(0x6E0)                              // mov ecx, 0x6E0
+    emit_u8(0x0F)  emit_u8(0x30)                                // wrmsr
+    emit_u8(0x58)                                               // pop rax
+}
+
+fn parse_wait_call(line: i64) {
+    if g[G_MODE_EFI] == 0 {
+        die_line("error: ring-0 intrinsic requires --target=efi-os", line)
+    }
+    if g[G_IN_ISR_MODE] != 0 {
+        die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", line)
+    }
+    expect_kind(TOK_LPAREN)
+
+    parse_expr(1)
+    addr_slot := alloc_temp_qword()
+    emit_store_local(addr_slot)
+
+    expect_kind(TOK_COMMA)
+    parse_expr(1)
+
+    if peek_kind() != TOK_COMMA {
+        // 2-arg `wait(monitor_addr, deadline_tsc)`
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC1) // mov rcx, rax (deadline_tsc)
+        emit_load_local(addr_slot)                  // rax = monitor_addr
+        free_temp_qwords(1)
+
+        lm_emit_wait_deadline_prefix()
+        // cmp qword [gs:32], 0; je .fallback_pause (+16)
+        emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x83)  emit_u8(0x3C)  emit_u8(0x25)
+        emit_u32(32)   emit_u8(0)
+        emit_u8(0x74)  emit_u8(0x10)
+        emit_u8(0x31)  emit_u8(0xC9)                // xor ecx, ecx
+        emit_u8(0x31)  emit_u8(0xD2)                // xor edx, edx
+        emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0xC8) // monitor
+        emit_u8(0x31)  emit_u8(0xC0)                // xor eax, eax
+        emit_u8(0x31)  emit_u8(0xC9)                // xor ecx, ecx
+        emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0xC9) // mwait
+        emit_u8(0xEB)  emit_u8(0x02)                // jmp .done (+2)
+        emit_u8(0xF3)  emit_u8(0x90)                // pause
+        emit_u8(0x31)  emit_u8(0xC0)                // xor eax, eax
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    // 3-arg Intel SDM §9.10.4 race-free `wait(monitor_addr, deadline_tsc, expected_old_u64)`
+    dl_slot := alloc_temp_qword()
+    emit_store_local(dl_slot)
+    g[G_TOK_IDX] += 1
+    parse_expr(1)
+    expect_kind(TOK_RPAREN)
+
+    emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0)     // mov r8, rax (expected_old_u64)
+    emit_load_local_rcx(dl_slot)                    // rcx = deadline_tsc
+    emit_load_local(addr_slot)                      // rax = monitor_addr
+    free_temp_qwords(2)
+
+    lm_emit_wait_deadline_prefix()
+    // cmp qword [gs:32], 0; je .g_fallback_pause (+21)
+    emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x83)  emit_u8(0x3C)  emit_u8(0x25)
+    emit_u32(32)   emit_u8(0)
+    emit_u8(0x74)  emit_u8(0x15)
+    emit_u8(0x31)  emit_u8(0xC9)                    // xor ecx, ecx
+    emit_u8(0x31)  emit_u8(0xD2)                    // xor edx, edx
+    emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0xC8)     // monitor
+    emit_u8(0x4C)  emit_u8(0x39)  emit_u8(0x00)     // cmp [rax], r8 (recheck AFTER monitor!)
+    emit_u8(0x75)  emit_u8(0x0B)                    // jne .g_done (+11)
+    emit_u8(0x31)  emit_u8(0xC0)                    // xor eax, eax
+    emit_u8(0x31)  emit_u8(0xC9)                    // xor ecx, ecx
+    emit_u8(0x0F)  emit_u8(0x01)  emit_u8(0xC9)     // mwait
+    emit_u8(0xEB)  emit_u8(0x02)                    // jmp .g_done (+2)
+    emit_u8(0xF3)  emit_u8(0x90)                    // pause
+    emit_u8(0x31)  emit_u8(0xC0)                    // xor eax, eax
+    g[G_LAST_EXPR_TY] = TY_U64
+}
+
+// --- Full Constant Expression Evaluator & `[hi:lo]` Bit-Slice Bounds ---
+
+fn lm_const_prec(idx: i64) i64 {
+    k := tok_kind[idx]
+    if k == TOK_OR2     { return 2 }
+    if k == TOK_AND2    { return 3 }
+    if k == TOK_PIPE    { return 4 }
+    if k == TOK_CARET   { return 5 }
+    if k == TOK_AMP     { return 6 }
+    if k == TOK_EQ || k == TOK_NE { return 7 }
+    if k == TOK_LT {
+        if is_descriptor_lt_at(idx) == 1 { return 0 }
+        return 8
+    }
+    if k == TOK_LE || k == TOK_GT || k == TOK_GE { return 8 }
+    if k == TOK_SHL || k == TOK_SHR || k == TOK_ROL || k == TOK_ROR { return 9 }
+    if k == TOK_PLUS || k == TOK_MINUS { return 10 }
+    if k == TOK_STAR || k == TOK_SLASH || k == TOK_PERCENT { return 11 }
+    return 0
+}
+
+// Parses `[ hi : lo ]` (`[` NOT yet consumed); returns `(width << 8) | lo`
+fn parse_bitslice_bounds() i64 {
+    expect_kind(TOK_LBRACK)
+
+    hi_start := g[G_TOK_IDX]
+    d := 0
+    idx := hi_start
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF { die_cur("error: parse fault (unclosed bit-slice)") }
+        if k == TOK_LPAREN || k == TOK_LBRACK { d += 1  idx += 1  continue }
+        if k == TOK_RPAREN || k == TOK_RBRACK {
+            if d <= 0 { die_cur("error: parse fault (invalid bit-slice)") }
+            d -= 1
+            idx += 1
+            continue
+        }
+        if d == 0 && k == TOK_COLON { break }
+        idx += 1
+    }
+    colon_i := idx
+    tok_kind[colon_i] = TOK_EOF
+    g[G_TOK_IDX] = hi_start
+    hi := lm_eval_const_expr(1)
+    tok_kind[colon_i] = TOK_COLON
+    if g[G_TOK_IDX] != colon_i {
+        die_cur("error: parse fault (trailing tokens in bit-slice hi)")
+    }
+    if hi < 0 || hi > 63 {
+        die_cur("error: parse fault (bit-slice hi out of 0..63)")
+    }
+    expect_kind(TOK_COLON)
+
+    lo_start := g[G_TOK_IDX]
+    d = 0
+    idx = lo_start
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF { die_cur("error: parse fault (unclosed bit-slice)") }
+        if k == TOK_LPAREN || k == TOK_LBRACK { d += 1  idx += 1  continue }
+        if k == TOK_RPAREN {
+            if d <= 0 { die_cur("error: parse fault (invalid bit-slice)") }
+            d -= 1
+            idx += 1
+            continue
+        }
+        if k == TOK_RBRACK {
+            if d == 0 { break }
+            d -= 1
+        }
+        idx += 1
+    }
+    rbr_i := idx
+    tok_kind[rbr_i] = TOK_EOF
+    g[G_TOK_IDX] = lo_start
+    lo := lm_eval_const_expr(1)
+    tok_kind[rbr_i] = TOK_RBRACK
+    if g[G_TOK_IDX] != rbr_i {
+        die_cur("error: parse fault (trailing tokens in bit-slice lo)")
+    }
+    if lo < 0 || lo > 63 || lo > hi {
+        die_cur("error: parse fault (invalid bit-slice bounds)")
+    }
+    expect_kind(TOK_RBRACK)
+    return ((hi - lo + 1) << 8) | lo
+}
+
+fn lm_eval_const_primary() i64 {
+    k := peek_kind()
+    if k == TOK_MINUS {
+        g[G_TOK_IDX] += 1
+        return -lm_eval_const_unary()
+    }
+    if k == TOK_TILDE {
+        g[G_TOK_IDX] += 1
+        return ~lm_eval_const_unary()
+    }
+    if k == TOK_BANG {
+        g[G_TOK_IDX] += 1
+        if lm_eval_const_unary() == 0 { return 1 }
+        return 0
+    }
+    if k == TOK_LPAREN {
+        g[G_TOK_IDX] += 1
+        v := lm_eval_const_expr(1)
+        expect_kind(TOK_RPAREN)
+        return v
+    }
+    if k == TOK_INT || k == TOK_CHAR {
+        v := peek_val()
+        g[G_TOK_IDX] += 1
+        return v
+    }
+    if k == TOK_KW {
+        kw := peek_kw()
+        g[G_TOK_IDX] += 1
+        if kw == KW_TRUE  { return 1 }
+        if kw == KW_FALSE { return 0 }
+        die_cur("error: parse fault (unexpected keyword in constant)")
+    }
+    if k == TOK_AT {
+        g[G_TOK_IDX] += 1
+        isym := expect_ident()
+        if isym == g[G_SYM_SIZEOF] {
+            expect_kind(TOK_LPAREN)
+            ty := parse_full_type_tag()
+            expect_kind(TOK_RPAREN)
+            return lm_ty_size(ty)
+        }
+        if isym == g[G_SYM_ALIGNOF] {
+            expect_kind(TOK_LPAREN)
+            ty := parse_full_type_tag()
+            expect_kind(TOK_RPAREN)
+            return lm_ty_align(ty)
+        }
+        die_cur("error: parse fault (unsupported @ intrinsic in constant)")
+    }
+    if k == TOK_IDENT {
+        sym := expect_ident()
+        ci := find_const(sym)
+        if ci < 0 || cst_done[ci] == 0 {
+            die_cur("error: parse fault (undefined constant identifier)")
+        }
+        return cst_val[ci]
+    }
+    die_cur("error: parse fault (invalid constant expression)")
+    return 0
+}
+
+fn lm_eval_const_unary() i64 {
+    val := lm_eval_const_primary()
+    loop <max: 16 | until: peek_kind() != TOK_LBRACK> {
+        packed := parse_bitslice_bounds()
+        lo := packed & 0xFF
+        w  := packed >> 8
+        uval: u64 = val
+        uval = uval >> lo
+        if w < 64 {
+            umsk: u64 = width_mask64(w)
+            uval = uval & umsk
+        }
+        val = uval
+    }
+    return val
+}
+
+fn lm_eval_const_expr(min_prec: i64) i64 {
+    lhs := lm_eval_const_unary()
+    loop <max: 1024 | until: 0 == 1> {
+        cur_i := g[G_TOK_IDX]
+        prec  := lm_const_prec(cur_i)
+        if prec < min_prec { break }
+        op := tok_kind[cur_i]
+        g[G_TOK_IDX] = cur_i + 1
+        rhs := lm_eval_const_expr(prec + 1)
+
+        if op == TOK_PLUS    { lhs = lhs + rhs }
+        if op == TOK_MINUS   { lhs = lhs - rhs }
+        if op == TOK_STAR    { lhs = lhs * rhs }
+        if op == TOK_SLASH {
+            if rhs == 0 { die_cur("error: parse fault (division by zero in constant)") }
+            lhs = lhs / rhs
+        }
+        if op == TOK_PERCENT {
+            if rhs == 0 { die_cur("error: parse fault (remainder by zero in constant)") }
+            lhs = lhs % rhs
+        }
+        if op == TOK_SHL   { lhs = lhs << rhs }
+        if op == TOK_SHR   { lhs = lhs >> rhs }
+        if op == TOK_ROL   { lhs = lhs <<< rhs }
+        if op == TOK_ROR   { lhs = lhs >>> rhs }
+        if op == TOK_AMP   { lhs = lhs & rhs }
+        if op == TOK_PIPE  { lhs = lhs | rhs }
+        if op == TOK_CARET { lhs = lhs ^ rhs }
+        if op == TOK_EQ    { if lhs == rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_NE    { if lhs != rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_LT    { if lhs <  rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_LE    { if lhs <= rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_GT    { if lhs >  rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_GE    { if lhs >= rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_AND2  { if lhs != 0 && rhs != 0 { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_OR2   { if lhs != 0 || rhs != 0 { lhs = 1 } else { lhs = 0 } }
+    }
+    return lhs
+}
+
+// --- Compile-Time Constant `if` Dead-Branch Elimination ---
+
+// Returns `0` = runtime condition (rewound), `1` = const false (`0`), `2` = const true (`!= 0`)
+fn try_eval_const_if() i64 {
+    cond_start := g[G_TOK_IDX]
+    pdepth := 0
+    idx := cond_start
+
+    loop <max: 65536 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            g[G_TOK_IDX] = cond_start
+            return 0
+        }
+        if pdepth == 0 && k == TOK_LBRACE {
+            break
+        }
+        if k == TOK_LPAREN {
+            pdepth += 1
+            idx += 1
+            continue
+        }
+        if k == TOK_RPAREN {
+            if pdepth <= 0 {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            pdepth -= 1
+            idx += 1
+            continue
+        }
+        if k == TOK_DOT || k == TOK_LBRACK || k == TOK_RBRACK || k == TOK_SLASH || k == TOK_PERCENT || k == TOK_PIPE_GT || k == TOK_STR {
+            g[G_TOK_IDX] = cond_start
+            return 0
+        }
+        if k == TOK_KW {
+            kw := tok_kw[idx]
+            if kw != KW_TRUE && kw != KW_FALSE {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            idx += 1
+            continue
+        }
+        if k == TOK_AT {
+            if tok_kind[idx + 1] != TOK_IDENT {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            asym := tok_val[idx + 1]
+            if asym != g[G_SYM_SIZEOF] && asym != g[G_SYM_ALIGNOF] {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            if tok_kind[idx + 2] != TOK_LPAREN {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            idx += 3
+            ad := 1
+            loop <max: 256 | until: ad == 0> {
+                ak := tok_kind[idx]
+                if ak == TOK_EOF {
+                    g[G_TOK_IDX] = cond_start
+                    return 0
+                }
+                if ak == TOK_LPAREN { ad += 1 }
+                if ak == TOK_RPAREN { ad -= 1 }
+                idx += 1
+            }
+            continue
+        }
+        if k == TOK_IDENT {
+            knext := tok_kind[idx + 1]
+            if knext == TOK_LPAREN || is_descriptor_lt_at(idx + 1) == 1 {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            isym := tok_val[idx]
+            if find_local(isym) >= 0 || find_space(isym) >= 0 {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            ci := find_const(isym)
+            if ci < 0 || cst_done[ci] == 0 {
+                g[G_TOK_IDX] = cond_start
+                return 0
+            }
+            idx += 1
+            continue
+        }
+        idx += 1
+    }
+
+    brace_i := idx
+    if brace_i <= cond_start {
+        g[G_TOK_IDX] = cond_start
+        return 0
+    }
+
+    tok_kind[brace_i] = TOK_EOF
+    g[G_TOK_IDX] = cond_start
+    cval := lm_eval_const_expr(1)
+    tok_kind[brace_i] = TOK_LBRACE
+
+    if g[G_TOK_IDX] != brace_i {
+        g[G_TOK_IDX] = cond_start
+        return 0
+    }
+    if cval != 0 { return 2 }
+    return 1
+}
+
+fn skip_else_chain() {
+    loop <max: 1024 | until: 0 == 1> {
+        if peek_kind() != TOK_KW || peek_kw() != KW_ELSE {
+            return
+        }
+        g[G_TOK_IDX] += 1
+        if peek_kind() == TOK_KW && peek_kw() == KW_IF {
+            g[G_TOK_IDX] += 1
+            pd := 0
+            loop <max: 65536 | until: 0 == 1> {
+                k := peek_kind()
+                if k == TOK_EOF { die_cur("error: parse fault (unclosed else if)") }
+                if k == TOK_LPAREN { pd += 1  g[G_TOK_IDX] += 1  continue }
+                if k == TOK_RPAREN && pd > 0 { pd -= 1  g[G_TOK_IDX] += 1  continue }
+                if pd == 0 && k == TOK_LBRACE { break }
+                g[G_TOK_IDX] += 1
+            }
+        }
+        skip_balanced_braces()
+    }
+}
+
+fn parse_stmt_if() {
+    expect_kw(KW_IF)
+    cres := try_eval_const_if()
+    if cres == 2 {
+        // Compile-time TRUE: compile ONLY live `{ ... }`, skip dead `else` chain!
+        parse_scoped_block()
+        skip_else_chain()
+        return
+    }
+    if cres == 1 {
+        // Compile-time FALSE: skip dead `{ ... }`, evaluate `else` / `else if` if present!
+        skip_balanced_braces()
+        if peek_kind() == TOK_KW && peek_kw() == KW_ELSE {
+            g[G_TOK_IDX] += 1
+            if peek_kind() == TOK_KW && peek_kw() == KW_IF {
+                parse_stmt_if()
+            } else {
+                parse_scoped_block()
+            }
+        }
+        return
+    }
+
+    // Runtime `if`
+    parse_expr(1)
+    else_patch := emit_jz_rel32()
+    parse_scoped_block()
+
+    if peek_kind() == TOK_KW && peek_kw() == KW_ELSE {
+        g[G_TOK_IDX] += 1
+        end_patch := emit_jmp_rel32()
+        patch_rel32_here(else_patch)
+        if peek_kind() == TOK_KW && peek_kw() == KW_IF {
+            parse_stmt_if()
+        } else {
+            parse_scoped_block()
+        }
+        patch_rel32_here(end_patch)
+    } else {
+        patch_rel32_here(else_patch)
+    }
+}
+
+// --- `match expr { pat1, pat2 => body  lo..hi => body  _ => body }` ---
+
+fn lm_eval_match_pat_const() i64 {
+    start_i := g[G_TOK_IDX]
+    d := 0
+    idx := start_i
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF { die_cur("error: parse fault (unclosed match pattern)") }
+        if k == TOK_LPAREN || k == TOK_LBRACK { d += 1  idx += 1  continue }
+        if k == TOK_RPAREN || k == TOK_RBRACK {
+            if d <= 0 { die_cur("error: parse fault (invalid match pattern)") }
+            d -= 1
+            idx += 1
+            continue
+        }
+        if d == 0 {
+            if k == TOK_COMMA || k == TOK_DOT2 || k == TOK_FAT_ARROW {
+                break
+            }
+        }
+        idx += 1
+    }
+    end_i := idx
+    saved_k := tok_kind[end_i]
+    tok_kind[end_i] = TOK_EOF
+    g[G_TOK_IDX] = start_i
+    val := lm_eval_const_expr(1)
+    tok_kind[end_i] = saved_k
+    if g[G_TOK_IDX] != end_i {
+        die_cur("error: parse fault (trailing tokens in match pattern)")
+    }
+    return val
+}
+
+fn lm_parse_match_arm_body() {
+    if peek_kind() == TOK_LBRACE {
+        parse_scoped_block()
+    } else {
+        parse_stmt()
+    }
+}
+
+fn parse_stmt_match() {
+    g[G_TOK_IDX] += 1   // consume `match`
+    parse_expr(1)
+    scrut_slot := alloc_anon_qwords(1)
+    emit_store_local(scrut_slot)
+
+    expect_kind(TOK_LBRACE)
+    end_head: i64 = -1
+
+    loop <max: 4096 | until: peek_kind() == TOK_RBRACE> {
+        if peek_kind() == TOK_EOF {
+            die_cur("error: parse fault (unclosed match block)")
+        }
+
+        // Wildcard `_ =>`
+        if peek_kind() == TOK_IDENT && peek_val() == g[G_SYM_WILDCARD] && tok_kind[g[G_TOK_IDX] + 1] == TOK_FAT_ARROW {
+            g[G_TOK_IDX] += 2
+            lm_parse_match_arm_body()
+            jend := emit_jmp_rel32()
+            end_head = push_patch_node(end_head, jend)
+            if peek_kind() == TOK_COMMA { g[G_TOK_IDX] += 1 }
+            continue
+        }
+
+        hit_head: i64 = -1
+        loop <max: 256 | until: 0 == 1> {
+            v0 := lm_eval_match_pat_const()
+            if peek_kind() == TOK_DOT2 {
+                g[G_TOK_IDX] += 1
+                v1 := lm_eval_match_pat_const()
+                if v1 <= v0 {
+                    die_cur("error: parse fault (invalid match range)")
+                }
+                span_w := v1 - v0
+                emit_load_local(scrut_slot)
+                emit_mov_rcx_imm64(v0)
+                emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx (scrut - v0)
+                emit_mov_rcx_imm64(span_w)
+                emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+                emit_u8(0x0F)  emit_u8(0x82)                // jb .hit
+                hp := g[G_CODE_OFF]
+                emit_u32(0)
+                hit_head = push_patch_node(hit_head, hp)
+            } else {
+                emit_load_local(scrut_slot)
+                emit_mov_rcx_imm64(v0)
+                emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+                emit_u8(0x0F)  emit_u8(0x84)                // je .hit
+                hp := g[G_CODE_OFF]
+                emit_u32(0)
+                hit_head = push_patch_node(hit_head, hp)
+            }
+            if peek_kind() != TOK_COMMA { break }
+            g[G_TOK_IDX] += 1
+        }
+
+        expect_kind(TOK_FAT_ARROW)
+        miss_patch := emit_jmp_rel32()
+        resolve_patch_chain(hit_head)
+
+        lm_parse_match_arm_body()
+        jend := emit_jmp_rel32()
+        end_head = push_patch_node(end_head, jend)
+        patch_rel32_here(miss_patch)
+        if peek_kind() == TOK_COMMA { g[G_TOK_IDX] += 1 }
+    }
+
+    expect_kind(TOK_RBRACE)
+    resolve_patch_chain(end_head)
+}
+
+// --- Hardware `for` Loop Engine (`bootstrap/loops.inc` Full Parity) ---
+
+fn lm_eval_for_lens_const(lt_line: i64) i64 {
+    start_i := g[G_TOK_IDX]
+    pd := 0
+    idx := start_i
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            die_line("error: unimplemented or invalid loop lens", lt_line)
+        }
+        if k == TOK_LPAREN { pd += 1  idx += 1  continue }
+        if k == TOK_RPAREN {
+            if pd <= 0 { die_line("error: unimplemented or invalid loop lens", lt_line) }
+            pd -= 1
+            idx += 1
+            continue
+        }
+        if pd == 0 {
+            if k == TOK_PIPE && tok_kind[idx + 1] == TOK_IDENT {
+                break
+            }
+            if k == TOK_GT && tok_kind[idx + 1] == TOK_LBRACE {
+                break
+            }
+        }
+        idx += 1
+    }
+    end_i := idx
+    if end_i <= start_i {
+        die_line("error: unimplemented or invalid loop lens", lt_line)
+    }
+    saved_k := tok_kind[end_i]
+    tok_kind[end_i] = TOK_EOF
+    g[G_TOK_IDX] = start_i
+    val := lm_eval_const_expr(1)
+    tok_kind[end_i] = saved_k
+    if g[G_TOK_IDX] != end_i {
+        die_line("error: unimplemented or invalid loop lens", lt_line)
+    }
+    return val
+}
+
+// Populates `lm_lens_tmp[0..8]`:
+//   [0] = has_rev, [1] = has_tile, [2] = has_prefetch,
+//   [3] = stride_val, [4] = unroll_val, [5] = prefetch_dist, [6] = tile_line,
+//   [7] = simd_width (0, 8, or 16), [8] = simd_line
+fn lm_parse_opt_for_lenses(is_span: i64) {
+    lm_lens_tmp[0] = 0
+    lm_lens_tmp[1] = 0
+    lm_lens_tmp[2] = 0
+    lm_lens_tmp[3] = 1
+    lm_lens_tmp[4] = 1
+    lm_lens_tmp[5] = 0
+    lm_lens_tmp[6] = peek_line()
+    lm_lens_tmp[7] = 0
+    lm_lens_tmp[8] = peek_line()
+
+    if peek_kind() != TOK_LT { return }
+    lt_line := peek_line()
+    g[G_TOK_IDX] += 1
+
+    loop <max: 16 | until: 0 == 1> {
+        if peek_kind() != TOK_IDENT {
+            die_line("error: unimplemented or invalid loop lens", lt_line)
+        }
+        cline := peek_line()
+        csym  := expect_ident()
+
+        if csym == g[G_SYM_TILE] {
+            if peek_kind() == TOK_COLON {
+                die_line("error: unimplemented or invalid loop lens", lt_line)
+            }
+            lm_lens_tmp[1] = 1
+            lm_lens_tmp[6] = cline
+        } else {
+            if csym == g[G_SYM_REV] {
+                if lm_lens_tmp[4] > 1 || lm_lens_tmp[7] > 0 {
+                    die_line("error: unimplemented or invalid loop lens", lt_line)
+                }
+                lm_lens_tmp[0] = 1
+            } else {
+                if csym == g[G_SYM_STRIDE] {
+                    if peek_kind() != TOK_COLON {
+                        die_line("error: unimplemented or invalid loop lens", lt_line)
+                    }
+                    g[G_TOK_IDX] += 1
+                    sv := lm_eval_for_lens_const(lt_line)
+                    if sv < 1 {
+                        die_line("error: unimplemented or invalid loop lens", lt_line)
+                    }
+                    lm_lens_tmp[3] = sv
+                } else {
+                    if csym == g[G_SYM_UNROLL] {
+                        if is_span == 1 || lm_lens_tmp[0] == 1 || lm_lens_tmp[7] > 0 || peek_kind() != TOK_COLON {
+                            die_line("error: unimplemented or invalid loop lens", lt_line)
+                        }
+                        g[G_TOK_IDX] += 1
+                        uv := lm_eval_for_lens_const(lt_line)
+                        if uv != 2 && uv != 4 && uv != 8 {
+                            die_line("error: unimplemented or invalid loop lens", lt_line)
+                        }
+                        lm_lens_tmp[4] = uv
+                    } else {
+                        if csym == g[G_SYM_PREFETCH] {
+                            if is_span == 0 || peek_kind() != TOK_COLON {
+                                die_line("error: unimplemented or invalid loop lens", lt_line)
+                            }
+                            g[G_TOK_IDX] += 1
+                            pv := lm_eval_for_lens_const(lt_line)
+                            if pv < 0 || pv > 0x7FFF_FFFF {
+                                die_line("error: unimplemented or invalid loop lens", lt_line)
+                            }
+                            lm_lens_tmp[2] = 1
+                            lm_lens_tmp[5] = pv
+                        } else {
+                            if csym == g[G_SYM_SIMD] {
+                                if is_span == 1 || peek_kind() != TOK_COLON {
+                                    die_line("error: unimplemented or invalid loop lens", lt_line)
+                                }
+                                g[G_TOK_IDX] += 1
+                                sw := lm_eval_for_lens_const(lt_line)
+                                if sw != 8 && sw != 16 {
+                                    die_line("error: unimplemented or invalid loop lens", lt_line)
+                                }
+                                lm_lens_tmp[7] = sw
+                                lm_lens_tmp[8] = cline
+                            } else {
+                                die_line("error: unimplemented or invalid loop lens", lt_line)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if peek_kind() != TOK_PIPE { break }
+        g[G_TOK_IDX] += 1
+    }
+
+    if lm_lens_tmp[7] > 0 {
+        if lm_lens_tmp[0] == 1 || lm_lens_tmp[2] == 1 || lm_lens_tmp[3] != 1 || lm_lens_tmp[4] > 1 {
+            die_line("error: unimplemented or invalid loop lens", lt_line)
+        }
+    }
+
+    if peek_kind() != TOK_GT {
+        die_line("error: unimplemented or invalid loop lens", lt_line)
+    }
+    g[G_TOK_IDX] += 1
+}
+
+// --- 512-Bit `AVX-512` (`EVEX`) `<simd: 8|16>` + `k1` Masked Tail Vectorizer ---
+
+fn lm_assign_to_simd_binop(op: i64) i64 {
+    if op == TOK_PLUS_EQ  { return TOK_PLUS }
+    if op == TOK_MINUS_EQ { return TOK_MINUS }
+    if op == TOK_STAR_EQ  { return TOK_STAR }
+    if op == TOK_PIPE_EQ  { return TOK_PIPE }
+    if op == TOK_AMP_EQ   { return TOK_AMP }
+    if op == TOK_CARET_EQ { return TOK_CARET }
+    if op == TOK_SHL_EQ   { return TOK_SHL }
+    if op == TOK_SHR_EQ   { return TOK_SHR }
+    die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+    return 0
+}
+
+fn lm_simd_elem_ok(ety: i64) i64 {
+    if (ety & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 0 }
+    ebase := ety & TY_BASE_MASK
+    want_sz := 4
+    if lm_simd_st[LMS_IS64] == 1 { want_sz = 8 }
+
+    if ebase >= TY_BP_BASE && ebase < TY_STRUCT_BASE {
+        if bp_bytes[ebase - TY_BP_BASE] == want_sz { return 1 }
+        return 0
+    }
+    if want_sz == 8 {
+        if ebase == TY_U64 || ebase == TY_I64 { return 1 }
+        return 0
+    }
+    if ebase == TY_U32 || ebase == TY_I32 { return 1 }
+    return 0
+}
+
+fn lm_scan_rbrack(lbr_idx: i64) i64 {
+    d   := 0
+    idx := lbr_idx
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+        }
+        if k == TOK_LBRACK || k == TOK_LPAREN { d += 1 }
+        if k == TOK_RBRACK || k == TOK_RPAREN {
+            d -= 1
+            if d == 0 && k == TOK_RBRACK { return idx }
+            if d <= 0 {
+                die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+            }
+        }
+        idx += 1
+    }
+    return idx
+}
+
+fn lm_scan_rparen(lp_idx: i64) i64 {
+    d   := 0
+    idx := lp_idx
+    loop <max: 4096 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+        }
+        if k == TOK_LPAREN || k == TOK_LBRACK { d += 1 }
+        if k == TOK_RPAREN || k == TOK_RBRACK {
+            d -= 1
+            if d == 0 && k == TOK_RPAREN { return idx }
+            if d <= 0 {
+                die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+            }
+        }
+        idx += 1
+    }
+    return idx
+}
+
+fn lm_range_has_simd_lane(start_i: i64, end_i: i64) i64 {
+    vsym      := lm_simd_st[LMS_VAR_SYM]
+    outer_loc := lm_simd_st[LMS_OUTER_LOC]
+    idx       := start_i
+    loop <max: 8192 | until: idx >= end_i> {
+        k := tok_kind[idx]
+        if k == TOK_IDENT {
+            sym := tok_val[idx]
+            if sym == vsym { return 1 }
+            li := find_local(sym)
+            if li >= outer_loc { return 1 }
+            if li >= 0 && is_ty_vec(loc_ty[li]) == 1 { return 1 }
+        }
+        if k == TOK_AT && tok_kind[idx + 1] == TOK_IDENT {
+            asym := tok_val[idx + 1]
+            if asym >= g[G_SYM_VEC_SPLAT32] && asym <= g[G_SYM_VEC_SUM64] {
+                return 1
+            }
+        }
+        idx += 1
+    }
+    return 0
+}
+
+fn lm_range_min_top_prec(start_i: i64, end_i: i64) i64 {
+    pdepth := 0
+    bdepth := 0
+    exp_op := 1
+    min_pr := 99
+    idx    := start_i
+    loop <max: 4096 | until: idx >= end_i> {
+        k := tok_kind[idx]
+        if k == TOK_LPAREN { pdepth += 1  exp_op = 1  idx += 1  continue }
+        if k == TOK_RPAREN { pdepth -= 1  exp_op = 0  idx += 1  continue }
+        if k == TOK_LBRACK { bdepth += 1  exp_op = 1  idx += 1  continue }
+        if k == TOK_RBRACK { bdepth -= 1  exp_op = 0  idx += 1  continue }
+        if pdepth == 0 && bdepth == 0 {
+            if exp_op == 1 {
+                if k == TOK_INT || k == TOK_CHAR || k == TOK_IDENT || k == TOK_KW {
+                    exp_op = 0
+                }
+            } else {
+                if k == TOK_DOT {
+                    idx += 2
+                    continue
+                }
+                pr := binop_prec(idx)
+                if pr > 0 {
+                    if pr < min_pr { min_pr = pr }
+                    exp_op = 1
+                }
+            }
+        }
+        idx += 1
+    }
+    return min_pr
+}
+
+// Parses `[ idx_expr ]` with unit stride `+1` in `var1_sym` (`[i]`, `[i + inv]`, `[i - inv]`, `[inv + i]`),
+// leaving scalar `start_idx` in `rax`.
+fn lm_emit_simd_unit_index() {
+    lbr_i := g[G_TOK_IDX]
+    expect_kind(TOK_LBRACK)
+    idx_start := g[G_TOK_IDX]
+    rbr_i     := lm_scan_rbrack(lbr_i)
+    if rbr_i <= idx_start {
+        die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+    }
+
+    vsym     := lm_simd_st[LMS_VAR_SYM]
+    cur_disp := lm_simd_st[LMS_CUR_DISP]
+
+    // 1. `[i]`
+    if rbr_i == idx_start + 1 && tok_kind[idx_start] == TOK_IDENT && tok_val[idx_start] == vsym {
+        g[G_TOK_IDX] = rbr_i + 1
+        emit_load_local(cur_disp)
+        return
+    }
+
+    // 2. `[i + inv]`
+    if rbr_i >= idx_start + 3 && tok_kind[idx_start] == TOK_IDENT && tok_val[idx_start] == vsym && tok_kind[idx_start + 1] == TOK_PLUS {
+        if lm_range_has_simd_lane(idx_start + 2, rbr_i) == 0 && lm_range_min_top_prec(idx_start + 2, rbr_i) >= 10 {
+            g[G_TOK_IDX] = idx_start + 2
+            parse_bounded_expr(rbr_i)
+            expect_kind(TOK_RBRACK)
+            emit_load_local_rcx(cur_disp)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            return
+        }
+    }
+
+    // 3. `[i - inv]`
+    if rbr_i >= idx_start + 3 && tok_kind[idx_start] == TOK_IDENT && tok_val[idx_start] == vsym && tok_kind[idx_start + 1] == TOK_MINUS {
+        if lm_range_has_simd_lane(idx_start + 2, rbr_i) == 0 && lm_range_min_top_prec(idx_start + 2, rbr_i) > 10 {
+            g[G_TOK_IDX] = idx_start + 2
+            parse_bounded_expr(rbr_i)
+            expect_kind(TOK_RBRACK)
+            emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC1) // mov rcx, rax
+            emit_load_local(cur_disp)
+            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx
+            return
+        }
+    }
+
+    // 4. `[inv + i]`
+    if rbr_i >= idx_start + 3 && tok_kind[rbr_i - 1] == TOK_IDENT && tok_val[rbr_i - 1] == vsym && tok_kind[rbr_i - 2] == TOK_PLUS {
+        if lm_range_has_simd_lane(idx_start, rbr_i - 2) == 0 && lm_range_min_top_prec(idx_start, rbr_i - 2) >= 10 {
+            g[G_TOK_IDX] = idx_start
+            parse_bounded_expr(rbr_i - 2)
+            g[G_TOK_IDX] = rbr_i + 1
+            emit_load_local_rcx(cur_disp)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            return
+        }
+    }
+
+    die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+}
+
+fn lm_emit_simd_bounds_rax_imm(cap: i64) {
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0) // test rax, rax
+    emit_u8(0x0F)  emit_u8(0x88)                // js .oob
+    oob_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    if lm_simd_st[LMS_IS_TAIL] == 0 {
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x50)  emit_u8(lm_simd_st[LMS_WIDTH]) // lea rdx, [rax + W]
+    } else {
+        emit_load_local_rcx(lm_simd_st[LMS_REM_DISP])
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x14)  emit_u8(0x08)                  // lea rdx, [rax + rcx]
+    }
+    emit_mov_rcx_imm64(cap)
+    emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xCA) // cmp rdx, rcx
+    emit_u8(0x0F)  emit_u8(0x86)                // jbe .ok
+    ok_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    patch_rel32_here(oob_p)
+    emit_raise_fault_imm(2)
+    patch_rel32_here(ok_p)
+}
+
+fn lm_emit_simd_bounds_rax_span(span_disp: i64) {
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0) // test rax, rax
+    emit_u8(0x0F)  emit_u8(0x88)                // js .oob
+    oob_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    if lm_simd_st[LMS_IS_TAIL] == 0 {
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x50)  emit_u8(lm_simd_st[LMS_WIDTH]) // lea rdx, [rax + W]
+    } else {
+        emit_load_local_rcx(lm_simd_st[LMS_REM_DISP])
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x14)  emit_u8(0x08)                  // lea rdx, [rax + rcx]
+    }
+    emit_load_local_rcx(span_disp + 8)
+    emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xCA) // cmp rdx, rcx
+    emit_u8(0x0F)  emit_u8(0x86)                // jbe .ok
+    ok_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    patch_rel32_here(oob_p)
+    emit_raise_fault_imm(2)
+    patch_rel32_here(ok_p)
+}
+
+// Validates `sym[idx_expr]` for `<simd>`, emits bounds/null checks, leaves `&sym[start_idx]` in `rax`,
+// and returns `1` if `sym` is a non-temporal `@stream` span, else `0`.
+fn lm_emit_simd_contig_addr_sym(sym: i64) i64 {
+    elem_sh := 2
+    if lm_simd_st[LMS_IS64] == 1 { elem_sh = 3 }
+
+    si := find_space(sym)
+    if si >= 0 {
+        sk: i64 = sp_kind[si]
+        if sk != SKIND_SLAB && sk != SKIND_ARENA {
+            die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+        }
+        if lm_simd_elem_ok(sp_elem_ty[si]) == 0 {
+            die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+        }
+        lm_emit_simd_unit_index()
+        lm_emit_simd_bounds_rax_imm(sp_cap[si])
+        emit_shl_rax_imm(elem_sh)
+        lm_emit_space_base_rcx(si)
+        emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+        return 0
+    }
+
+    li := find_local(sym)
+    if li >= 0 && li < lm_simd_st[LMS_OUTER_LOC] {
+        lty: i64   = loc_ty[li]
+        ldisp: i64 = loc_disp[li]
+
+        if (lty & TY_FLAG_SPAN) != 0 {
+            if lm_simd_elem_ok(lty & TY_BASE_MASK) == 0 {
+                die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+            }
+            lm_emit_simd_unit_index()
+            lm_emit_simd_bounds_rax_span(ldisp)
+            emit_shl_rax_imm(elem_sh)
+            emit_load_local_rcx(ldisp)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            if (lty & TY_FLAG_STREAM) != 0 { return 1 }
+            return 0
+        }
+
+        if (lty & TY_FLAG_VIEW1) != 0 {
+            if lm_simd_elem_ok(lty & TY_BASE_MASK) == 0 {
+                die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+            }
+            lm_emit_simd_unit_index()
+            emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0) // test rax, rax
+            emit_u8(0x0F)  emit_u8(0x89)                // jns .ok_v
+            ok_v := g[G_CODE_OFF]
+            emit_u32(0)
+            emit_raise_fault_imm(2)
+            patch_rel32_here(ok_v)
+
+            emit_shl_rax_imm(elem_sh)
+            emit_load_local_rcx(ldisp)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            return 0
+        }
+    }
+
+    die_line("error: unimplemented or invalid loop lens", lm_simd_st[LMS_LINE])
+    return 0
+}
+
+fn lm_emit_splat_rax_simd() {
+    if lm_simd_st[LMS_IS64] == 1 {
+        emit_zmm0_splat64_rax()
+    } else {
+        emit_zmm0_splat32_eax()
+    }
+}
+
+fn lm_parse_simd_primary() {
+    k     := peek_kind()
+    sline := lm_simd_st[LMS_LINE]
+    is_64 := lm_simd_st[LMS_IS64]
+
+    if k == TOK_MINUS {
+        g[G_TOK_IDX] += 1
+        if peek_kind() == TOK_INT {
+            v := peek_val()
+            g[G_TOK_IDX] += 1
+            emit_mov_rax_imm64(-v)
+            lm_emit_splat_rax_simd()
+            return
+        }
+        lm_parse_simd_unary()
+        emit_zmm1_from_zmm0()
+        emit_zmm_binop(TOK_CARET, 1, 0, 0, 0) // vpxorq zmm0, zmm0, zmm0
+        emit_zmm0_binop(TOK_MINUS, is_64)
+        return
+    }
+
+    if k == TOK_TILDE {
+        g[G_TOK_IDX] += 1
+        lm_parse_simd_unary()
+        emit_mov_rax_imm64(-1)
+        emit_zmm_splat64_rax(1)
+        emit_zmm0_binop(TOK_CARET, 1)
+        return
+    }
+
+    if k == TOK_LPAREN {
+        rp_i := lm_scan_rparen(g[G_TOK_IDX])
+        nk_after := tok_kind[rp_i + 1]
+        if lm_range_has_simd_lane(g[G_TOK_IDX], rp_i + 1) == 0 && nk_after != TOK_DOT && nk_after != TOK_LBRACK {
+            parse_unary()
+            ty := g[G_LAST_EXPR_TY]
+            if (ty & TY_FLAG_SPAN) != 0 || lm_is_struct_val(ty) == 1 || is_ty_vec(ty) == 1 {
+                die_line("error: unimplemented or invalid loop lens", sline)
+            }
+            lm_emit_splat_rax_simd()
+            return
+        }
+        g[G_TOK_IDX] += 1
+        lm_parse_simd_expr(1)
+        expect_kind(TOK_RPAREN)
+        return
+    }
+
+    if k == TOK_INT || k == TOK_CHAR {
+        v := peek_val()
+        g[G_TOK_IDX] += 1
+        emit_mov_rax_imm64(v)
+        lm_emit_splat_rax_simd()
+        return
+    }
+
+    if k == TOK_KW {
+        kw := peek_kw()
+        if kw == KW_TRUE {
+            g[G_TOK_IDX] += 1
+            emit_mov_rax_imm64(1)
+            lm_emit_splat_rax_simd()
+            return
+        }
+        if kw == KW_FALSE {
+            g[G_TOK_IDX] += 1
+            emit_mov_rax_imm64(0)
+            lm_emit_splat_rax_simd()
+            return
+        }
+        die_line("error: unimplemented or invalid loop lens", sline)
+    }
+
+    if k == TOK_AT {
+        if tok_kind[g[G_TOK_IDX] + 1] == TOK_IDENT {
+            asym := tok_val[g[G_TOK_IDX] + 1]
+            if asym == g[G_SYM_SIZEOF] || asym == g[G_SYM_ALIGNOF] || asym == g[G_SYM_RID] {
+                parse_unary()
+                lm_emit_splat_rax_simd()
+                return
+            }
+        }
+        die_line("error: unimplemented or invalid loop lens", sline)
+    }
+
+    if k == TOK_IDENT {
+        sym := peek_val()
+        nk  := tok_kind[g[G_TOK_IDX] + 1]
+
+        // 1. Loop index `i` -> `vec_i`
+        if sym == lm_simd_st[LMS_VAR_SYM] {
+            if nk == TOK_LPAREN || nk == TOK_DOT {
+                die_line("error: unimplemented or invalid loop lens", sline)
+            }
+            g[G_TOK_IDX] += 1
+            emit_zmm0_load_rbp(lm_simd_st[LMS_VEC_I_DISP])
+            return
+        }
+
+        // 2. Inner `<simd>` lane-local variable
+        li := find_local(sym)
+        if li >= lm_simd_st[LMS_OUTER_LOC] {
+            if nk == TOK_LPAREN || nk == TOK_DOT {
+                die_line("error: unimplemented or invalid loop lens", sline)
+            }
+            g[G_TOK_IDX] += 1
+            emit_zmm0_load_rbp(loc_disp[li])
+            return
+        }
+
+        // 3. Outer `u32x16` / `u64x8` vector local matching `<simd>` width
+        if li >= 0 && is_ty_vec(loc_ty[li]) == 1 {
+            want_vty := TY_U32X16
+            if is_64 == 1 { want_vty = TY_U64X8 }
+            if loc_ty[li] != want_vty || nk == TOK_LPAREN || nk == TOK_DOT || nk == TOK_LBRACK {
+                die_line("error: unimplemented or invalid loop lens", sline)
+            }
+            g[G_TOK_IDX] += 1
+            emit_zmm0_load_rbp(loc_disp[li])
+            return
+        }
+
+        // 4. Reject scalar function calls inside `<simd>`
+        if nk == TOK_LPAREN {
+            die_line("error: unimplemented or invalid loop lens", sline)
+        }
+
+        // 5. Subscript `arr[idx_expr]` — contiguous vector load if lane-varying, else invariant broadcast
+        if nk == TOK_LBRACK {
+            rbr_i := lm_scan_rbrack(g[G_TOK_IDX] + 1)
+            if lm_range_has_simd_lane(g[G_TOK_IDX] + 2, rbr_i) == 1 {
+                if tok_kind[rbr_i + 1] == TOK_DOT {
+                    die_line("error: unimplemented or invalid loop lens", sline)
+                }
+                g[G_TOK_IDX] += 1
+                lm_emit_simd_contig_addr_sym(sym)
+                if lm_simd_st[LMS_IS_TAIL] == 0 {
+                    if is_64 == 1 { emit_zmm0_load64_rax() } else { emit_zmm0_load32_rax() }
+                } else {
+                    if is_64 == 1 { emit_zmm0_load64_k1z_rax() } else { emit_zmm0_load32_k1z_rax() }
+                }
+                return
+            }
+        }
+
+        // 6. Loop-invariant scalar expression (`alpha`, `CONST`, `cfg.gain`, `lut[k]`, `x[15:0]`)
+        scan_i := g[G_TOK_IDX] + 1
+        loop <max: 64 | until: 0 == 1> {
+            sk := tok_kind[scan_i]
+            if sk == TOK_DOT && tok_kind[scan_i + 1] == TOK_IDENT {
+                scan_i += 2
+                continue
+            }
+            if sk == TOK_LBRACK {
+                sr := lm_scan_rbrack(scan_i)
+                if lm_range_has_simd_lane(scan_i + 1, sr) == 1 {
+                    die_line("error: unimplemented or invalid loop lens", sline)
+                }
+                scan_i = sr + 1
+                continue
+            }
+            break
+        }
+        if tok_kind[scan_i] == TOK_LPAREN {
+            die_line("error: unimplemented or invalid loop lens", sline)
+        }
+        parse_unary()
+        uty := g[G_LAST_EXPR_TY]
+        if (uty & TY_FLAG_SPAN) != 0 || lm_is_struct_val(uty) == 1 || is_ty_vec(uty) == 1 {
+            die_line("error: unimplemented or invalid loop lens", sline)
+        }
+        lm_emit_splat_rax_simd()
+        return
+    }
+
+    die_line("error: unimplemented or invalid loop lens", sline)
+}
+
+fn lm_parse_simd_unary() {
+    lm_parse_simd_primary()
+    is_64 := lm_simd_st[LMS_IS64]
+    loop <max: 16 | until: peek_kind() != TOK_LBRACK> {
+        packed    := parse_bitslice_bounds()
+        lo        := packed & 0xFF
+        w         := packed >> 8
+        lane_bits := 32
+        if is_64 == 1 { lane_bits = 64 }
+        if lo + w > lane_bits {
+            die_line("error: parse fault (bit-slice exceeds SIMD lane width)", lm_simd_st[LMS_LINE])
+        }
+        if lo > 0 {
+            emit_zmm0_shr_imm(lo, is_64)
+        }
+        if w < lane_bits {
+            emit_mov_rax_imm64(width_mask64(w))
+            if is_64 == 1 { emit_zmm_splat64_rax(1) } else { emit_zmm_splat32_eax(1) }
+            emit_zmm0_binop(TOK_AMP, 1)
+        }
+    }
+}
+
+fn lm_parse_simd_expr(min_prec: i64) {
+    lm_parse_simd_unary()
+    is_64 := lm_simd_st[LMS_IS64]
+    sline := lm_simd_st[LMS_LINE]
+
+    loop <max: 1024 | until: 0 == 1> {
+        cur_i := g[G_TOK_IDX]
+        prec  := binop_prec(cur_i)
+        if prec < min_prec { break }
+
+        op := tok_kind[cur_i]
+        if op != TOK_PLUS && op != TOK_MINUS && op != TOK_STAR && op != TOK_AMP && op != TOK_PIPE && op != TOK_CARET && op != TOK_SHL && op != TOK_SHR {
+            die_line("error: unimplemented or invalid loop lens", sline)
+        }
+        g[G_TOK_IDX] = cur_i + 1
+
+        // Immediate constant shift fast-path (`vpslld/q`, `vpsrld/q`)
+        if (op == TOK_SHL || op == TOK_SHR) && peek_kind() == TOK_INT {
+            after_i := g[G_TOK_IDX] + 1
+            if tok_kind[after_i] != TOK_LBRACK && binop_prec(after_i) <= prec {
+                imm    := peek_val()
+                max_sh := 31
+                if is_64 == 1 { max_sh = 63 }
+                if imm >= 0 && imm <= max_sh {
+                    g[G_TOK_IDX] += 1
+                    if op == TOK_SHL {
+                        emit_zmm0_shl_imm(imm, is_64)
+                    } else {
+                        emit_zmm0_shr_imm(imm, is_64)
+                    }
+                    continue
+                }
+            }
+        }
+
+        vslot := alloc_temp_vec()
+        emit_zmm0_store_rbp(vslot)
+        lm_parse_simd_expr(prec + 1)
+        emit_zmm1_from_zmm0()
+        emit_zmm0_load_rbp(vslot)
+        free_temp_vec()
+        emit_zmm0_binop(op, is_64)
+    }
+}
+
+fn lm_parse_simd_body() {
+    sline  := lm_simd_st[LMS_LINE]
+    is_64  := lm_simd_st[LMS_IS64]
+    vec_ty := TY_U32X16
+    if is_64 == 1 { vec_ty = TY_U64X8 }
+
+    expect_kind(TOK_LBRACE)
+    loop <max: 4096 | until: peek_kind() == TOK_RBRACE> {
+        if peek_kind() == TOK_EOF {
+            die_cur("error: parse fault (unclosed '{' block)")
+        }
+        if peek_kind() != TOK_IDENT {
+            die_line("error: unimplemented or invalid loop lens", sline)
+        }
+
+        dline := peek_line()
+        sym   := expect_ident()
+        k     := peek_kind()
+
+        // 1. Inner per-lane vector local `v := expr`
+        if k == TOK_WALRUS {
+            if sym == lm_simd_st[LMS_VAR_SYM] {
+                die_line("error: duplicate variable in same block", dline)
+            }
+            g[G_TOK_IDX] += 1
+            lm_parse_simd_expr(1)
+            vdisp := alloc_local(sym, vec_ty, dline)
+            emit_zmm0_store_rbp(vdisp)
+            continue
+        }
+
+        // 2. Inner per-lane vector local `v: T = expr`
+        if k == TOK_COLON {
+            if sym == lm_simd_st[LMS_VAR_SYM] {
+                die_line("error: duplicate variable in same block", dline)
+            }
+            g[G_TOK_IDX] += 1
+            dty := parse_full_type_tag()
+            if dty != TY_U32 && dty != TY_I32 && dty != TY_U64 && dty != TY_I64 && dty != vec_ty {
+                die_line("error: unimplemented or invalid loop lens", sline)
+            }
+            expect_kind(TOK_ASSIGN)
+            lm_parse_simd_expr(1)
+            vdisp := alloc_local(sym, vec_ty, dline)
+            emit_zmm0_store_rbp(vdisp)
+            continue
+        }
+
+        // 3. Inner per-lane vector local update `v = expr` / `v op= expr`
+        li := find_local(sym)
+        if li >= lm_simd_st[LMS_OUTER_LOC] && k != TOK_LBRACK {
+            op := peek_kind()
+            if op == TOK_ASSIGN {
+                g[G_TOK_IDX] += 1
+                lm_parse_simd_expr(1)
+                emit_zmm0_store_rbp(loc_disp[li])
+                continue
+            }
+            bop := lm_assign_to_simd_binop(op)
+            g[G_TOK_IDX] += 1
+            lm_parse_simd_expr(1)
+            emit_zmm1_from_zmm0()
+            emit_zmm0_load_rbp(loc_disp[li])
+            emit_zmm0_binop(bop, is_64)
+            emit_zmm0_store_rbp(loc_disp[li])
+            continue
+        }
+
+        // 4. Contiguous element store / compound update `dst[idx_expr] = expr` / `op= expr`
+        if k == TOK_LBRACK {
+            is_stream := lm_emit_simd_contig_addr_sym(sym)
+            addr_slot := alloc_temp_qword()
+            emit_store_local(addr_slot)
+
+            op := peek_kind()
+            if op == TOK_ASSIGN {
+                g[G_TOK_IDX] += 1
+                lm_parse_simd_expr(1)
+            } else {
+                bop := lm_assign_to_simd_binop(op)
+                g[G_TOK_IDX] += 1
+                lm_parse_simd_expr(1)
+                emit_zmm1_from_zmm0()
+                emit_load_local(addr_slot)
+                if lm_simd_st[LMS_IS_TAIL] == 0 {
+                    if is_64 == 1 { emit_zmm0_load64_rax() } else { emit_zmm0_load32_rax() }
+                } else {
+                    if is_64 == 1 { emit_zmm0_load64_k1z_rax() } else { emit_zmm0_load32_k1z_rax() }
+                }
+                emit_zmm0_binop(bop, is_64)
+            }
+
+            emit_load_local_rcx(addr_slot)
+            free_temp_qwords(1)
+            if lm_simd_st[LMS_IS_TAIL] == 0 {
+                if is_stream == 1 {
+                    emit_zmm_stream_safe_rcx(0, is_64)
+                } else {
+                    if is_64 == 1 { emit_zmm0_store64_rcx() } else { emit_zmm0_store32_rcx() }
+                }
+            } else {
+                if is_64 == 1 { emit_zmm0_store64_k1_rcx() } else { emit_zmm0_store32_k1_rcx() }
+            }
+            continue
+        }
+
+        die_line("error: unimplemented or invalid loop lens", sline)
+    }
+    expect_kind(TOK_RBRACE)
+}
+
+fn lm_compile_simd_for(r_simd: i64, r_sline: i64, var1_sym: i64, lo_copy: i64, hi_disp: i64, outer_loc: i64) {
+    check_avx512_context(r_sline)
+
+    is_64 := 0
+    if r_simd == 8 { is_64 = 1 }
+
+    rem_disp   := alloc_anon_qwords(1)
+    iota_disp  := alloc_anon_qwords(8)
+    vec_i_disp := alloc_anon_qwords(8)
+
+    lm_simd_st[LMS_WIDTH]      = r_simd
+    lm_simd_st[LMS_IS64]       = is_64
+    lm_simd_st[LMS_IS_TAIL]    = 0
+    lm_simd_st[LMS_VAR_SYM]    = var1_sym
+    lm_simd_st[LMS_CUR_DISP]   = lo_copy
+    lm_simd_st[LMS_REM_DISP]   = rem_disp
+    lm_simd_st[LMS_VEC_I_DISP] = vec_i_disp
+    lm_simd_st[LMS_OUTER_LOC]  = outer_loc
+    lm_simd_st[LMS_LINE]       = r_sline
+
+    // Preload constant `[0, 1, ..., W-1]` iota vector once before loop head
+    if is_64 == 1 { emit_zmm0_iota64() } else { emit_zmm0_iota32() }
+    emit_zmm0_store_rbp(iota_disp)
+
+    // --- Pass 1: 512-Bit `EVEX` `ZMM` Main Loop (`hi - cur >= W`) ---
+    fast_top := g[G_CODE_OFF]
+    emit_load_local(hi_disp)
+    emit_load_local_rcx(lo_copy)
+    emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8)              // sub rax, rcx (`hi - cur`)
+    emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xF8)  emit_u8(r_simd) // cmp rax, W
+    emit_u8(0x0F)  emit_u8(0x8C)                             // jl .tail_pass (signed!)
+    tail_patch := g[G_CODE_OFF]
+    emit_u32(0)
+
+    emit_load_local(lo_copy)
+    lm_emit_splat_rax_simd()
+    emit_zmm1_load_rbp(iota_disp)
+    emit_zmm0_binop(TOK_PLUS, is_64)
+    emit_zmm0_store_rbp(vec_i_disp)
+
+    body_tok_start := g[G_TOK_IDX]
+    hdr_loc        := g[G_LOC_CNT]
+    hdr_fqw        := g[G_FRAME_QW]
+    lm_simd_st[LMS_IS_TAIL] = 0
+    lm_parse_simd_body()
+    body_tok_after := g[G_TOK_IDX]
+    g[G_LOC_CNT]    = hdr_loc
+    g[G_FRAME_QW]   = hdr_fqw
+
+    emit_load_local(lo_copy)
+    emit_add_rax_imm32(r_simd)
+    emit_store_local(lo_copy)
+    emit_jmp_to(fast_top)
+
+    // --- Pass 2: Single Branchless `k1`-Masked Tail Pass (`rem = hi - cur`, 0 scalar loop!) ---
+    patch_rel32_here(tail_patch)
+    // `rax` holds `rem = hi - cur` (`(hi - lo) & (W - 1)` when `hi > lo`, `<= 0` otherwise)
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0)              // test rax, rax
+    emit_u8(0x0F)  emit_u8(0x8E)                             // jle .simd_done
+    done_patch := g[G_CODE_OFF]
+    emit_u32(0)
+
+    emit_store_local(rem_disp)
+    emit_k1_lane_mask_eax(r_simd)
+
+    emit_load_local(lo_copy)
+    lm_emit_splat_rax_simd()
+    emit_zmm1_load_rbp(iota_disp)
+    emit_zmm0_binop(TOK_PLUS, is_64)
+    emit_zmm0_store_rbp(vec_i_disp)
+
+    g[G_TOK_IDX] = body_tok_start
+    lm_simd_st[LMS_IS_TAIL] = 1
+    lm_parse_simd_body()
+    g[G_LOC_CNT] = hdr_loc
+
+    patch_rel32_here(done_patch)
+    g[G_TOK_IDX] = body_tok_after
+}
+
+fn lm_emit_load_span_elem(idx_disp: i64, base_disp: i64, elem_disp: i64, elem_ty: i64, elem_sz: i64, pref_dist: i64) {
+    emit_load_local(idx_disp)
+    if elem_sz > 1 {
+        emit_mov_rcx_imm64(elem_sz)
+        emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xAF)  emit_u8(0xC1) // imul rax, rcx
+    }
+    emit_load_local_rcx(base_disp)
+    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx -> &base[idx]
+
+    if pref_dist >= 0 {
+        // `prefetcht0 [rax + disp32]` = `0F 18 88 <disp32>`
+        emit_u8(0x0F)  emit_u8(0x18)  emit_u8(0x88)
+        emit_u32(pref_dist)
+    }
+
+    if is_ty_vec(elem_ty) == 1 {
+        check_avx512_context(peek_line())
+        emit_load_mem_typed(elem_ty)
+        emit_zmm0_store_rbp(elem_disp)
+        return
+    }
+
+    if lm_is_struct_val(elem_ty) == 1 {
+        lm_emit_lea_local_rcx(elem_disp)
+        emit_store_mem_typed(elem_ty)
+    } else {
+        emit_load_mem_typed(elem_ty)
+        emit_narrow_rax(elem_ty)
+        emit_store_local(elem_disp)
+    }
+}
+
+fn parse_stmt_for() {
+    expect_kw(KW_FOR)
+    saved_loc := g[G_LOC_CNT]
+    g[G_SCOPE_DEPTH] += 1
+
+    var1_line := peek_line()
+    var1_sym  := expect_ident()
+    var2_sym: i64 = 0
+    if peek_kind() == TOK_COMMA {
+        g[G_TOK_IDX] += 1
+        var2_sym = expect_ident()
+    }
+    expect_kw(KW_IN)
+
+    // Check bare `@slab` / `@arena` / `@ring` / `@dma_queue` / `@capsule` identifier
+    is_span_mode := 0
+    base_disp: i64  = 0
+    bound_disp: i64 = 0
+    elem_ty: i64    = TY_U8
+    elem_sz: i64    = 1
+
+    sp_i: i64 = -1
+    if peek_kind() == TOK_IDENT {
+        nk := tok_kind[g[G_TOK_IDX] + 1]
+        if nk != TOK_LBRACK && nk != TOK_DOT && nk != TOK_LPAREN {
+            sp_i = find_space(peek_val())
+        }
+    }
+
+    if sp_i >= 0 {
+        if sp_kind[sp_i] == SKIND_PORT {
+            die_cur("error: parse fault (cannot iterate @port)")
+        }
+        g[G_TOK_IDX] += 1
+        base_disp = alloc_anon_qwords(1)
+        lm_emit_space_base_rax(sp_i)
+        emit_store_local(base_disp)
+
+        bound_disp = alloc_anon_qwords(1)
+        emit_mov_rax_imm64(sp_cap[sp_i])
+        emit_store_local(bound_disp)
+
+        elem_ty = sp_elem_ty[sp_i]
+        elem_sz = sp_elem_sz[sp_i]
+        is_span_mode = 1
+    } else {
+        // Evaluate `lo` / `mask` / `span_expr` BEFORE binding loop vars!
+        parse_expr(1)
+        ety1 := g[G_LAST_EXPR_TY]
+        if (ety1 & TY_FLAG_SPAN) != 0 {
+            emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0)                 // mov r8, rax
+            base_disp = alloc_anon_qwords(1)
+            emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x00)                 // mov rax, [r8]
+            emit_store_local(base_disp)
+            bound_disp = alloc_anon_qwords(1)
+            emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x40)  emit_u8(0x08)  // mov rax, [r8 + 8]
+            emit_store_local(bound_disp)
+            elem_ty = ety1 & TY_BASE_MASK
+            elem_sz = lm_ty_size(elem_ty)
+            is_span_mode = 1
+        }
+    }
+
+    // --- Branch 1: Span or Space Iteration (`for [idx,] elem in iterable [<lenses>]`) ---
+    if is_span_mode == 1 {
+        lm_parse_opt_for_lenses(1)
+        s_rev    := lm_lens_tmp[0]
+        s_tile   := lm_lens_tmp[1]
+        s_pref   := lm_lens_tmp[2]
+        s_stride := lm_lens_tmp[3]
+        s_pdist  := lm_lens_tmp[5]
+        s_tline  := lm_lens_tmp[6]
+        pref_arg := -1
+        if s_pref == 1 { pref_arg = s_pdist }
+
+        idx_disp: i64  = 0
+        elem_disp: i64 = 0
+        if var2_sym != 0 {
+            idx_disp  = alloc_local(var1_sym, TY_U64, var1_line)
+            elem_disp = alloc_local(var2_sym, elem_ty, var1_line)
+        } else {
+            idx_disp  = alloc_anon_qwords(1)
+            elem_disp = alloc_local(var1_sym, elem_ty, var1_line)
+        }
+
+        has_rec := block_has_trailing_recover(g[G_TOK_IDX])
+        rec_slot: i64 = 0
+        if has_rec == 1 {
+            rec_slot = g[G_REC_DEPTH]
+            rec_jmp_head[rec_slot]  = -1
+            rec_tile_base[rec_slot] = g[G_TILE_DEPTH]
+            g[G_REC_DEPTH] = rec_slot + 1
+        }
+        if s_tile == 1 {
+            emit_tile_enter_checked(s_tline)
+        }
+
+        ld := g[G_LP_DEPTH]
+        lp_cont_tgt[ld]  = -1
+        lp_brk_head[ld]  = -1
+        lp_cont_head[ld] = -1
+        lp_tile_base[ld] = g[G_TILE_DEPTH]
+        g[G_LP_DEPTH]    = ld + 1
+
+        if s_rev == 0 {
+            emit_mov_rax_imm64(0)
+            emit_store_local(idx_disp)
+            head_off := g[G_CODE_OFF]
+            emit_load_local(idx_disp)
+            emit_load_local_rcx(bound_disp)
+            emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+            emit_u8(0x0F)  emit_u8(0x83)                // jae .exit (unsigned!)
+            exit_p := g[G_CODE_OFF]
+            emit_u32(0)
+
+            lm_emit_load_span_elem(idx_disp, base_disp, elem_disp, elem_ty, elem_sz, pref_arg)
+            parse_raw_brace_stmts()
+
+            resolve_patch_chain(lp_cont_head[ld])
+            if s_stride == 1 {
+                emit_inc_local_qword(idx_disp)
+            } else {
+                emit_load_local(idx_disp)
+                emit_mov_rcx_imm64(s_stride)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+                emit_store_local(idx_disp)
+            }
+            emit_jmp_to(head_off)
+            patch_rel32_here(exit_p)
+        } else {
+            // Reverse span loop (`bound_disp` = `rem` initialized to `len`, safe at `len == 0`)
+            head_off := g[G_CODE_OFF]
+            emit_load_local(bound_disp)
+            exit_p := emit_jz_rel32()
+
+            emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xE8)  emit_u8(1) // sub rax, 1 -> idx = rem - 1
+            emit_store_local(idx_disp)
+
+            lm_emit_load_span_elem(idx_disp, base_disp, elem_disp, elem_ty, elem_sz, pref_arg)
+            parse_raw_brace_stmts()
+
+            resolve_patch_chain(lp_cont_head[ld])
+            emit_load_local(bound_disp)
+            emit_mov_rcx_imm64(s_stride)
+            emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx (rem vs stride)
+            emit_u8(0x77)  emit_u8(0x04)                // ja .sub_s (+4)
+            emit_u8(0x31)  emit_u8(0xC0)                // xor eax, eax
+            emit_u8(0xEB)  emit_u8(0x03)                // jmp .save_rem (+3)
+            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx
+            emit_store_local(bound_disp)
+            emit_jmp_to(head_off)
+            patch_rel32_here(exit_p)
+        }
+
+        g[G_LP_DEPTH] = ld
+        resolve_patch_chain(lp_brk_head[ld])
+        if s_tile == 1 {
+            emit_tile_exit_one()
+        }
+        g[G_SCOPE_DEPTH] -= 1
+        g[G_LOC_CNT] = saved_loc
+        if has_rec == 1 {
+            finish_recover_clause(rec_slot)
+        }
+        return
+    }
+
+    if var2_sym != 0 {
+        die_cur("error: parse fault (2-variable for loop requires span or space)")
+    }
+
+    // --- Branch 2: Range Iteration (`for i in lo..hi [<rev | stride: S | unroll: K | simd: W | tile>]`) ---
+    if peek_kind() == TOK_DOT2 {
+        g[G_TOK_IDX] += 1
+
+        idx_disp := alloc_local(var1_sym, TY_I64, var1_line)
+        emit_store_local(idx_disp)      // `i = lo`
+        lo_copy := alloc_anon_qwords(1)
+        emit_load_local(idx_disp)
+        emit_store_local(lo_copy)       // `lo` / `cur` copy for `<rev>`, `<unroll: K>`, & `<simd: W>`
+
+        parse_expr(1)                   // `hi` -> `rax`
+        hi_disp := alloc_anon_qwords(1)
+        emit_store_local(hi_disp)
+
+        lm_parse_opt_for_lenses(0)
+        r_rev    := lm_lens_tmp[0]
+        r_tile   := lm_lens_tmp[1]
+        r_stride := lm_lens_tmp[3]
+        r_unroll := lm_lens_tmp[4]
+        r_tline  := lm_lens_tmp[6]
+        r_simd   := lm_lens_tmp[7]
+        r_sline  := lm_lens_tmp[8]
+
+        has_rec := block_has_trailing_recover(g[G_TOK_IDX])
+        rec_slot: i64 = 0
+        if has_rec == 1 {
+            rec_slot = g[G_REC_DEPTH]
+            rec_jmp_head[rec_slot]  = -1
+            rec_tile_base[rec_slot] = g[G_TILE_DEPTH]
+            g[G_REC_DEPTH] = rec_slot + 1
+        }
+        if r_tile == 1 {
+            emit_tile_enter_checked(r_tline)
+        }
+
+        if r_simd > 0 {
+            lm_compile_simd_for(r_simd, r_sline, var1_sym, lo_copy, hi_disp, saved_loc + 1)
+            if r_tile == 1 {
+                emit_tile_exit_one()
+            }
+            g[G_SCOPE_DEPTH] -= 1
+            g[G_LOC_CNT] = saved_loc
+            if has_rec == 1 {
+                finish_recover_clause(rec_slot)
+            }
+            return
+        }
+
+        ld := g[G_LP_DEPTH]
+        lp_cont_tgt[ld]  = -1
+        lp_brk_head[ld]  = -1
+        lp_cont_head[ld] = -1
+        lp_tile_base[ld] = g[G_TILE_DEPTH]
+        g[G_LP_DEPTH]    = ld + 1
+
+        if r_rev == 1 {
+            // Reverse range: if `hi <= lo`, skip; else `i = hi - 1`, loop with `i - lo >= stride`
+            emit_load_local(hi_disp)
+            emit_load_local_rcx(lo_copy)
+            emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx (hi vs lo)
+            emit_u8(0x0F)  emit_u8(0x8E)                // jle .exit_rev
+            exit_rev1 := g[G_CODE_OFF]
+            emit_u32(0)
+
+            emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xE8)  emit_u8(1) // sub rax, 1
+            emit_store_local(idx_disp)
+
+            rev_top := g[G_CODE_OFF]
+            parse_raw_brace_stmts()
+
+            resolve_patch_chain(lp_cont_head[ld])
+            emit_load_local(idx_disp)
+            emit_load_local_rcx(lo_copy)
+            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx (rem = i - lo)
+            emit_mov_rcx_imm64(r_stride)
+            emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+            emit_u8(0x0F)  emit_u8(0x82)                // jb .exit_rev2
+            exit_rev2 := g[G_CODE_OFF]
+            emit_u32(0)
+
+            emit_load_local(idx_disp)
+            emit_mov_rcx_imm64(r_stride)
+            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx
+            emit_store_local(idx_disp)
+            emit_jmp_to(rev_top)
+
+            patch_rel32_here(exit_rev1)
+            patch_rel32_here(exit_rev2)
+        } else {
+            if r_unroll > 1 {
+                // Token-replay hardware loop unrolling (`<unroll: K>`, `K` in {2, 4, 8})
+                body_tok_start := g[G_TOK_IDX]
+                body_tok_after: i64 = body_tok_start
+
+                fast_top := g[G_CODE_OFF]
+                emit_load_local(hi_disp)
+                emit_load_local_rcx(lo_copy)
+                emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx (hi - cur)
+                min_span := (r_unroll - 1) * r_stride + 1
+                emit_mov_rcx_imm64(min_span)
+                emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+                emit_u8(0x0F)  emit_u8(0x8C)                // jl .tail_loop (signed!)
+                tail_patch := g[G_CODE_OFF]
+                emit_u32(0)
+
+                for lane in 0..r_unroll {
+                    emit_load_local(lo_copy)
+                    if lane > 0 {
+                        emit_mov_rcx_imm64(lane * r_stride)
+                        emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+                    }
+                    emit_store_local(idx_disp)
+
+                    g[G_TOK_IDX] = body_tok_start
+                    hdr_loc := g[G_LOC_CNT]
+                    hdr_fqw := g[G_FRAME_QW]
+                    parse_raw_brace_stmts()
+                    g[G_LOC_CNT]  = hdr_loc
+                    g[G_FRAME_QW] = hdr_fqw
+                    body_tok_after = g[G_TOK_IDX]
+
+                    // `continue` inside lane jumps cleanly to the next lane!
+                    resolve_patch_chain(lp_cont_head[ld])
+                    lp_cont_head[ld] = -1
+                }
+
+                // `cur += K * stride`
+                emit_load_local(lo_copy)
+                emit_mov_rcx_imm64(r_unroll * r_stride)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                emit_store_local(lo_copy)
+                emit_jmp_to(fast_top)
+
+                // Scalar remainder loop for `< K` trailing iterations
+                patch_rel32_here(tail_patch)
+                emit_load_local(lo_copy)
+                emit_store_local(idx_disp)
+
+                tail_top := g[G_CODE_OFF]
+                emit_load_local(idx_disp)
+                emit_load_local_rcx(hi_disp)
+                emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8)
+                emit_u8(0x0F)  emit_u8(0x8D)                // jge .done_unroll
+                done_unr := g[G_CODE_OFF]
+                emit_u32(0)
+
+                g[G_TOK_IDX] = body_tok_start
+                hdr_loc2 := g[G_LOC_CNT]
+                parse_raw_brace_stmts()
+                g[G_LOC_CNT] = hdr_loc2
+
+                resolve_patch_chain(lp_cont_head[ld])
+                lp_cont_head[ld] = -1
+                if r_stride == 1 {
+                    emit_inc_local_qword(idx_disp)
+                } else {
+                    emit_load_local(idx_disp)
+                    emit_mov_rcx_imm64(r_stride)
+                    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                    emit_store_local(idx_disp)
+                }
+                emit_jmp_to(tail_top)
+
+                patch_rel32_here(done_unr)
+                g[G_TOK_IDX] = body_tok_after
+            } else {
+                // Standard / strided forward range loop
+                head_off := g[G_CODE_OFF]
+                emit_load_local(idx_disp)
+                emit_load_local_rcx(hi_disp)
+                emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+                emit_u8(0x0F)  emit_u8(0x8D)                // jge .exit
+                exit_p := g[G_CODE_OFF]
+                emit_u32(0)
+
+                parse_raw_brace_stmts()
+
+                resolve_patch_chain(lp_cont_head[ld])
+                if r_stride == 1 {
+                    emit_inc_local_qword(idx_disp)
+                } else {
+                    emit_load_local(idx_disp)
+                    emit_mov_rcx_imm64(r_stride)
+                    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+                    emit_store_local(idx_disp)
+                }
+                emit_jmp_to(head_off)
+                patch_rel32_here(exit_p)
+            }
+        }
+
+        g[G_LP_DEPTH] = ld
+        resolve_patch_chain(lp_brk_head[ld])
+        if r_tile == 1 {
+            emit_tile_exit_one()
+        }
+        g[G_SCOPE_DEPTH] -= 1
+        g[G_LOC_CNT] = saved_loc
+        if has_rec == 1 {
+            finish_recover_clause(rec_slot)
+        }
+        return
+    }
+
+    // --- Branch 3: `<bits>` Hardware Set-Bit Iteration (`tzcnt` + `blsr`) ---
+    v_disp := alloc_local(var1_sym, TY_I64, var1_line)
+    mask_slot := alloc_anon_qwords(1)
+    emit_store_local(mask_slot)
+
+    if peek_kind() != TOK_LT {
+        die_cur("error: unimplemented or invalid loop lens")
+    }
+    lt_ln := peek_line()
+    g[G_TOK_IDX] += 1
+    if peek_kind() != TOK_IDENT || peek_val() != g[G_SYM_BITS] {
+        die_line("error: unimplemented or invalid loop lens", lt_ln)
+    }
+    g[G_TOK_IDX] += 1
+    if peek_kind() != TOK_GT {
+        die_line("error: unimplemented or invalid loop lens", lt_ln)
+    }
+    g[G_TOK_IDX] += 1
+
+    has_rec := block_has_trailing_recover(g[G_TOK_IDX])
+    rec_slot: i64 = 0
+    if has_rec == 1 {
+        rec_slot = g[G_REC_DEPTH]
+        rec_jmp_head[rec_slot]  = -1
+        rec_tile_base[rec_slot] = g[G_TILE_DEPTH]
+        g[G_REC_DEPTH] = rec_slot + 1
+    }
+
+    ld := g[G_LP_DEPTH]
+    lp_cont_tgt[ld]  = -1
+    lp_brk_head[ld]  = -1
+    lp_cont_head[ld] = -1
+    lp_tile_base[ld] = g[G_TILE_DEPTH]
+    g[G_LP_DEPTH]    = ld + 1
+
+    head_off := g[G_CODE_OFF]
+    emit_load_local(mask_slot)
+    exit_p := emit_jz_rel32()
+    // `tzcnt rax, rax` (`F3 48 0F BC C0`)
+    emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBC)  emit_u8(0xC0)
+    emit_store_local(v_disp)
+
+    parse_raw_brace_stmts()
+
+    g[G_LP_DEPTH] = ld
+    resolve_patch_chain(lp_cont_head[ld])
+    emit_load_local(mask_slot)
+    // `blsr rax, rax` (`C4 E2 F8 F3 C8`)
+    emit_u8(0xC4)  emit_u8(0xE2)  emit_u8(0xF8)  emit_u8(0xF3)  emit_u8(0xC8)
+    emit_store_local(mask_slot)
+    emit_jmp_to(head_off)
+
+    patch_rel32_here(exit_p)
+    resolve_patch_chain(lp_brk_head[ld])
+    g[G_SCOPE_DEPTH] -= 1
+    g[G_LOC_CNT] = saved_loc
+    if has_rec == 1 {
+        finish_recover_clause(rec_slot)
+    }
+}

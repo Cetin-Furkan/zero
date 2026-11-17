@@ -1,0 +1,1455 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — Types, Constants, & Spaces (`compiler/types_spaces.zr`)
+// =============================================================================
+// Full multi-stage top-level prescan & hardware layout engine matching `bootstrap/types.inc`:
+//   1. Inventories top-level `::`, `@space`, and `[@isr|@isr_ok] fn` declarations,
+//      enforcing top-level symbol uniqueness and target gates (`--target=efi-os`, `--target=capsule`).
+//   2. Resolves `Name :: <f0: w0 | ...>` BitPack layouts (MSB -> LSB, 8/16/32/64-bit check).
+//   3. Runs early constant fixed-point pass (`[hi:lo]` bit-slices, `@sizeof`, `@alignof`).
+//   4. Resolves `Struct` (`<packed>`, `<align: N>`) & `@cell64` (`<= 64B`, `64B` align) layouts.
+//   5. Runs late constant fixed-point pass (resolving forward `@sizeof(Struct)` / `@alignof(Struct)`).
+//   6. Resolves programmable `Name :: @ptr<Elem | mask | wrap | stride | bswap>` pointer lenses.
+//   7. Allocates 4KiB-aligned `.bss` spaces (`@slab`, `@arena`, `@capsule`, `@ring`, `@dma_queue`)
+//      and hardware I/O `@port` channels.
+//   8. Prescans all `fn` / `@isr fn` / `@isr_ok fn` signatures and parameter/return types.
+// =============================================================================
+
+// --- User Type & Struct Field Lookup Helpers ---
+
+@slab cst_end : <u32 | max: 4096>
+
+fn find_user_type(sym: i64) i64 {
+    cnt := g[G_UT_CNT]
+    for i in 0..cnt {
+        if ut_sym[i] == sym {
+            return i
+        }
+    }
+    return -1
+}
+
+fn find_struct_field(ut_idx: i64, fsym: i64) i64 {
+    fstart: i64 = ut_fstart[ut_idx]
+    fcnt: i64   = ut_fcnt[ut_idx]
+    for i in 0..fcnt {
+        fi := fstart + i
+        if fld_sym[fi] == fsym {
+            return fi
+        }
+    }
+    return -1
+}
+
+fn is_ty_vec(ty: i64) i64 {
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 0 }
+    base := ty & TY_BASE_MASK
+    if base == TY_U32X16 || base == TY_U64X8 { return 1 }
+    return 0
+}
+
+fn check_ring0_zmm_allowed(line: i64) {
+    if g[G_IN_ISR_MODE] != 0 {
+        die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", line)
+    }
+    if g[G_MODE_EFI] == 1 && g[G_TILE_DEPTH] <= 0 {
+        die_line("error: AVX-512 <simd> in Ring-0 requires enclosing <tile>", line)
+    }
+    g[G_TILE_USED_ZMM] = 1
+}
+
+fn ts_type_size(ty: i64) i64 {
+    if (ty & TY_FLAG_SPAN) != 0 { return 16 }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    base := ty & TY_BASE_MASK
+    if base == TY_U32X16 || base == TY_U64X8 { return 64 }
+    if base >= TY_PTR_BASE { return 8 }
+    if base >= TY_STRUCT_BASE {
+        return ut_size[base - TY_STRUCT_BASE]
+    }
+    if base >= TY_BP_BASE {
+        return bp_bytes[base - TY_BP_BASE]
+    }
+    if base == TY_U8  || base == TY_I8  { return 1 }
+    if base == TY_U16 || base == TY_I16 { return 2 }
+    if base == TY_U32 || base == TY_I32 { return 4 }
+    return 8
+}
+
+fn ty_align(ty: i64) i64 {
+    if (ty & TY_FLAG_SPAN) != 0 { return 8 }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    base := ty & TY_BASE_MASK
+    if base == TY_U32X16 || base == TY_U64X8 { return 64 }
+    if base >= TY_PTR_BASE { return 8 }
+    if base >= TY_STRUCT_BASE {
+        return ut_align[base - TY_STRUCT_BASE]
+    }
+    if base >= TY_BP_BASE {
+        return bp_bytes[base - TY_BP_BASE]
+    }
+    if base == TY_U8  || base == TY_I8  { return 1 }
+    if base == TY_U16 || base == TY_I16 { return 2 }
+    if base == TY_U32 || base == TY_I32 { return 4 }
+    return 8
+}
+
+// --- Full Type Annotation Parser (Scalars, Spans, Views, Atomics, BitPacks, Structs, `@ptr`) ---
+
+fn parse_full_type_tag() i64 {
+    // `!Fault` error-returning scalar shorthand -> `TY_I64`
+    if peek_kind() == TOK_BANG {
+        g[G_TOK_IDX] += 1
+        expect_ident()
+        return TY_I64
+    }
+
+    // `[]T` bounded span (`16B` `{ base, len }`)
+    if peek_kind() == TOK_LBRACK {
+        g[G_TOK_IDX] += 1
+        expect_kind(TOK_RBRACK)
+        elem := parse_full_type_tag()
+        return (elem & TY_BASE_MASK) | TY_FLAG_SPAN
+    }
+
+    // `@span<T>`, `@atomic<T>`, `@stream<T>`, `@mmio<T>`, or `@T` single overlay pointer
+    if peek_kind() == TOK_AT {
+        g[G_TOK_IDX] += 1
+        if peek_kind() == TOK_KW && peek_kw() == KW_MMIO {
+            g[G_TOK_IDX] += 1
+            expect_kind(TOK_LT)
+            elem := parse_full_type_tag()
+            expect_kind(TOK_GT)
+            return (elem & TY_BASE_MASK) | TY_FLAG_VIEW1 | TY_FLAG_MMIO
+        }
+        if peek_kind() == TOK_IDENT {
+            psym := peek_val()
+            if psym == g[G_SYM_SPAN] {
+                g[G_TOK_IDX] += 1
+                expect_kind(TOK_LT)
+                elem := parse_full_type_tag()
+                expect_kind(TOK_GT)
+                return (elem & TY_BASE_MASK) | TY_FLAG_SPAN
+            }
+            if psym == g[G_SYM_ATOMIC] {
+                g[G_TOK_IDX] += 1
+                expect_kind(TOK_LT)
+                elem := parse_full_type_tag()
+                expect_kind(TOK_GT)
+                return (elem & TY_BASE_MASK) | TY_FLAG_ATOMIC
+            }
+            if psym == g[G_SYM_STREAM] {
+                g[G_TOK_IDX] += 1
+                expect_kind(TOK_LT)
+                elem := parse_full_type_tag()
+                expect_kind(TOK_GT)
+                return (elem & TY_BASE_MASK) | TY_FLAG_SPAN | TY_FLAG_STREAM
+            }
+        }
+        elem := parse_full_type_tag()
+        return (elem & TY_BASE_MASK) | TY_FLAG_VIEW1
+    }
+
+    sym := expect_ident()
+    if sym == g[G_SYM_I64]    { return TY_I64 }
+    if sym == g[G_SYM_U64]    { return TY_U64 }
+    if sym == g[G_SYM_MASK64] { return TY_U64 }
+    if sym == g[G_SYM_I32]    { return TY_I32 }
+    if sym == g[G_SYM_U32]    { return TY_U32 }
+    if sym == g[G_SYM_I16]    { return TY_I16 }
+    if sym == g[G_SYM_U16]    { return TY_U16 }
+    if sym == g[G_SYM_I8]     { return TY_I8 }
+    if sym == g[G_SYM_U8]     { return TY_U8 }
+    if sym == g[G_SYM_BOOL]   { return TY_U8 }
+    if sym == g[G_SYM_BIT]    { return TY_U8 }
+    if sym == g[G_SYM_STR]    { return TY_U8 | TY_FLAG_SPAN }
+    if sym == g[G_SYM_BYTES]  { return TY_U8 | TY_FLAG_SPAN }
+    if sym == g[G_SYM_U32X16] { return TY_U32X16 }
+    if sym == g[G_SYM_U64X8]  { return TY_U64X8 }
+
+    ut_idx := find_user_type(sym)
+    if ut_idx >= 0 {
+        uk: i64 = ut_kind[ut_idx]
+        if uk == UKIND_BITPACK {
+            return TY_BP_BASE + ut_idx
+        }
+        if uk == UKIND_PTR {
+            return TY_PTR_BASE + ut_idx
+        }
+        return TY_STRUCT_BASE + ut_idx
+    }
+
+    die_cur("error: parse fault (unknown type)")
+    return TY_I64
+}
+
+// --- Compile-Time Constant Expression Evaluator (`[hi:lo]`, `@sizeof`, `@alignof`, full ALU/cmp) ---
+
+fn ts_const_prec(idx: i64) i64 {
+    k := tok_kind[idx]
+    if k == TOK_OR2     { return 2 }
+    if k == TOK_AND2    { return 3 }
+    if k == TOK_PIPE    { return 4 }
+    if k == TOK_CARET   { return 5 }
+    if k == TOK_AMP     { return 6 }
+    if k == TOK_EQ || k == TOK_NE { return 7 }
+    if k == TOK_LT {
+        if is_descriptor_lt_at(idx) == 1 { return 0 }
+        return 8
+    }
+    if k == TOK_LE || k == TOK_GT || k == TOK_GE { return 8 }
+    if k == TOK_SHL || k == TOK_SHR || k == TOK_ROL || k == TOK_ROR { return 9 }
+    if k == TOK_PLUS || k == TOK_MINUS { return 10 }
+    if k == TOK_STAR || k == TOK_SLASH || k == TOK_PERCENT { return 11 }
+    return 0
+}
+
+fn eval_ts_const_primary() i64 {
+    k := peek_kind()
+
+    if k == TOK_MINUS {
+        g[G_TOK_IDX] += 1
+        return -eval_ts_const_unary()
+    }
+    if k == TOK_TILDE {
+        g[G_TOK_IDX] += 1
+        return ~eval_ts_const_unary()
+    }
+    if k == TOK_BANG {
+        g[G_TOK_IDX] += 1
+        v := eval_ts_const_unary()
+        if v == 0 { return 1 }
+        return 0
+    }
+    if k == TOK_LPAREN {
+        g[G_TOK_IDX] += 1
+        v := eval_ts_const_expr(1)
+        expect_kind(TOK_RPAREN)
+        return v
+    }
+    if k == TOK_INT || k == TOK_CHAR {
+        v := peek_val()
+        g[G_TOK_IDX] += 1
+        return v
+    }
+    if k == TOK_KW {
+        kw := peek_kw()
+        if kw == KW_TRUE {
+            g[G_TOK_IDX] += 1
+            return 1
+        }
+        if kw == KW_FALSE {
+            g[G_TOK_IDX] += 1
+            return 0
+        }
+        die_cur("error: parse fault (unexpected keyword in constant expression)")
+    }
+    if k == TOK_AT {
+        g[G_TOK_IDX] += 1
+        isym := expect_ident()
+        is_align := 0
+        if isym == g[G_SYM_ALIGNOF] {
+            is_align = 1
+        } else {
+            if isym != g[G_SYM_SIZEOF] {
+                die_cur("error: parse fault (unsupported @ intrinsic in constant expression)")
+            }
+        }
+        expect_kind(TOK_LPAREN)
+        if peek_kind() == TOK_AT {
+            g[G_TOK_IDX] += 1
+            parse_full_type_tag()
+            expect_kind(TOK_RPAREN)
+            return 8
+        }
+        ty := parse_full_type_tag()
+        if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) == 0 {
+            base := ty & TY_BASE_MASK
+            if base >= TY_STRUCT_BASE && base < TY_PTR_BASE {
+                st_idx := base - TY_STRUCT_BASE
+                if ut_size[st_idx] == 0 {
+                    expect_kind(TOK_RPAREN)
+                    if g[G_CST_TRIAL] == 1 {
+                        g[G_CST_UNRES] = 1
+                        return 0
+                    }
+                    die_cur("error: unresolved or cyclic constant")
+                }
+            }
+        }
+        expect_kind(TOK_RPAREN)
+        if is_align == 1 {
+            return ty_align(ty)
+        }
+        return ts_type_size(ty)
+    }
+    if k == TOK_IDENT {
+        sym := expect_ident()
+        ci := find_const(sym)
+        if ci < 0 {
+            if g[G_CST_TRIAL] == 1 {
+                g[G_CST_UNRES] = 1
+                return 0
+            }
+            die_cur("error: parse fault (undefined constant identifier)")
+        }
+        if cst_done[ci] == 0 {
+            if g[G_CST_TRIAL] == 1 {
+                g[G_CST_UNRES] = 1
+                return 0
+            }
+            die_cur("error: unresolved or cyclic constant")
+        }
+        return cst_val[ci]
+    }
+
+    die_cur("error: parse fault (invalid constant expression)")
+    return 0
+}
+
+fn eval_ts_const_unary() i64 {
+    val := eval_ts_const_primary()
+    loop <max: 16 | until: peek_kind() != TOK_LBRACK> {
+        bline := peek_line()
+        g[G_TOK_IDX] += 1
+        hi := eval_ts_const_expr(1)
+        expect_kind(TOK_COLON)
+        lo := eval_ts_const_expr(1)
+        expect_kind(TOK_RBRACK)
+        if g[G_CST_UNRES] == 0 {
+            if lo < 0 || hi > 63 || hi < lo {
+                die_line("error: parse fault (invalid [hi:lo] bit-slice bounds)", bline)
+            }
+            w := hi - lo + 1
+            u_val: u64 = val
+            u_lo: u64  = lo
+            u_val = u_val >> u_lo
+            if w < 64 {
+                u_msk: u64 = width_mask64(w)
+                u_val = u_val & u_msk
+            }
+            val = u_val
+        }
+    }
+    return val
+}
+
+fn eval_ts_const_expr(min_prec: i64) i64 {
+    lhs := eval_ts_const_unary()
+    loop <max: 1024 | until: 0 == 1> {
+        cur_i := g[G_TOK_IDX]
+        prec  := ts_const_prec(cur_i)
+        if prec < min_prec { break }
+        op := tok_kind[cur_i]
+        g[G_TOK_IDX] = cur_i + 1
+        rhs := eval_ts_const_expr(prec + 1)
+        if g[G_CST_UNRES] != 0 {
+            continue
+        }
+        if op == TOK_PLUS  { lhs = lhs + rhs }
+        if op == TOK_MINUS { lhs = lhs - rhs }
+        if op == TOK_STAR  { lhs = lhs * rhs }
+        if op == TOK_SLASH {
+            if rhs == 0 {
+                if g[G_CST_TRIAL] == 1 {
+                    g[G_CST_UNRES] = 1
+                    return 0
+                }
+                die_cur("error: parse fault (division by zero in constant)")
+            }
+            lhs = lhs / rhs
+        }
+        if op == TOK_PERCENT {
+            if rhs == 0 {
+                if g[G_CST_TRIAL] == 1 {
+                    g[G_CST_UNRES] = 1
+                    return 0
+                }
+                die_cur("error: parse fault (remainder by zero in constant)")
+            }
+            lhs = lhs % rhs
+        }
+        if op == TOK_SHL   { lhs = lhs << rhs }
+        if op == TOK_SHR   { lhs = lhs >> rhs }
+        if op == TOK_ROL   { lhs = lhs <<< rhs }
+        if op == TOK_ROR   { lhs = lhs >>> rhs }
+        if op == TOK_AMP   { lhs = lhs & rhs }
+        if op == TOK_PIPE  { lhs = lhs | rhs }
+        if op == TOK_CARET { lhs = lhs ^ rhs }
+        if op == TOK_EQ    { if lhs == rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_NE    { if lhs != rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_LT    { if lhs <  rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_LE    { if lhs <= rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_GT    { if lhs >  rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_GE    { if lhs >= rhs { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_AND2  { if lhs != 0 && rhs != 0 { lhs = 1 } else { lhs = 0 } }
+        if op == TOK_OR2   { if lhs != 0 || rhs != 0 { lhs = 1 } else { lhs = 0 } }
+    }
+    return lhs
+}
+
+// Evaluates a constant expression inside `<...>` bounded by top-level `|` or `>`
+fn parse_const_lens_expr() i64 {
+    start_i := g[G_TOK_IDX]
+    pdepth  := 0
+    idx     := start_i
+    loop <max: 65536 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            die_cur("error: parse fault (unclosed '<...>' constant clause)")
+        }
+        if k == TOK_LPAREN || k == TOK_LBRACK {
+            pdepth += 1
+            idx += 1
+            continue
+        }
+        if k == TOK_RPAREN || k == TOK_RBRACK {
+            if pdepth > 0 { pdepth -= 1 }
+            idx += 1
+            continue
+        }
+        if pdepth == 0 && (k == TOK_PIPE || k == TOK_GT) {
+            break
+        }
+        idx += 1
+    }
+    if idx == start_i {
+        die_cur("error: parse fault (empty constant clause)")
+    }
+    saved_k := tok_kind[idx]
+    tok_kind[idx] = TOK_EOF
+    g[G_TOK_IDX]  = start_i
+    val := eval_ts_const_expr(1)
+    tok_kind[idx] = saved_k
+    if g[G_TOK_IDX] != idx {
+        die_cur("error: parse fault (trailing tokens in constant clause)")
+    }
+    return val
+}
+
+// Non-destructively evaluates `[start_idx .. end_idx)` in trial mode.
+// Sets `g[G_CST_UNRES] = 0` on success (returning `val`), or `g[G_CST_UNRES] = 1` on failure.
+fn try_eval_const_fenced(start_idx: i64, end_idx: i64) i64 {
+    if end_idx <= start_idx {
+        g[G_CST_UNRES] = 1
+        return 0
+    }
+    saved_k := tok_kind[end_idx]
+    saved_t := g[G_CST_TRIAL]
+    tok_kind[end_idx] = TOK_EOF
+    g[G_CST_TRIAL]    = 1
+    g[G_CST_UNRES]    = 0
+    g[G_TOK_IDX]      = start_idx
+    val := eval_ts_const_expr(1)
+    tok_kind[end_idx] = saved_k
+    g[G_CST_TRIAL]    = saved_t
+    if g[G_TOK_IDX] != end_idx {
+        g[G_CST_UNRES] = 1
+        return 0
+    }
+    return val
+}
+
+// Checks if an `if` condition starting at `g[G_TOK_IDX]` up to `{` is compile-time constant.
+// Returns `1` (true) or `0` (false) with `g[G_TOK_IDX]` positioned at `{`,
+// or `-1` (not constant) with `g[G_TOK_IDX]` rewound to the condition start.
+fn try_eval_const_if_cond() i64 {
+    start_idx := g[G_TOK_IDX]
+    idx       := start_idx
+    loop <max: 65536 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            g[G_TOK_IDX] = start_idx
+            return -1
+        }
+        if k == TOK_LBRACE {
+            break
+        }
+        if k == TOK_DOT || k == TOK_LBRACK || k == TOK_SLASH || k == TOK_PERCENT {
+            g[G_TOK_IDX] = start_idx
+            return -1
+        }
+        if k == TOK_AT {
+            if tok_kind[idx + 1] != TOK_IDENT {
+                g[G_TOK_IDX] = start_idx
+                return -1
+            }
+            asym := tok_val[idx + 1]
+            if asym != g[G_SYM_SIZEOF] && asym != g[G_SYM_ALIGNOF] {
+                g[G_TOK_IDX] = start_idx
+                return -1
+            }
+            if tok_kind[idx + 2] != TOK_LPAREN {
+                g[G_TOK_IDX] = start_idx
+                return -1
+            }
+            idx += 3
+            pd := 1
+            loop <max: 1024 | until: pd == 0> {
+                pk := tok_kind[idx]
+                if pk == TOK_EOF {
+                    g[G_TOK_IDX] = start_idx
+                    return -1
+                }
+                if pk == TOK_LPAREN { pd += 1 }
+                if pk == TOK_RPAREN { pd -= 1 }
+                idx += 1
+            }
+            continue
+        }
+        if k == TOK_IDENT {
+            nk := tok_kind[idx + 1]
+            if nk == TOK_LPAREN || nk == TOK_LT || nk == TOK_LBRACE {
+                g[G_TOK_IDX] = start_idx
+                return -1
+            }
+            sym := tok_val[idx]
+            if find_local(sym) >= 0 || find_space(sym) >= 0 || find_const(sym) < 0 {
+                g[G_TOK_IDX] = start_idx
+                return -1
+            }
+        }
+        idx += 1
+    }
+
+    if idx == start_idx {
+        g[G_TOK_IDX] = start_idx
+        return -1
+    }
+    val := try_eval_const_fenced(start_idx, idx)
+    if g[G_CST_UNRES] != 0 {
+        g[G_TOK_IDX] = start_idx
+        return -1
+    }
+    g[G_TOK_IDX] = idx
+    if val != 0 {
+        return 1
+    }
+    return 0
+}
+
+// --- Balanced Block & Top-Level Declaration Skippers ---
+
+fn ts_skip_brace_block() {
+    expect_kind(TOK_LBRACE)
+    depth := 1
+    loop <max: 262144 | until: depth == 0> {
+        k := peek_kind()
+        if k == TOK_EOF {
+            die_cur("error: parse fault (unclosed '{' block)")
+        }
+        if k == TOK_LBRACE { depth += 1 }
+        if k == TOK_RBRACE { depth -= 1 }
+        g[G_TOK_IDX] += 1
+    }
+}
+
+fn ts_skip_angle_block() {
+    expect_kind(TOK_LT)
+    depth := 1
+    loop <max: 65536 | until: depth == 0> {
+        k := peek_kind()
+        if k == TOK_EOF {
+            die_cur("error: parse fault (unclosed '<...>' descriptor)")
+        }
+        if k == TOK_LT { depth += 1 }
+        if k == TOK_GT { depth -= 1 }
+        g[G_TOK_IDX] += 1
+    }
+}
+
+// Advances across a top-level constant RHS or `fn ... => expr` until next top-level declaration
+fn ts_skip_top_rhs() {
+    depth := 0
+    loop <max: 262144 | until: 0 == 1> {
+        idx := g[G_TOK_IDX]
+        k   := tok_kind[idx]
+        if k == TOK_EOF {
+            break
+        }
+        if k == TOK_LPAREN || k == TOK_LBRACK || k == TOK_LBRACE {
+            depth += 1
+            g[G_TOK_IDX] = idx + 1
+            continue
+        }
+        if k == TOK_RPAREN || k == TOK_RBRACK || k == TOK_RBRACE {
+            if depth > 0 {
+                depth -= 1
+                g[G_TOK_IDX] = idx + 1
+                continue
+            }
+        }
+        if depth == 0 {
+            if k == TOK_KW && tok_kw[idx] == KW_FN {
+                break
+            }
+            if k == TOK_IDENT && tok_kind[idx + 1] == TOK_COLON2 {
+                break
+            }
+            if k == TOK_AT {
+                if tok_kind[idx + 2] == TOK_KW && tok_kw[idx + 2] == KW_FN {
+                    break
+                }
+                if tok_kind[idx + 2] == TOK_IDENT && tok_kind[idx + 3] == TOK_COLON {
+                    break
+                }
+            }
+        }
+        g[G_TOK_IDX] = idx + 1
+    }
+}
+
+// Skips any top-level `Name :: ...` declaration (`Struct`, `@cell64`, `@ptr`, `BitPack`, or `Const`)
+fn skip_top_colon2_decl() {
+    expect_ident()
+    expect_kind(TOK_COLON2)
+    k := peek_kind()
+    if k == TOK_LBRACE {
+        ts_skip_brace_block()
+        return
+    }
+    if k == TOK_AT {
+        k1 := tok_kind[g[G_TOK_IDX] + 1]
+        if k1 == TOK_KW && tok_kw[g[G_TOK_IDX] + 1] == KW_CELL64 {
+            g[G_TOK_IDX] += 2
+            ts_skip_brace_block()
+            return
+        }
+        if k1 == TOK_IDENT && tok_val[g[G_TOK_IDX] + 1] == g[G_SYM_PTR] {
+            g[G_TOK_IDX] += 2
+            ts_skip_angle_block()
+            return
+        }
+    }
+    if k == TOK_LT {
+        ts_skip_angle_block()
+        if peek_kind() == TOK_LBRACE {
+            ts_skip_brace_block()
+        }
+        return
+    }
+    ts_skip_top_rhs()
+}
+
+// Skips any top-level `@space name : <...>` declaration (`@` NOT yet consumed)
+fn skip_top_space_decl() {
+    expect_kind(TOK_AT)
+    g[G_TOK_IDX] += 1
+    expect_ident()
+    expect_kind(TOK_COLON)
+    ts_skip_angle_block()
+}
+
+fn ts_check_top_unique(sym: i64, line: i64) {
+    if find_const(sym) >= 0 || find_user_type(sym) >= 0 || find_space(sym) >= 0 {
+        die_line("error: duplicate top-level symbol", line)
+    }
+}
+
+// --- Stage 2..7 Resolution Passes ---
+
+fn ts_parse_bit_width() i64 {
+    k := peek_kind()
+    if k == TOK_INT {
+        w := peek_val()
+        g[G_TOK_IDX] += 1
+        if w < 1 || w > 64 {
+            die_cur("error: parse fault (bit-layout field width out of 1..64)")
+        }
+        return w
+    }
+    if k == TOK_IDENT {
+        sym := expect_ident()
+        if sym == g[G_SYM_BIT] || sym == g[G_SYM_BOOL] {
+            return 1
+        }
+        slen: i64 = sym_len[sym]
+        soff: i64 = sym_off[sym]
+        if slen < 2 || slen > 3 {
+            die_cur("error: parse fault (invalid bit-layout width specifier)")
+        }
+        c0: u8 = str_pool[soff]
+        if c0 != 'u' && c0 != 'i' && c0 != 'b' {
+            die_cur("error: parse fault (expected u/i/b<1..64> width in bit-layout)")
+        }
+        w: i64 = 0
+        for i in 1..slen {
+            dc: u8 = str_pool[soff + i]
+            if dc < '0' || dc > '9' {
+                die_cur("error: parse fault (invalid digit in bit-layout width)")
+            }
+            w = w * 10 + (dc - '0')
+        }
+        if w < 1 || w > 64 {
+            die_cur("error: parse fault (bit-layout field width out of 1..64)")
+        }
+        return w
+    }
+    die_cur("error: parse fault (expected bit width in bit-layout)")
+    return 0
+}
+
+fn resolve_all_bitpacks() {
+    ut_cnt := g[G_UT_CNT]
+    for ut_idx in 0..ut_cnt {
+        if ut_kind[ut_idx] != UKIND_BITPACK {
+            continue
+        }
+        g[G_TOK_IDX] = ut_tok[ut_idx]
+        expect_kind(TOK_LT)
+
+        fstart := g[G_BPF_CNT]
+        fcnt: i64       = 0
+        total_bits: i64 = 0
+
+        loop <max: 64 | until: 0 == 1> {
+            fsym := expect_ident()
+            expect_kind(TOK_COLON)
+            fw   := ts_parse_bit_width()
+            fi   := g[G_BPF_CNT]
+            bpf_sym[fi]   = fsym
+            bpf_width[fi] = fw
+            bpf_shift[fi] = 0
+            g[G_BPF_CNT]  = fi + 1
+            fcnt += 1
+            total_bits += fw
+            if peek_kind() != TOK_PIPE {
+                break
+            }
+            g[G_TOK_IDX] += 1
+        }
+        expect_kind(TOK_GT)
+
+        if total_bits != 8 && total_bits != 16 && total_bits != 32 && total_bits != 64 {
+            die_line("error: bit-layout width must sum to 8, 16, 32, or 64", ut_line[ut_idx])
+        }
+
+        // Compute MSB -> LSB field shifts
+        rem := total_bits
+        for j in 0..fcnt {
+            rem -= bpf_width[fstart + j]
+            bpf_shift[fstart + j] = rem
+        }
+
+        bsz := total_bits >> 3
+        ut_size[ut_idx]   = bsz
+        ut_align[ut_idx]  = bsz
+        ut_fstart[ut_idx] = fstart
+        ut_fcnt[ut_idx]   = fcnt
+
+        bp_sym[ut_idx]    = ut_sym[ut_idx]
+        bp_bytes[ut_idx]  = bsz
+        bp_fstart[ut_idx] = fstart
+        bp_fcnt[ut_idx]   = fcnt
+        if ut_idx + 1 > g[G_BP_CNT] {
+            g[G_BP_CNT] = ut_idx + 1
+        }
+    }
+}
+
+// Returns `0` if all constants resolved, or `1` if pending (when `fatal_if_stuck == 0`)
+fn run_ts_const_fixpoint(fatal_if_stuck: i64) i64 {
+    cnt := g[G_CST_CNT]
+    if cnt == 0 {
+        return 0
+    }
+    g[G_CST_TRIAL] = 1
+    for round in 0..(cnt + 1) {
+        rem      := 0
+        progress := 0
+        for i in 0..cnt {
+            if cst_done[i] == 1 {
+                continue
+            }
+            rem += 1
+            end_i   := cst_end[i]
+            saved_k := tok_kind[end_i]
+            tok_kind[end_i] = TOK_EOF
+            g[G_CST_UNRES]  = 0
+            g[G_TOK_IDX]    = cst_tok[i]
+            val := eval_ts_const_expr(1)
+            tok_kind[end_i] = saved_k
+            if g[G_CST_UNRES] == 0 {
+                if g[G_TOK_IDX] != end_i {
+                    die_line("error: parse fault (trailing tokens in constant declaration)", cst_line[i])
+                }
+                cst_val[i]  = val
+                cst_done[i] = 1
+                progress    = 1
+                rem -= 1
+            }
+        }
+        if rem == 0 {
+            g[G_CST_TRIAL] = 0
+            return 0
+        }
+        if progress == 0 {
+            g[G_CST_TRIAL] = 0
+            if fatal_if_stuck == 0 {
+                return 1
+            }
+            for i in 0..cnt {
+                if cst_done[i] == 0 {
+                    die_line("error: unresolved or cyclic constant", cst_line[i])
+                }
+            }
+            die_msg("error: unresolved or cyclic constant")
+        }
+    }
+    g[G_CST_TRIAL] = 0
+    return 1
+}
+
+fn resolve_all_structs() {
+    ut_cnt := g[G_UT_CNT]
+    if ut_cnt == 0 {
+        return
+    }
+    for round in 0..(ut_cnt + 1) {
+        rem      := 0
+        progress := 0
+        for ut_idx in 0..ut_cnt {
+            uk: i64 = ut_kind[ut_idx]
+            if uk != UKIND_STRUCT && uk != UKIND_CELL64 {
+                continue
+            }
+            if ut_size[ut_idx] != 0 {
+                continue
+            }
+            rem += 1
+
+            is_cell64 := 0
+            if uk == UKIND_CELL64 {
+                is_cell64 = 1
+            }
+
+            g[G_TOK_IDX] = ut_tok[ut_idx]
+            max_align: i64 = 1
+            if is_cell64 == 1 {
+                max_align = 64
+            }
+            is_packed: i64 = 0
+
+            // Optional `<packed>` or `<align: Bytes>`
+            if peek_kind() == TOK_LT {
+                g[G_TOK_IDX] += 1
+                asym := expect_ident()
+                if asym == g[G_SYM_PACKED] {
+                    expect_kind(TOK_GT)
+                    is_packed = 1
+                } else {
+                    if asym == g[G_SYM_ALIGN] {
+                        expect_kind(TOK_COLON)
+                        al_val := parse_const_lens_expr()
+                        if al_val < 1 || (al_val & (al_val - 1)) != 0 {
+                            die_line("error: parse fault (struct align must be power of 2)", ut_line[ut_idx])
+                        }
+                        max_align = al_val
+                        expect_kind(TOK_GT)
+                    } else {
+                        die_line("error: parse fault (unknown struct attribute)", ut_line[ut_idx])
+                    }
+                }
+            }
+
+            expect_kind(TOK_LBRACE)
+            fstart := g[G_FLD_CNT]
+            fcnt: i64    = 0
+            cur_off: i64 = 0
+            deferred := 0
+
+            loop <max: 1024 | until: peek_kind() == TOK_RBRACE> {
+                if peek_kind() == TOK_EOF {
+                    die_line("error: parse fault (unclosed struct '{')", ut_line[ut_idx])
+                }
+                if peek_kind() == TOK_AT {
+                    die_line("error: unimplemented '@cold' split", peek_line())
+                }
+
+                fsym := expect_ident()
+                expect_kind(TOK_COLON)
+                fty  := parse_full_type_tag()
+
+                // Defer if an embedded by-value struct field has not resolved yet
+                if (fty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) == 0 {
+                    fbase := fty & TY_BASE_MASK
+                    if fbase >= TY_STRUCT_BASE && fbase < TY_PTR_BASE {
+                        dep_idx := fbase - TY_STRUCT_BASE
+                        if ut_size[dep_idx] == 0 {
+                            deferred = 1
+                            break
+                        }
+                    }
+                }
+
+                fsz := ts_type_size(fty)
+                fal := ty_align(fty)
+                if is_packed == 0 {
+                    if fal > max_align {
+                        max_align = fal
+                    }
+                    cur_off = (cur_off + fal - 1) & (~(fal - 1))
+                }
+
+                fi := g[G_FLD_CNT]
+                fld_sym[fi]  = fsym
+                fld_ty[fi]   = fty
+                fld_off[fi]  = cur_off
+                fld_sz[fi]   = fsz
+                g[G_FLD_CNT] = fi + 1
+
+                cur_off += fsz
+                fcnt += 1
+
+                if peek_kind() == TOK_COMMA {
+                    g[G_TOK_IDX] += 1
+                }
+            }
+
+            if deferred == 1 {
+                g[G_FLD_CNT] = fstart
+                continue
+            }
+
+            expect_kind(TOK_RBRACE)
+
+            if is_cell64 == 1 {
+                if cur_off > 64 {
+                    die_line("error: @cell64 layout exceeds 64-byte hardware cacheline", ut_line[ut_idx])
+                }
+                cur_off   = 64
+                max_align = 64
+            } else {
+                if is_packed == 0 {
+                    cur_off = (cur_off + max_align - 1) & (~(max_align - 1))
+                }
+                if cur_off == 0 {
+                    cur_off = 1
+                }
+            }
+
+            ut_fstart[ut_idx] = fstart
+            ut_fcnt[ut_idx]   = fcnt
+            ut_packed[ut_idx] = is_packed
+            ut_align[ut_idx]  = max_align
+            ut_size[ut_idx]   = cur_off
+            progress = 1
+            rem -= 1
+        }
+        if rem == 0 {
+            return
+        }
+        if progress == 0 {
+            for ut_idx in 0..ut_cnt {
+                uk: i64 = ut_kind[ut_idx]
+                if (uk == UKIND_STRUCT || uk == UKIND_CELL64) && ut_size[ut_idx] == 0 {
+                    die_line("error: parse fault (cyclic by-value struct dependency)", ut_line[ut_idx])
+                }
+            }
+            return
+        }
+    }
+}
+
+fn resolve_all_custom_ptrs() {
+    ut_cnt := g[G_UT_CNT]
+    for ut_idx in 0..ut_cnt {
+        if ut_kind[ut_idx] != UKIND_PTR {
+            continue
+        }
+        g[G_TOK_IDX] = ut_tok[ut_idx]
+        expect_kind(TOK_LT)
+
+        ety := parse_full_type_tag()
+        esz := ts_type_size(ety)
+
+        ptr_elem_ty[ut_idx]   = ety
+        ptr_stride[ut_idx]    = esz
+        ptr_mask[ut_idx]      = 0
+        ptr_wrap_mask[ut_idx] = 0
+        ptr_bswap[ut_idx]     = 0
+        ptr_has_mask[ut_idx]  = 0
+        ptr_has_wrap[ut_idx]  = 0
+
+        loop <max: 16 | until: peek_kind() != TOK_PIPE> {
+            g[G_TOK_IDX] += 1
+            cline := peek_line()
+            csym  := expect_ident()
+            if csym == g[G_SYM_MASK] {
+                expect_kind(TOK_COLON)
+                mval := parse_const_lens_expr()
+                if mval == 0 {
+                    die_line("error: parse fault (invalid @ptr mask)", cline)
+                }
+                ptr_mask[ut_idx]     = mval
+                ptr_has_mask[ut_idx] = 1
+            } else {
+                if csym == g[G_SYM_WRAP] {
+                    expect_kind(TOK_COLON)
+                    wval := parse_const_lens_expr()
+                    if wval < 2 || (wval & (wval - 1)) != 0 {
+                        die_line("error: parse fault (@ptr wrap must be power of 2)", cline)
+                    }
+                    ptr_wrap_mask[ut_idx] = wval - 1
+                    ptr_has_wrap[ut_idx]  = 1
+                } else {
+                    if csym == g[G_SYM_STRIDE] {
+                        expect_kind(TOK_COLON)
+                        sval := parse_const_lens_expr()
+                        if sval < 1 {
+                            die_line("error: parse fault (@ptr stride must be >= 1)", cline)
+                        }
+                        ptr_stride[ut_idx] = sval
+                    } else {
+                        if csym == g[G_SYM_BSWAP] {
+                            ebase := ety & TY_BASE_MASK
+                            if ebase >= TY_STRUCT_BASE || (esz != 2 && esz != 4 && esz != 8) {
+                                die_line("error: parse fault (@ptr bswap requires 2/4/8-byte scalar)", cline)
+                            }
+                            ptr_bswap[ut_idx] = 1
+                        } else {
+                            die_line("error: parse fault (unknown @ptr lens clause)", cline)
+                        }
+                    }
+                }
+            }
+        }
+
+        expect_kind(TOK_GT)
+        ut_size[ut_idx]  = 8
+        ut_align[ut_idx] = 8
+    }
+}
+
+fn resolve_all_spaces() {
+    sp_cnt := g[G_SP_CNT]
+    for si in 0..sp_cnt {
+        g[G_TOK_IDX] = sp_tok[si]
+        sline: i64   = sp_line[si]
+        sk: i64      = sp_kind[si]
+        expect_kind(TOK_LT)
+
+        if sk == SKIND_PORT {
+            ety := parse_full_type_tag()
+            if ety != TY_U8 && ety != TY_U16 && ety != TY_U32 {
+                die_line("error: invalid @port width or port number", sline)
+            }
+            esz := ts_type_size(ety)
+            expect_kind(TOK_PIPE)
+            pnum := parse_const_lens_expr()
+            if pnum < 0 || pnum > 0xFFFF {
+                die_line("error: invalid @port width or port number", sline)
+            }
+            expect_kind(TOK_GT)
+            sp_elem_ty[si]  = ety
+            sp_elem_sz[si]  = esz
+            sp_cap[si]      = 0
+            sp_port_num[si] = pnum
+            sp_vaddr[si]    = pnum
+            sp_bss_off[si]  = 0
+            sp_align[si]    = 0
+            continue
+        }
+
+        ety: i64 = TY_U8
+        esz: i64 = 1
+        cap: i64 = 0
+
+        if sk == SKIND_SLAB {
+            ety = parse_full_type_tag()
+            esz = ts_type_size(ety)
+            expect_kind(TOK_PIPE)
+            csym := expect_ident()
+            if csym != g[G_SYM_MAX] && csym != g[G_SYM_CAP] {
+                die_line("error: parse fault (@slab expects max:)", sline)
+            }
+            expect_kind(TOK_COLON)
+            cap = parse_const_lens_expr()
+            if cap <= 0 {
+                die_line("error: parse fault (@slab max must be > 0)", sline)
+            }
+            expect_kind(TOK_GT)
+        } else {
+            if sk == SKIND_ARENA {
+                csym := expect_ident()
+                if csym != g[G_SYM_CAP] {
+                    die_line("error: parse fault (@arena expects cap:)", sline)
+                }
+                expect_kind(TOK_COLON)
+                cap = parse_const_lens_expr()
+                if cap <= 0 {
+                    die_line("error: parse fault (@arena cap must be > 0)", sline)
+                }
+                expect_kind(TOK_GT)
+            } else {
+                if sk == SKIND_CAPSULE {
+                    csym := expect_ident()
+                    if csym != g[G_SYM_CAP] {
+                        die_line("error: parse fault (@capsule expects cap:)", sline)
+                    }
+                    expect_kind(TOK_COLON)
+                    cap = parse_const_lens_expr()
+                    if cap < 4096 || (cap & 4095) != 0 {
+                        die_line("error: @capsule requires 4KiB-aligned cap (and --target=capsule forbids mutable @slab/@ring)", sline)
+                    }
+                    expect_kind(TOK_GT)
+                } else {
+                    // `SKIND_RING` or `SKIND_DMA_QUEUE`
+                    ety = parse_full_type_tag()
+                    esz = ts_type_size(ety)
+                    eal := ty_align(ety)
+                    if sk == SKIND_RING {
+                        if esz != 64 || eal != 64 {
+                            die_line("error: @ring/@dma_queue requires valid aligned element size and power-of-2 cap", sline)
+                        }
+                    } else {
+                        if esz != 16 && esz != 32 && esz != 64 {
+                            die_line("error: @ring/@dma_queue requires valid aligned element size and power-of-2 cap", sline)
+                        }
+                    }
+                    expect_kind(TOK_PIPE)
+                    csym := expect_ident()
+                    if csym != g[G_SYM_CAP] {
+                        die_line("error: parse fault (@ring/@dma_queue expects cap:)", sline)
+                    }
+                    expect_kind(TOK_COLON)
+                    cap = parse_const_lens_expr()
+                    if cap < 2 || (cap & (cap - 1)) != 0 {
+                        die_line("error: @ring/@dma_queue requires valid aligned element size and power-of-2 cap", sline)
+                    }
+                    expect_kind(TOK_GT)
+                }
+            }
+        }
+
+        // Align `.bss` allocation to 4096-byte hardware page boundary (0 disk bytes!)
+        aligned_off := (g[G_BSS_OFF] + 4095) & (~4095)
+        sp_elem_ty[si]  = ety
+        sp_elem_sz[si]  = esz
+        sp_cap[si]      = cap
+        sp_bss_off[si]  = aligned_off
+        sp_vaddr[si]    = ELF_DATA_BASE + aligned_off
+        sp_port_num[si] = 0
+        sp_align[si]    = 4096
+        g[G_BSS_OFF]    = aligned_off + cap * esz
+    }
+}
+
+fn prescan_one_fn_sig(fn_attr: i64) {
+    expect_kw(KW_FN)
+    fline := peek_line()
+    fsym  := expect_ident()
+    fidx  := find_or_add_fn(fsym)
+    if fn_defined[fidx] != 0 {
+        die_line("error: duplicate function definition", fline)
+    }
+    fn_defined[fidx]  = 1
+    fn_isr_attr[fidx] = fn_attr
+    fn_pstart[fidx]   = g[G_FNP_CNT]
+
+    expect_kind(TOK_LPAREN)
+    arity: i64 = 0
+    if peek_kind() != TOK_RPAREN {
+        loop <max: 8 | until: 0 == 1> {
+            if arity >= 6 {
+                die_line("error: maximum 6 function parameters", fline)
+            }
+            expect_ident()
+            expect_kind(TOK_COLON)
+            pty := parse_full_type_tag()
+            if fn_attr != 0 && is_ty_vec(pty) == 1 {
+                die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", fline)
+            }
+            fn_param_ty[g[G_FNP_CNT]] = pty
+            g[G_FNP_CNT] += 1
+            arity += 1
+            if peek_kind() != TOK_COMMA {
+                break
+            }
+            g[G_TOK_IDX] += 1
+        }
+    }
+    expect_kind(TOK_RPAREN)
+    fn_arity[fidx] = arity
+
+    if peek_kind() == TOK_ARROW {
+        g[G_TOK_IDX] += 1
+    }
+    rty: i64 = TY_VOID
+    if peek_kind() != TOK_LBRACE && peek_kind() != TOK_FAT_ARROW {
+        rty = parse_full_type_tag()
+    }
+    if fn_attr != 0 && is_ty_vec(rty) == 1 {
+        die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", fline)
+    }
+    fn_ret_ty[fidx] = rty
+
+    if peek_kind() == TOK_FAT_ARROW {
+        g[G_TOK_IDX] += 1
+        ts_skip_top_rhs()
+    } else {
+        ts_skip_brace_block()
+    }
+}
+
+fn prescan_all_fn_sigs() {
+    g[G_TOK_IDX] = 0
+    loop <max: 262144 | until: peek_kind() == TOK_EOF> {
+        k := peek_kind()
+        if k == TOK_IDENT && tok_kind[g[G_TOK_IDX] + 1] == TOK_COLON2 {
+            skip_top_colon2_decl()
+            continue
+        }
+        if k == TOK_AT {
+            k1 := tok_kind[g[G_TOK_IDX] + 1]
+            v1 := tok_val[g[G_TOK_IDX] + 1]
+            if k1 == TOK_IDENT && (v1 == g[G_SYM_ISR] || v1 == g[G_SYM_ISR_OK]) {
+                attr := 1
+                if v1 == g[G_SYM_ISR_OK] {
+                    attr = 2
+                }
+                g[G_TOK_IDX] += 2
+                prescan_one_fn_sig(attr)
+                continue
+            }
+            skip_top_space_decl()
+            continue
+        }
+        if k == TOK_KW && peek_kw() == KW_FN {
+            prescan_one_fn_sig(0)
+            continue
+        }
+        die_cur("error: parse fault (unexpected top-level token)")
+    }
+}
+
+fn skip_fn_in_stage1() {
+    expect_kw(KW_FN)
+    expect_ident()
+    expect_kind(TOK_LPAREN)
+    pd := 1
+    loop <max: 1024 | until: pd == 0> {
+        pk := peek_kind()
+        if pk == TOK_EOF {
+            die_cur("error: parse fault (unclosed '(' in fn signature)")
+        }
+        if pk == TOK_LPAREN { pd += 1 }
+        if pk == TOK_RPAREN { pd -= 1 }
+        g[G_TOK_IDX] += 1
+    }
+    loop <max: 32 | until: peek_kind() == TOK_LBRACE || peek_kind() == TOK_FAT_ARROW> {
+        if peek_kind() == TOK_EOF {
+            die_cur("error: parse fault (expected function body)")
+        }
+        g[G_TOK_IDX] += 1
+    }
+    if peek_kind() == TOK_FAT_ARROW {
+        g[G_TOK_IDX] += 1
+        ts_skip_top_rhs()
+    } else {
+        ts_skip_brace_block()
+    }
+}
+
+// Master Prescan Entrypoint: runs all 7 stages cleanly across the expanded module token stream
+fn prescan_all() {
+    g[G_TOK_IDX] = 0
+    g[G_CST_CNT] = 0
+    g[G_UT_CNT]  = 0
+    g[G_BP_CNT]  = 0
+    g[G_BPF_CNT] = 0
+    g[G_FLD_CNT] = 0
+    g[G_SP_CNT]  = 0
+
+    if g[G_MODE_EFI] == 1 && g[G_MODE_CAPSULE] == 0 {
+        g[G_BSS_OFF] = EFI_BSS_USER_START
+    } else {
+        g[G_BSS_OFF] = 64
+    }
+
+    // Stage 1: Inventory all top-level `::`, `@space`, and `[@isr|@isr_ok] fn` declarations
+    loop <max: 262144 | until: peek_kind() == TOK_EOF> {
+        k := peek_kind()
+
+        if k == TOK_KW && peek_kw() == KW_FN {
+            skip_fn_in_stage1()
+            continue
+        }
+
+        if k == TOK_AT {
+            at_line := peek_line()
+            g[G_TOK_IDX] += 1
+            tk := peek_kind()
+
+            if tk == TOK_IDENT {
+                tv := peek_val()
+                if tv == g[G_SYM_ISR] || tv == g[G_SYM_ISR_OK] {
+                    if g[G_MODE_EFI] == 0 {
+                        die_line("error: ring-0 intrinsic requires --target=efi-os", at_line)
+                    }
+                    g[G_TOK_IDX] += 1
+                    if peek_kind() != TOK_KW || peek_kw() != KW_FN {
+                        die_line("error: parse fault (expected fn after @isr/@isr_ok)", at_line)
+                    }
+                    skip_fn_in_stage1()
+                    continue
+                }
+            }
+
+            skind: i64 = 0
+            if tk == TOK_KW {
+                tkw := peek_kw()
+                if tkw == KW_SLAB    { skind = SKIND_SLAB }
+                if tkw == KW_ARENA   { skind = SKIND_ARENA }
+                if tkw == KW_CAPSULE { skind = SKIND_CAPSULE }
+                if tkw == KW_RING    { skind = SKIND_RING }
+            } else {
+                if tk == TOK_IDENT {
+                    tv := peek_val()
+                    if tv == g[G_SYM_DMA_QUEUE] {
+                        skind = SKIND_DMA_QUEUE
+                    }
+                    if tv == g[G_SYM_PORT] {
+                        if g[G_MODE_EFI] == 0 {
+                            die_line("error: ring-0 intrinsic requires --target=efi-os", at_line)
+                        }
+                        skind = SKIND_PORT
+                    }
+                }
+            }
+
+            if skind == 0 {
+                die_line("error: unimplemented '@' space", at_line)
+            }
+            g[G_TOK_IDX] += 1
+
+            if g[G_MODE_CAPSULE] == 1 && skind != SKIND_PORT {
+                die_line("error: @capsule requires 4KiB-aligned cap (and --target=capsule forbids mutable @slab/@ring)", at_line)
+            }
+
+            sline := peek_line()
+            ssym  := expect_ident()
+            ts_check_top_unique(ssym, sline)
+            expect_kind(TOK_COLON)
+
+            si := g[G_SP_CNT]
+            sp_sym[si]  = ssym
+            sp_kind[si] = skind
+            sp_tok[si]  = g[G_TOK_IDX]
+            sp_line[si] = sline
+            g[G_SP_CNT] = si + 1
+
+            ts_skip_angle_block()
+            continue
+        }
+
+        if k == TOK_IDENT && tok_kind[g[G_TOK_IDX] + 1] == TOK_COLON2 {
+            dline := peek_line()
+            dsym  := expect_ident()
+            expect_kind(TOK_COLON2)
+            ts_check_top_unique(dsym, dline)
+
+            rk := peek_kind()
+
+            // 1. Plain `Name :: { ... }` struct
+            if rk == TOK_LBRACE {
+                ut_idx := g[G_UT_CNT]
+                ut_sym[ut_idx]  = dsym
+                ut_kind[ut_idx] = UKIND_STRUCT
+                ut_size[ut_idx] = 0
+                ut_tok[ut_idx]  = g[G_TOK_IDX]
+                ut_line[ut_idx] = dline
+                g[G_UT_CNT]     = ut_idx + 1
+                ts_skip_brace_block()
+                continue
+            }
+
+            // 2. `Name :: @cell64 { ... }` or `Name :: @ptr<...>`
+            if rk == TOK_AT {
+                nk := tok_kind[g[G_TOK_IDX] + 1]
+                if nk == TOK_KW && tok_kw[g[G_TOK_IDX] + 1] == KW_CELL64 {
+                    g[G_TOK_IDX] += 2
+                    ut_idx := g[G_UT_CNT]
+                    ut_sym[ut_idx]  = dsym
+                    ut_kind[ut_idx] = UKIND_CELL64
+                    ut_size[ut_idx] = 0
+                    ut_tok[ut_idx]  = g[G_TOK_IDX]
+                    ut_line[ut_idx] = dline
+                    g[G_UT_CNT]     = ut_idx + 1
+                    ts_skip_brace_block()
+                    continue
+                }
+                if nk == TOK_IDENT && tok_val[g[G_TOK_IDX] + 1] == g[G_SYM_PTR] {
+                    g[G_TOK_IDX] += 2
+                    lt_tok := g[G_TOK_IDX]
+                    ts_skip_angle_block()
+                    ut_idx := g[G_UT_CNT]
+                    ut_sym[ut_idx]   = dsym
+                    ut_kind[ut_idx]  = UKIND_PTR
+                    ut_size[ut_idx]  = 8
+                    ut_align[ut_idx] = 8
+                    ut_tok[ut_idx]   = lt_tok
+                    ut_line[ut_idx]  = dline
+                    g[G_UT_CNT]      = ut_idx + 1
+                    continue
+                }
+            }
+
+            // 3. `Name :: <...> { ... }` (aligned/packed struct) vs `Name :: <...>` (bitpack)
+            if rk == TOK_LT {
+                lt_tok := g[G_TOK_IDX]
+                ts_skip_angle_block()
+                ut_idx := g[G_UT_CNT]
+                ut_sym[ut_idx]  = dsym
+                ut_size[ut_idx] = 0
+                ut_tok[ut_idx]  = lt_tok
+                ut_line[ut_idx] = dline
+                if peek_kind() == TOK_LBRACE {
+                    ut_kind[ut_idx] = UKIND_STRUCT
+                    g[G_UT_CNT]     = ut_idx + 1
+                    ts_skip_brace_block()
+                } else {
+                    ut_kind[ut_idx] = UKIND_BITPACK
+                    g[G_UT_CNT]     = ut_idx + 1
+                }
+                continue
+            }
+
+            // 4. Compile-time constant `NAME :: const_expr`
+            ci := g[G_CST_CNT]
+            cst_sym[ci]  = dsym
+            cst_tok[ci]  = g[G_TOK_IDX]
+            cst_line[ci] = dline
+            cst_done[ci] = 0
+            cst_val[ci]  = 0
+            g[G_CST_CNT] = ci + 1
+            ts_skip_top_rhs()
+            cst_end[ci]  = g[G_TOK_IDX]
+            continue
+        }
+
+        die_cur("error: parse fault (unexpected top-level token)")
+    }
+
+    // Stage 2: BitPack layouts
+    resolve_all_bitpacks()
+
+    // Stage 3a: Early constant fixed-point resolution
+    pending := run_ts_const_fixpoint(0)
+
+    // Stage 4: Struct & `@cell64` layouts
+    resolve_all_structs()
+
+    // Stage 3b: Late constant fixed-point resolution (for forward `@sizeof`/`@alignof`)
+    if pending != 0 {
+        run_ts_const_fixpoint(1)
+    }
+
+    // Stage 5: Custom `@ptr<...>` types
+    resolve_all_custom_ptrs()
+
+    // Stage 6: Topological spaces (`@slab`, `@arena`, `@capsule`, `@ring`, `@dma_queue`, `@port`)
+    resolve_all_spaces()
+
+    // Stage 7: Function signatures & `@isr` / `@isr_ok` attributes
+    prescan_all_fn_sigs()
+}

@@ -3,76 +3,104 @@ set -euo pipefail
 
 ZERO0="${1:-build/zero0}"
 BUILD="build"
+ZERO2="$BUILD/zero2"
 mkdir -p "$BUILD/neg"
 
-echo "=== [1/6] Host Compiler W^X & Lexer Verification ==="
+echo "=== [1/7] Self-Hosting Fixed-Point Bootstrap & Strict W^X Verification (zero0 -> zero1 -> zero2 == zero3) ==="
 if readelf -lW "$ZERO0" | grep -q "RWE"; then
     echo "  [FAIL] $ZERO0 contains an RWX segment!" >&2
     exit 1
 fi
-echo "  [PASS] $ZERO0 has strict W^X PT_LOAD segments (no RWE)"
+echo "  [PASS] seed compiler $ZERO0 has strict W^X PT_LOAD segments (no RWE)"
 
-"$ZERO0" --lex tests/lex_showcase.zr > "$BUILD/lex_showcase.log"
-grep -q "lex ok:" "$BUILD/lex_showcase.log"
-echo "  [PASS] --lex verified on tests/lex_showcase.zr"
+"$ZERO0"       "compiler/zero1.zr" "$BUILD/zero1" > /dev/null
+"$BUILD/zero1" "compiler/zero1.zr" "$ZERO2"       > /dev/null
+"$ZERO2"       "compiler/zero1.zr" "$BUILD/zero3" > /dev/null
+for zbin in "$BUILD/zero1" "$ZERO2" "$BUILD/zero3"; do
+    if readelf -lW "$zbin" | grep -q "RWE"; then
+        echo "  [FAIL] self-hosted compiler $zbin contains an RWX segment!" >&2
+        exit 1
+    fi
+done
+if ! cmp -s "$ZERO2" "$BUILD/zero3"; then
+    echo "  [FAIL] Stage-2 ($ZERO2) and Stage-3 ($BUILD/zero3) differ (fixed-point failed)!" >&2
+    exit 1
+fi
+echo "  [PASS] deterministic self-hosting fixed point proven: $ZERO2 == $BUILD/zero3 ($(stat -c%s "$ZERO2") bytes, strict W^X)"
 
-echo "=== [2/6] Golden-Output Positive Compilation & Execution Suites ==="
-run_golden() {
+"$ZERO2" --lex tests/lex_showcase.zr > "$BUILD/lex_showcase_z2.log"
+grep -q "lex ok:" "$BUILD/lex_showcase_z2.log"
+echo "  [PASS] [zero2] --lex verified on tests/lex_showcase.zr"
+
+echo "=== [2/7] Full 8-Suite Golden Parity, Inline Silicon, & AVX-512 EVEX Verification (Self-Hosted zero2) ==="
+run_z2_golden() {
     local src="$1"
     local bin="$2"
     local expected="$3"
     local out_log="${bin}.stdout"
 
-    "$ZERO0" "$src" "$bin"
+    "$ZERO2" "$src" "$bin" > /dev/null
     if readelf -lW "$bin" | grep -q "RWE"; then
-        echo "  [FAIL] guest binary $bin contains an RWX segment!" >&2
+        echo "  [FAIL] [zero2] guest binary $bin contains an RWX segment!" >&2
         exit 1
     fi
     "$bin" > "$out_log"
     diff -u "$expected" "$out_log"
-    echo "  [PASS] $src -> $bin (W^X + stdout matches $expected)"
+    echo "  [PASS] [zero2] $src -> $bin (W^X + stdout matches $expected)"
 }
 
-run_golden "examples/first.zr"              "$BUILD/first"                 "tests/first.expected"
-run_golden "tests/step3_compute.zr"         "$BUILD/step3_compute"         "tests/step3_compute.expected"
-run_golden "tests/step4_systems.zr"         "$BUILD/step4_systems"         "tests/step4_systems.expected"
-run_golden "tests/phase0_scalar.zr"         "$BUILD/phase0_scalar"         "tests/phase0_scalar.expected"
-run_golden "tests/phase1_zero_lang.zr"      "$BUILD/phase1_zero_lang"      "tests/phase1_zero_lang.expected"
-run_golden "tests/phase2_zero_power.zr"     "$BUILD/phase2_zero_power"     "tests/phase2_zero_power.expected"
-run_golden "tests/phase3_reactor_fabric.zr" "$BUILD/phase3_reactor_fabric" "tests/phase3_reactor_fabric.expected"
+run_z2_golden "examples/first.zr"              "$BUILD/z2_first"                 "tests/first.expected"
+run_z2_golden "tests/step3_compute.zr"         "$BUILD/z2_step3_compute"         "tests/step3_compute.expected"
+run_z2_golden "tests/step4_systems.zr"         "$BUILD/z2_step4_systems"         "tests/step4_systems.expected"
+run_z2_golden "tests/phase0_scalar.zr"         "$BUILD/z2_phase0_scalar"         "tests/phase0_scalar.expected"
+run_z2_golden "tests/phase1_zero_lang.zr"      "$BUILD/z2_phase1_zero_lang"      "tests/phase1_zero_lang.expected"
+run_z2_golden "tests/phase2_zero_power.zr"     "$BUILD/z2_phase2_zero_power"     "tests/phase2_zero_power.expected"
+run_z2_golden "tests/phase3_reactor_fabric.zr" "$BUILD/z2_phase3_reactor_fabric" "tests/phase3_reactor_fabric.expected"
+run_z2_golden "tests/phase4_avx512_simd.zr"    "$BUILD/z2_phase4_avx512_simd"    "tests/phase4_avx512_simd.expected"
 
-# Verify literal silicon opcodes emitted directly in guest `.text` (zero runtime wrappers)
-DIS_POWER=$(objdump -D -b binary -m i386:x86-64 --start-address=120 "$BUILD/phase2_zero_power")
+# Verify literal silicon & AVX-512 EVEX opcodes emitted directly in zero2 guest `.text` (offset 176 = 64B Ehdr + 2*56B Phdr)
+DIS_Z2_POWER=$(objdump -D -b binary -m i386:x86-64 --start-address=176 "$BUILD/z2_phase2_zero_power")
 for op in "movnti" "lock xadd" "lock cmpxchg" "popcnt" "lzcnt" "tzcnt" "pdep" "pext" "crc32" "prefetcht0" "bswap" "sfence" "lfence" "mfence"; do
-    if ! grep -q "$op" <<< "$DIS_POWER"; then
-        echo "  [FAIL] $BUILD/phase2_zero_power missing inline silicon instruction: $op" >&2
+    if ! grep -q "$op" <<< "$DIS_Z2_POWER"; then
+        echo "  [FAIL] $BUILD/z2_phase2_zero_power missing inline silicon instruction: $op" >&2
         exit 1
     fi
 done
-DIS_FAB=$(objdump -D -b binary -m i386:x86-64 --start-address=120 "$BUILD/phase3_reactor_fabric")
+DIS_Z2_FAB=$(objdump -D -b binary -m i386:x86-64 --start-address=176 "$BUILD/z2_phase3_reactor_fabric")
 for op in "movdir64b" "movdiri" "cpuid"; do
-    if ! grep -q "$op" <<< "$DIS_FAB"; then
-        echo "  [FAIL] $BUILD/phase3_reactor_fabric missing direct-silicon instruction: $op" >&2
+    if ! grep -q "$op" <<< "$DIS_Z2_FAB"; then
+        echo "  [FAIL] $BUILD/z2_phase3_reactor_fabric missing direct-silicon instruction: $op" >&2
         exit 1
     fi
 done
-echo "  [PASS] verified inline silicon opcodes (movdir64b, movdiri, movnti, lock xadd/cmpxchg, BMI2, CRC32C, prefetcht0, fences)"
+DIS_Z2_SIMD=$(objdump -D -b binary -m i386:x86-64 --start-address=176 "$BUILD/z2_phase4_avx512_simd")
+for op in "vmovdqu32" "vmovdqu64" "{%k1}{z}" "kmovw" "bzhi" "vmovntdq" "vpbroadcastd" "vpbroadcastq" "vpaddd" "vpaddq" "vpmulld" "vpmullq" "vpsllvq" "incq"; do
+    if ! grep -q "$op" <<< "$DIS_Z2_SIMD"; then
+        echo "  [FAIL] $BUILD/z2_phase4_avx512_simd missing AVX-512 EVEX / GPR instruction: $op" >&2
+        exit 1
+    fi
+done
+if ! grep -Eq 'vmovdqu(32|64).*\{%k1\}$' <<< "$DIS_Z2_SIMD"; then
+    echo "  [FAIL] $BUILD/z2_phase4_avx512_simd missing write-masked {%k1} store!" >&2
+    exit 1
+fi
+echo "  [PASS] [zero2] verified inline silicon + 512-bit AVX-512 EVEX opcodes (movdir64b, movdiri, movnti, vmovntdq, {%k1}{z}/{%k1}, kmovw, bzhi, ZMM ALU, incq)"
 
-echo "=== [3/6] Adversarial Negative Rejection Probes (ELF64, EFI, & Capsule) ==="
+echo "=== [3/7] Adversarial Negative Rejection Probes on Self-Hosted zero2 (ELF64, EFI, & Capsule) ==="
 expect_compile_reject() {
     local name="$1"
     local code="$2"
     local expected_err="$3"
     local src="$BUILD/neg/${name}.zr"
-    local err_log="$BUILD/neg/${name}.err"
+    local err_log="$BUILD/neg/${name}.z2.err"
 
     printf "%s\n" "$code" > "$src"
-    if "$ZERO0" "$src" "$BUILD/neg/${name}.bin" 2> "$err_log"; then
-        echo "  [FAIL] $name unexpectedly compiled!" >&2
+    if "$ZERO2" "$src" "$BUILD/neg/${name}.z2.bin" 2> "$err_log" > /dev/null; then
+        echo "  [FAIL] $name unexpectedly compiled under $ZERO2!" >&2
         exit 1
     fi
     grep -q "$expected_err" "$err_log"
-    echo "  [PASS] rejected $name ($(cat "$err_log"))"
+    echo "  [PASS] [zero2] rejected $name ($(cat "$err_log"))"
 }
 
 expect_efi_reject() {
@@ -80,15 +108,15 @@ expect_efi_reject() {
     local code="$2"
     local expected_err="$3"
     local src="$BUILD/neg/${name}.zr"
-    local err_log="$BUILD/neg/${name}.err"
+    local err_log="$BUILD/neg/${name}.z2.err"
 
     printf "%s\n" "$code" > "$src"
-    if "$ZERO0" --target=efi-os "$src" "$BUILD/neg/${name}.efi" 2> "$err_log"; then
-        echo "  [FAIL] $name unexpectedly compiled on --target=efi-os!" >&2
+    if "$ZERO2" --target=efi-os "$src" "$BUILD/neg/${name}.z2.efi" 2> "$err_log" > /dev/null; then
+        echo "  [FAIL] $name unexpectedly compiled under $ZERO2 --target=efi-os!" >&2
         exit 1
     fi
     grep -q "$expected_err" "$err_log"
-    echo "  [PASS] rejected $name ($(cat "$err_log"))"
+    echo "  [PASS] [zero2] rejected $name ($(cat "$err_log"))"
 }
 
 expect_capsule_reject() {
@@ -96,15 +124,15 @@ expect_capsule_reject() {
     local code="$2"
     local expected_err="$3"
     local src="$BUILD/neg/${name}.zr"
-    local err_log="$BUILD/neg/${name}.err"
+    local err_log="$BUILD/neg/${name}.z2.err"
 
     printf "%s\n" "$code" > "$src"
-    if "$ZERO0" --target=capsule "$src" "$BUILD/neg/${name}.zcap" 2> "$err_log"; then
-        echo "  [FAIL] $name unexpectedly compiled on --target=capsule!" >&2
+    if "$ZERO2" --target=capsule "$src" "$BUILD/neg/${name}.z2.zcap" 2> "$err_log" > /dev/null; then
+        echo "  [FAIL] $name unexpectedly compiled under $ZERO2 --target=capsule!" >&2
         exit 1
     fi
     grep -q "$expected_err" "$err_log"
-    echo "  [PASS] rejected $name ($(cat "$err_log"))"
+    echo "  [PASS] [zero2] rejected $name ($(cat "$err_log"))"
 }
 
 expect_compile_reject "fake_nonrange_simd" \
@@ -297,70 +325,108 @@ expect_efi_reject "bad_isr_ok_non_leaf" \
     $'@isr_ok fn a() {}\n@isr_ok fn b() { a() }\nfn main(h: u64) i64 { return 0 }' \
     "@isr/@isr_ok forbids"
 
-echo "=== [4/6] Runtime Unhandled Fault Exit Check ==="
+# Phase-4 / Track 2 Zero-XSAVE Ring-0 AVX-512 `<tile>` Law & `<simd>` Lens Validation
+expect_efi_reject "simd_outside_tile_on_efi" \
+    $'@slab s : <u64 | max: 16>\nfn main(h: u64) i64 { for i in 0..8 <simd: 8> { s[i] = i } return 0 }' \
+    "AVX-512 <simd> in Ring-0 requires enclosing <tile>"
+
+expect_efi_reject "vec_outside_tile_on_efi" \
+    'fn main(h: u64) i64 { v: u32x16 = @vec_iota32() return @vec_sum32(v) }' \
+    "AVX-512 <simd> in Ring-0 requires enclosing <tile>"
+
+expect_capsule_reject "vec_outside_tile_on_capsule" \
+    'fn main() i64 { v: u64x8 = @vec_iota64() return @vec_sum64(v) }' \
+    "AVX-512 <simd> in Ring-0 requires enclosing <tile>"
+
+expect_efi_reject "simd_in_isr" \
+    $'@isr fn irq() { v: u64x8 = @vec_iota64() }\nfn main(h: u64) i64 { return 0 }' \
+    "@isr/@isr_ok forbids"
+
+expect_efi_reject "vec_in_isr_ok" \
+    $'@isr_ok fn helper() u64 { v := @vec_splat64(1) return @vec_sum64(v) }\nfn main(h: u64) i64 { return 0 }' \
+    "@isr/@isr_ok forbids"
+
+expect_compile_reject "bad_simd_width_3" \
+    $'@slab s : <u64 | max: 16>\nfn main() { for i in 0..8 <simd: 3> { s[i] = i } }' \
+    "unimplemented or invalid loop lens"
+
+expect_compile_reject "bad_simd_nonvec_call" \
+    $'@slab s : <u64 | max: 16>\nfn foo(x: i64) u64 { return x }\nfn main() { for i in 0..8 <simd: 8> { s[i] = foo(i) } }' \
+    "unimplemented or invalid loop lens"
+
+echo "=== [4/7] Runtime Unhandled Fault Exit Check (Self-Hosted zero2) ==="
 printf 'fn main() { fail 99 }\n' > "$BUILD/neg/unhandled_fail.zr"
-"$ZERO0" "$BUILD/neg/unhandled_fail.zr" "$BUILD/neg/unhandled_fail.bin" > /dev/null
+"$ZERO2" "$BUILD/neg/unhandled_fail.zr" "$BUILD/neg/unhandled_fail_z2.bin" > /dev/null
 set +e
-"$BUILD/neg/unhandled_fail.bin"
+"$BUILD/neg/unhandled_fail_z2.bin"
 rc=$?
 set -e
 if [[ "$rc" -ne 1 ]]; then
-    echo "  [FAIL] unhandled_fail exited with $rc instead of 1" >&2
+    echo "  [FAIL] unhandled_fail_z2 exited with $rc instead of 1" >&2
     exit 1
 fi
-echo "  [PASS] unhandled runtime fail exited cleanly with status $rc"
+echo "  [PASS] [zero2] unhandled runtime fail exited cleanly with status $rc"
 
-echo "=== [5/6] Phase-4 Self-Hosting Fixed-Point Bootstrap Verification (zero0 -> zero1 -> zero2 == zero3) ==="
-"$ZERO0" "compiler/zero1.zr" "$BUILD/zero1" > /dev/null
-"$BUILD/zero1" "compiler/zero1.zr" "$BUILD/zero2" > /dev/null
-"$BUILD/zero2" "compiler/zero1.zr" "$BUILD/zero3" > /dev/null
-for zbin in "$BUILD/zero1" "$BUILD/zero2" "$BUILD/zero3"; do
-    if readelf -lW "$zbin" | grep -q "RWE"; then
-        echo "  [FAIL] self-hosted compiler $zbin contains an RWX segment!" >&2
+echo "=== [5/7] 100% Zero-NASM Self-Hosted PE32+ UEFI OS & Multi-@capsule Image Verification (build/zero2) ==="
+# Three CRC32C-signed Ring-0 `.zcap` capsules (NVMe Extents 0..2), all compiled by self-hosted `zero2`
+"$ZERO2" --target=capsule "examples/capsule_compute.zr"           "$BUILD/capsule_z2.zcap"      > /dev/null
+"$ZERO2" --target=capsule "examples/capsules/cap_avx512_wave.zr"  "$BUILD/cap_avx512_wave.zcap" > /dev/null
+"$ZERO2" --target=capsule "examples/capsules/cap_matrix_crc.zr"   "$BUILD/cap_matrix_crc.zcap"  > /dev/null
+for zcap in "$BUILD/capsule_z2.zcap" "$BUILD/cap_avx512_wave.zcap" "$BUILD/cap_matrix_crc.zcap"; do
+    if [[ "$(head -c 8 "$zcap")" != "ZEROZCAP" ]]; then
+        echo "  [FAIL] $zcap missing ZEROZCAP header magic!" >&2
         exit 1
     fi
 done
-if ! cmp -s "$BUILD/zero2" "$BUILD/zero3"; then
-    echo "  [FAIL] Stage-2 ($BUILD/zero2) and Stage-3 ($BUILD/zero3) differ (fixed-point failed)!" >&2
-    exit 1
-fi
-echo "  [PASS] deterministic self-hosting fixed point proven: $BUILD/zero2 == $BUILD/zero3 ($(stat -c%s "$BUILD/zero2") bytes, strict W^X)"
+DIS_WAVE=$(objdump -D -b binary -m i386:x86-64 --start-address=64 "$BUILD/cap_avx512_wave.zcap")
+for op in "vpbroadcastq" "vpmullq" "vpaddq" "vpxorq" "vzeroupper"; do
+    if ! grep -q "$op" <<< "$DIS_WAVE"; then
+        echo "  [FAIL] $BUILD/cap_avx512_wave.zcap missing AVX-512 instruction: $op" >&2
+        exit 1
+    fi
+done
+DIS_MTX=$(objdump -D -b binary -m i386:x86-64 --start-address=64 "$BUILD/cap_matrix_crc.zcap")
+for op in "crc32" "pext" "pdep" "rol"; do
+    if ! grep -q "$op" <<< "$DIS_MTX"; then
+        echo "  [FAIL] $BUILD/cap_matrix_crc.zcap missing silicon instruction: $op" >&2
+        exit 1
+    fi
+done
+echo "  [PASS] [zero2] emitted 3 CRC32C-signed --target=capsule extents (compute $(stat -c%s "$BUILD/capsule_z2.zcap")B, AVX-512 wave $(stat -c%s "$BUILD/cap_avx512_wave.zcap")B, matrix-CRC $(stat -c%s "$BUILD/cap_matrix_crc.zcap")B)"
 
-"$BUILD/zero2" "examples/first.zr"      "$BUILD/z2_first"  > /dev/null
-"$BUILD/zero2" "tests/step3_compute.zr" "$BUILD/z2_step3"  > /dev/null
-"$BUILD/zero2" "tests/phase0_scalar.zr" "$BUILD/z2_phase0" > /dev/null
-"$BUILD/z2_first"  | diff -u "tests/first.expected"         -
-"$BUILD/z2_step3"  | diff -u "tests/step3_compute.expected" -
-"$BUILD/z2_phase0" | diff -u "tests/phase0_scalar.expected" -
-echo "  [PASS] self-hosted zero2 compiled first.zr, step3_compute.zr, & phase0_scalar.zr (100% golden match)"
-
-"$ZERO0"       --target=capsule "examples/capsule_compute.zr" "$BUILD/capsule_compute.zcap" > /dev/null
-"$BUILD/zero2" --target=capsule "examples/capsule_compute.zr" "$BUILD/capsule_z2.zcap"      > /dev/null
-echo "  [PASS] both zero0 and self-hosted zero2 emitted CRC32C-signed --target=capsule (.zcap) workloads"
-
-echo "=== [6/6] Gate-3 Bare-Metal Multi-Core Reactor + PCIe/NVMe @capsule Verification (QEMU Q35 + OVMF) ==="
-"$ZERO0" --target=efi-os "examples/gate1_os.zr" "$BUILD/gate1_os.efi"
-HDR_EFI=$(objdump -p "$BUILD/gate1_os.efi")
-DIS_EFI=$(objdump -d "$BUILD/gate1_os.efi")
+"$ZERO2" --target=efi-os "examples/gate1_os.zr" "$BUILD/gate1_os_z2.efi" > /dev/null
+HDR_EFI=$(objdump -p "$BUILD/gate1_os_z2.efi")
+DIS_EFI=$(objdump -d "$BUILD/gate1_os_z2.efi")
 grep -q "Subsystem[[:space:]]*0000000a[[:space:]]*(EFI application)" <<< "$HDR_EFI"
-for efi_op in "movdir64b" "monitor" "mwait" "iretq" "movnti" "sfence" "crc32" "%gs:0x0" "%gs:0x8"; do
+if objdump -x "$BUILD/gate1_os_z2.efi" | grep -E "^\s*[0-9]+\s+\." -A1 | paste - - | grep -q "EXECUTE.*WRITE\|WRITE.*EXECUTE"; then
+    echo "  [FAIL] $BUILD/gate1_os_z2.efi contains a writable+executable PE32+ section!" >&2
+    exit 1
+fi
+for efi_op in "movdir64b" "monitor" "mwait" "iretq" "vmovntdq" "vzeroupper" "{%k1}{z}" "kmovw" "sfence" "crc32" "%gs:0x0" "%gs:0x8"; do
     if ! grep -q "$efi_op" <<< "$DIS_EFI"; then
-        echo "  [FAIL] $BUILD/gate1_os.efi missing hardware instruction/prefix: $efi_op" >&2
+        echo "  [FAIL] $BUILD/gate1_os_z2.efi missing hardware instruction/prefix: $efi_op" >&2
         exit 1
     fi
 done
-echo "  [PASS] examples/gate1_os.zr -> $BUILD/gate1_os.efi (PE32+ + movdir64b + monitor/mwait + iretq + crc32 + %gs:0 + movnti)"
+echo "  [PASS] [zero2] examples/gate1_os.zr -> $BUILD/gate1_os_z2.efi (strict W^X PE32+ + AVX-512 vmovntdq/{%k1}/vzeroupper + movdir64b + monitor/mwait + iretq + %gs:0)"
 
-# Verify `qemu_debug :: 0` laptop build compiles cleanly too and eliminates 0xE9 port I/O
+# Verify `qemu_debug :: 0` laptop build under `zero2` eliminates all 0xE9 port I/O (direct imm8 AND `mov dx` forms)
 ln -sfn ../examples/os "$BUILD/os"
 sed 's/^qemu_debug[[:space:]]*:: 1/qemu_debug          :: 0/' examples/gate1_os.zr > "$BUILD/gate1_laptop.zr"
-"$ZERO0" --target=efi-os "$BUILD/gate1_laptop.zr" "$BUILD/gate1_laptop.efi" > /dev/null
-if objdump -d "$BUILD/gate1_laptop.efi" | grep -Eq '\b(in|out)\b.*0xe9'; then
-    echo "  [FAIL] gate1_laptop.efi still contains port 0xE9 I/O with qemu_debug :: 0" >&2
+"$ZERO2" --target=efi-os "$BUILD/gate1_laptop.zr" "$BUILD/gate1_laptop_z2.efi" > /dev/null
+dbg_e9=$(grep -Ec '\b(in|out)\b.*0xe9' <<< "$DIS_EFI" || true)
+if [[ "$dbg_e9" -eq 0 ]]; then
+    echo "  [FAIL] positive control failed: debug gate1_os_z2.efi shows 0 port-0xE9 instructions (regex broken?)" >&2
     exit 1
 fi
-echo "  [PASS] laptop variant (qemu_debug :: 0) compiled -> $BUILD/gate1_laptop.efi (0xE9 eliminated)"
+DIS_LAPTOP=$(objdump -d "$BUILD/gate1_laptop_z2.efi")
+if grep -Eq '\b(in|out)\b.*0xe9' <<< "$DIS_LAPTOP" || grep -Eq '\b(in|out)\b +[^,]*,?\(%dx\)|\b(in|out)\b +\(%dx\)' <<< "$DIS_LAPTOP"; then
+    echo "  [FAIL] gate1_laptop_z2.efi still contains port 0xE9 / %dx-indirect port I/O with qemu_debug :: 0" >&2
+    exit 1
+fi
+echo "  [PASS] [zero2] laptop variant (qemu_debug :: 0) compiled -> $BUILD/gate1_laptop_z2.efi (0xE9 eliminated; debug build control = $dbg_e9 port-0xE9 insns)"
 
+echo "=== [6/7] Interactive Tickless ZeroOS Command Deck: IRQ1/MWAIT + 3 NVMe @capsule Extents on 4 Reactors (QEMU Q35 + OVMF) ==="
 python3 - <<'PY'
 import os, re, shutil, socket, struct, subprocess, sys, time
 
@@ -370,81 +436,99 @@ if not os.path.exists(ovmf):
     sys.exit(1)
 
 os.makedirs("build/esp/EFI/BOOT", exist_ok=True)
-shutil.copyfile("build/gate1_os.efi", "build/esp/EFI/BOOT/BOOTX64.EFI")
+shutil.copyfile("build/gate1_os_z2.efi", "build/esp/EFI/BOOT/BOOTX64.EFI")
 
-# Build 16 MiB raw NVMe Master Extent image holding self-hosted `build/capsule_z2.zcap`!
-cap_bytes = open("build/capsule_z2.zcap", "rb").read()
-hdr_crc = struct.unpack_from("<I", cap_bytes, 20)[0]
+# 16 MiB raw NVMe disk: `ZEXTENT1` Master Extent Table (3 entries) + 3 zero2-compiled `.zcap` extents (4 KiB aligned)
+CAPS = [("build/capsule_z2.zcap",      0x5A32434150, 4096),
+        ("build/cap_avx512_wave.zcap", 0x5A32574156, 8192),
+        ("build/cap_matrix_crc.zcap",  0x5A324D5458, 12288)]
 disk = bytearray(16 * 1024 * 1024)
-struct.pack_into("<QIIQ", disk, 0, 0x31544E455458455A, 1, 1, 1)
-struct.pack_into("<QQQII", disk, 64, 0x5A32434150, 4096, len(cap_bytes), hdr_crc, 1)
-disk[4096 : 4096 + len(cap_bytes)] = cap_bytes
+struct.pack_into("<QIIQ", disk, 0, 0x31544E455458455A, 1, len(CAPS), 1)
+for i, (path, id_hash, off) in enumerate(CAPS):
+    cap = open(path, "rb").read()
+    assert len(cap) <= 4096, f"{path} exceeds its 4 KiB extent slot"
+    crc = struct.unpack_from("<I", cap, 20)[0]
+    struct.pack_into("<QQQII", disk, 64 + i * 32, id_hash, off, len(cap), crc, 1)
+    disk[off:off + len(cap)] = cap
 open("build/nvme_disk.img", "wb").write(disk)
 
-accel = ["-enable-kvm", "-cpu", "host"] if os.access("/dev/kvm", os.R_OK | os.W_OK) else ["-cpu", "max"]
-pm_flags = ["-overcommit", "cpu-pm=on"] if os.access("/dev/kvm", os.R_OK | os.W_OK) else []
+kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+accel = ["-enable-kvm", "-cpu", "host"] if kvm else ["-cpu", "max"]
+pm_flags = ["-overcommit", "cpu-pm=on"] if kvm else []
 
-# 1. Boot `-machine q35 -smp 4` with PCIe NVMe (`capsule_z2.zcap`), `MONITOR`/`MWAIT`, & `MOVDIR64B`
-for p in ("build/gate1_debugcon.log", "build/gate1_gop.ppm", "build/qmp.sock"):
-    if os.path.exists(p):
-        os.remove(p)
+# Expected per-dispatch return sums for `(arg0, arg1) = (40, 2)`, cross-checked against an independent
+# Python reference model of each capsule (x86 `crc32 r64`, BMI2 `pext`/`pdep`, `u64x8` lane math):
+#   C=4 -> workers rid 1..3 ; C=1 -> BSP rid 0
+EXPECT = {4: (2337, 1207754, 35277270), 1: (777, 381953, 978462)}
 
-cmd = [
-    "qemu-system-x86_64", "-machine", "q35", *accel, *pm_flags, "-smp", "4", "-m", "512M",
-    "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
-    "-drive", "format=raw,file=fat:rw:build/esp",
-    "-drive", "file=build/nvme_disk.img,if=none,id=nvm0,format=raw",
-    "-device", "nvme,serial=ZEROZCAP,drive=nvm0",
-    "-debugcon", "file:build/gate1_debugcon.log",
-    "-global", "isa-debugcon.iobase=0xe9",
-    "-monitor", "unix:build/qmp.sock,server,nowait",
-    "-display", "none",
-    "-no-reboot",
-]
-
-proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-try:
-    t0 = time.time()
-    sent_key = False
-    sock = None
-    while time.time() - t0 < 12.0:
-        if os.path.exists("build/gate1_debugcon.log"):
-            log = open("build/gate1_debugcon.log", "rb").read().decode("latin1")
-            if ("KBD\n" in log) and not sent_key:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.connect("build/qmp.sock")
-                time.sleep(0.05)
-                sock.sendall(b"sendkey a\n")
-                sent_key = True
-            if "GATE1B_OK" in log and sock is not None:
-                sock.sendall(b"screendump build/gate1_gop.ppm\n")
-                time.sleep(0.15)
-                sock.sendall(b"quit\n")
-                sock.close()
-                break
+def run_deck(tag, qemu_args, keys, dump_after=None, boot_tmo=12.0):
+    log_p, sock_p, ppm_p = f"build/{tag}.log", f"build/{tag}.sock", f"build/{tag}.ppm"
+    for p in (log_p, sock_p, ppm_p):
+        if os.path.exists(p):
+            os.remove(p)
+    proc = subprocess.Popen(["qemu-system-x86_64", *qemu_args,
+                             "-debugcon", f"file:{log_p}", "-global", "isa-debugcon.iobase=0xe9",
+                             "-monitor", f"unix:{sock_p},server,nowait", "-display", "none", "-no-reboot"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rd = lambda: open(log_p, "rb").read().decode("latin1") if os.path.exists(log_p) else ""
+    def wait_for(pred, tmo):
+        t0 = time.time()
+        while time.time() - t0 < tmo:
+            if pred(rd()):
+                return True
+            time.sleep(0.03)
+        return False
+    marker = {"1": "CAP1=", "2": "CAP2=", "3": "CAP3=", "b": "BENCH=OK", "a": "GATE1B_OK", "q": "SHUTDOWN_OK"}
+    try:
+        if not wait_for(lambda l: "KBD\n" in l, boot_tmo):
+            print(f"  [FAIL] {tag}: no ZEROHAND ... KBD banner:\n" + rd(), file=sys.stderr)
+            sys.exit(1)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_p)
         time.sleep(0.05)
-    proc.wait(timeout=4)
-finally:
-    if proc.poll() is None:
-        proc.kill()
+        for k in keys:
+            n0 = rd().count(marker[k])
+            sock.sendall(f"sendkey {k}\n".encode())
+            if not wait_for(lambda l: l.count(marker[k]) > n0, 6.0):
+                print(f"  [FAIL] {tag}: no '{marker[k]}' response to sendkey {k}:\n" + rd(), file=sys.stderr)
+                sys.exit(1)
+            if dump_after == k:
+                sock.sendall(f"screendump {ppm_p}\n".encode())
+                wait_for(lambda l: os.path.exists(ppm_p) and os.path.getsize(ppm_p) > 0, 3.0)
+                time.sleep(0.15)
+        time.sleep(0.1)
+        sock.sendall(b"quit\n")
+        sock.close()
+        proc.wait(timeout=4)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    return rd(), ppm_p
 
-log = open("build/gate1_debugcon.log", "rb").read().decode("latin1")
-m = re.search(r"^ZEROHAND W=(\d+) H=(\d+) S=(\d+) F=0 C=4 M=(\d+) PT=(\d+) WX=0 ACPI=1 GS=1 FAB=1 CYC=(\d+) CAP=777 KBD\nSCAN=0x0000001E GATE1B_OK\n$", log)
+# 1. 4-core Q35 + NVMe: `1` -> `2` -> `3` -> `b` -> `a` -> screendump -> `q`
+q35_nvme = ["-machine", "q35", *accel, *pm_flags, "-m", "512M",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
+            "-drive", "format=raw,file=fat:rw:build/esp",
+            "-drive", "file=build/nvme_disk.img,if=none,id=nvm0,format=raw",
+            "-device", "nvme,serial=ZEROZCAP,drive=nvm0"]
+log, ppm = run_deck("gate1_debugcon", [*q35_nvme, "-smp", "4"], ["1", "2", "3", "b", "a", "q"], dump_after="a")
+c1, c2, c3 = EXPECT[4]
+m = re.search(r"^ZEROHAND W=(\d+) H=(\d+) S=(\d+) F=0 C=4 M=(\d+) PT=(\d+) WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=(\d+)/(\d+) CYC=(\d+) CAP=777 KBD\n"
+              rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\nBENCH=OK\nSCAN=0x0000001E GATE1B_OK\nSHUTDOWN_OK\n$", log)
 if not m:
-    print("  [FAIL] unexpected Gate-3 (Q35 + NVMe -smp 4) debugcon log:\n" + log, file=sys.stderr)
+    print("  [FAIL] unexpected 4-core Command Deck debugcon log:\n" + log, file=sys.stderr)
     sys.exit(1)
-
-gw, gh, gs, mc, pt, cyc = map(int, m.groups())
+gw, gh, gs, mc, pt, vec_cyc, sc_cyc, cyc = map(int, m.groups())
 assert gs >= gw * 4, f"stride {gs} < width*4 ({gw*4})"
-assert cyc > 0, f"expected positive rdtsc round-trip cycle count, got {cyc}"
-print(f"  [PASS] Q35+OVMF (-smp 4, cpu-pm=on, NVMe) C=4 + W^X({pt} PT) + gs:0 + MOVDIR64B/MWAIT (CYC={cyc}) + Self-Hosted NVMe @capsule (CAP=777) + i8042(0x1E)")
+assert vec_cyc > 0 and sc_cyc > 0 and cyc > 0
+print(f"  [PASS] [zero2] Q35+OVMF -smp 4 + NVMe: C=4 WX=0({pt} PT) SIMD=1 VEC={vec_cyc}/{sc_cyc} CYC={cyc} CAP=777")
+print(f"  [PASS] [zero2] IRQ1/MWAIT Command Deck: [1] CAP1={c1} [2] AVX-512 CAP2={c2} [3] MATRIX_CRC CAP3={c3} [B] BENCH=OK [A] GATE1B_OK [Q] SHUTDOWN_OK")
 
-with open("build/gate1_gop.ppm", "rb") as f:
+with open(ppm, "rb") as f:
     assert f.readline().strip() == b"P6"
     pw, ph = map(int, f.readline().split())
     assert f.readline().strip() == b"255"
     rgb = f.read()
-
 assert (pw, ph) == (gw, gh), f"PPM {pw}x{ph} != GOP {gw}x{gh}"
 
 def get_px(x, y):
@@ -454,72 +538,50 @@ def get_px(x, y):
 def exp_px(x, y):
     return (x ^ y) & 0xFF, (y * 3 + (x >> 2)) & 0xFF, x & 0xFF
 
-for pt_xy in [(0, 0), (1, 0), (0, 1), (17, 5), (pw // 2, ph // 2), (pw - 1, 0), (0, ph - 1), (pw - 1, ph - 1)]:
-    assert get_px(*pt_xy) == exp_px(*pt_xy), f"GOP pixel mismatch at {pt_xy}"
-
+for pt_xy in [(0, 0), (1, 0), (0, 1), (15, 0), (16, 0), (17, 5), (pw // 2, ph // 2), (pw - 1, 0), (0, ph - 1), (pw - 1, ph - 1)]:
+    assert get_px(*pt_xy) == exp_px(*pt_xy), f"GOP AVX-512 scanout pixel mismatch at {pt_xy}"
 assert get_px(40, 40) == ((0x1E ^ 0xA5) & 0xFF, 0xFF, 0x1E), "scancode cell mismatch at (40,40)"
-expected_leds = [
-    (0, (0x00, 0xE5, 0xFF)),
-    (1, (0x29, 0x79, 0xFF)),
-    (2, (0xFF, 0xD6, 0x00)),
-    (3, (0xFF, 0x6D, 0x00)),
-    (4, (0x00, 0xE6, 0x76)),
-    (5, (0xE0, 0x66, 0xFF)),
-]
-for slot, want_rgb in expected_leds:
+for slot, want_rgb in [(0, (0x00, 0xE5, 0xFF)), (1, (0x29, 0x79, 0xFF)), (2, (0xFF, 0xD6, 0x00)),
+                       (3, (0xFF, 0x6D, 0x00)), (4, (0x00, 0xE6, 0x76)), (5, (0xE0, 0x66, 0xFF))]:
     got_rgb = get_px(36 + slot * 24, 12)
     assert got_rgb == want_rgb, f"checkpoint LED {slot} mismatch: got {got_rgb}, want {want_rgb}"
-
 for core_i in range(4):
     assert get_px(204 + core_i * 16, 12) == (0x00, 0xFF, 0xAA), f"online core pip {core_i} missing"
 assert get_px(204 + 4 * 16, 12) == exp_px(204 + 4 * 16, 12), "unexpected 5th core pip on -smp 4"
 assert get_px(420, 6)  == (0x00, 0xE5, 0xFF), f"HUD cyan border mismatch: {get_px(420, 6)}"
 assert get_px(425, 10) == (0x0C, 0x10, 0x18), f"HUD obsidian fill mismatch: {get_px(425, 10)}"
 assert get_px(434, 12) == (0xF0, 0xF4, 0xFF), f"HUD glyph 'Z' mismatch: {get_px(434, 12)}"
-print(f"  [PASS] GOP BGRX8888 stride={gs}B (movnti+unroll:4), 6 LEDs (incl. NVMe @capsule), 4 core pips, HUD ('ZERO OS // GATE 3 // C:4 WX:0 CYC:{cyc} CAP:777') verified ({pw}x{ph})")
-
-# 2. Verify `-smp 1` without NVMe degrades cleanly (`C=1`, `CAP=0`)
-for p in ("build/gate1_smp1.log", "build/qmp1.sock"):
-    if os.path.exists(p):
-        os.remove(p)
-proc1 = subprocess.Popen([
-    "qemu-system-x86_64", *accel, "-smp", "1", "-m", "512M",
-    "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
-    "-drive", "format=raw,file=fat:rw:build/esp",
-    "-debugcon", "file:build/gate1_smp1.log",
-    "-global", "isa-debugcon.iobase=0xe9",
-    "-monitor", "unix:build/qmp1.sock,server,nowait",
-    "-display", "none",
-    "-no-reboot",
-], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# Obsidian Command Deck (x=32..608, y=84..332): border, header bar, body, and `> [3]` active-slot highlight
+assert get_px(32, 84)   == (0x00, 0xE5, 0xFF), f"deck cyan border mismatch: {get_px(32, 84)}"
+assert get_px(560, 100) == (0x12, 0x1A, 0x2A), f"deck header bar mismatch: {get_px(560, 100)}"
+assert get_px(36, 120)  == (0x0C, 0x10, 0x18), f"deck obsidian body mismatch: {get_px(36, 120)}"
+assert get_px(560, 180) == (0x0C, 0x10, 0x18) and get_px(560, 200) == (0x0C, 0x10, 0x18), "slots [1]/[2] wrongly highlighted"
+assert get_px(560, 225) == (0x16, 0x26, 0x3D), f"active slot [3] highlight missing: {get_px(560, 225)}"
+assert get_px(44, 218)  == (0xFF, 0xD6, 0x00), f"active slot '>' marker missing: {get_px(44, 218)}"
 try:
-    t0 = time.time()
-    sent1 = False
-    sock1 = None
-    while time.time() - t0 < 10.0:
-        if os.path.exists("build/gate1_smp1.log"):
-            log1 = open("build/gate1_smp1.log", "rb").read().decode("latin1")
-            if ("KBD\n" in log1) and not sent1:
-                sock1 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock1.connect("build/qmp1.sock")
-                time.sleep(0.05)
-                sock1.sendall(b"sendkey a\n")
-                sent1 = True
-            if "GATE1B_OK" in log1 and sock1 is not None:
-                sock1.sendall(b"quit\n")
-                sock1.close()
-                break
-        time.sleep(0.05)
-    proc1.wait(timeout=4)
-finally:
-    if proc1.poll() is None:
-        proc1.kill()
+    from PIL import Image
+    Image.open(ppm).save("build/gate4_live_os_hud.png")
+    png_note = " -> build/gate4_live_os_hud.png"
+except Exception:
+    png_note = ""
+print(f"  [PASS] [zero2] GOP {pw}x{ph} stride={gs}B: AVX-512 scanout, 6 LEDs, 4 core pips, HUD, Command Deck + '> [3] EXT2 MATRIX_CRC' highlight{png_note}")
 
-log1 = open("build/gate1_smp1.log", "rb").read().decode("latin1")
-assert re.search(r"^ZEROHAND W=\d+ H=\d+ S=\d+ F=0 C=1 M=\d+ PT=\d+ WX=0 ACPI=1 GS=1 FAB=1 CYC=\d+ CAP=0 KBD\nSCAN=0x0000001E GATE1B_OK\n$", log1), f"unexpected -smp 1 log: {log1}"
-print("  [PASS] single-core no-NVMe (-smp 1) fallback verified cleanly (C=1, WX=0, GS=1, FAB=1, CAP=0)")
+# 2. Single-core Q35 + NVMe: BSP executes all 3 capsules directly (`rid 0`)
+c1, c2, c3 = EXPECT[1]
+log1n, _ = run_deck("gate1_smp1_nvme", [*q35_nvme, "-smp", "1"], ["1", "2", "3", "q"])
+assert re.search(r"^ZEROHAND W=\d+ H=\d+ S=\d+ F=0 C=1 M=\d+ PT=\d+ WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=\d+/\d+ CYC=\d+ CAP=777 KBD\n"
+                 rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\nSHUTDOWN_OK\n$", log1n), f"unexpected -smp 1 NVMe log: {log1n}"
+print(f"  [PASS] [zero2] single-core Q35 + NVMe BSP capsule path: CAP1={c1} CAP2={c2} CAP3={c3} SHUTDOWN_OK")
 
-# 3. Verify missing GOP (`-vga none`) returns cleanly to firmware without guessing framebuffer (§8.5)
+# 3. Single-core i440FX without NVMe: degrades cleanly (`C=1`, `CAP=0`, capsule keys return `0`)
+log1, _ = run_deck("gate1_smp1", [*accel, "-smp", "1", "-m", "512M",
+                                   "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
+                                   "-drive", "format=raw,file=fat:rw:build/esp"], ["2", "a", "q"])
+assert re.search(r"^ZEROHAND W=\d+ H=\d+ S=\d+ F=0 C=1 M=\d+ PT=\d+ WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=\d+/\d+ CYC=\d+ CAP=0 KBD\n"
+                 r"CAP2=0\nSCAN=0x0000001E GATE1B_OK\nSHUTDOWN_OK\n$", log1), f"unexpected -smp 1 no-NVMe log: {log1}"
+print("  [PASS] [zero2] single-core no-NVMe (-smp 1) fallback: C=1 WX=0 SIMD=1 CAP=0, CAP2=0 (no extent), GATE1B_OK, SHUTDOWN_OK")
+
+# 4. Missing GOP (`-vga none`) returns cleanly to firmware without guessing a framebuffer (§8.5)
 if os.path.exists("build/gate1_nogop.log"):
     os.remove("build/gate1_nogop.log")
 proc2 = subprocess.Popen([
@@ -537,8 +599,153 @@ proc2.kill()
 proc2.wait()
 nogop_bytes = os.path.getsize("build/gate1_nogop.log") if os.path.exists("build/gate1_nogop.log") else 0
 assert nogop_bytes == 0, f"missing GOP unexpectedly wrote {nogop_bytes} bytes to 0xE9!"
-print("  [PASS] missing GOP (-vga none) returned cleanly to UEFI firmware (0 framebuffer guesses)")
+print("  [PASS] [zero2] missing GOP (-vga none) returned cleanly to UEFI firmware (0 framebuffer guesses)")
+PY
+
+echo "=== [7/7] Physical-Laptop USB Image: GPT + FAT32 ESP + qemu_debug=0 BOOTX64.EFI (make usb-img) ==="
+python3 scripts/build_usb_image.py --compiler "$ZERO2" --src examples/gate1_os.zr --build-dir "$BUILD" --out "$BUILD/zeroos_usb.img" > /dev/null
+python3 - <<'PY'
+import os, socket, struct, subprocess, sys, time, zlib
+
+IMG = "build/zeroos_usb.img"
+img = open(IMG, "rb").read()
+SEC = 512
+assert len(img) == 64 * 1024 * 1024, f"USB image is {len(img)} bytes, want 64 MiB"
+total = len(img) // SEC
+
+# 1. Protective MBR (type 0xEE) + primary & backup GPT headers / entry arrays with valid CRC32s
+assert img[510:512] == b"\x55\xAA" and img[446 + 4] == 0xEE, "missing protective MBR (0xEE)"
+def check_gpt(lba, want_alt):
+    hdr = img[lba * SEC:(lba + 1) * SEC]
+    assert hdr[0:8] == b"EFI PART", f"no GPT signature at LBA {lba}"
+    hsz = struct.unpack_from("<I", hdr, 12)[0]
+    hcrc = struct.unpack_from("<I", hdr, 16)[0]
+    tmp = bytearray(hdr[:hsz]); tmp[16:20] = b"\0\0\0\0"
+    assert zlib.crc32(tmp) & 0xFFFFFFFF == hcrc, f"GPT header CRC mismatch at LBA {lba}"
+    my, alt, first, last = struct.unpack_from("<QQQQ", hdr, 24)
+    ent_lba, n_ent, ent_sz, ent_crc = struct.unpack_from("<QIII", hdr, 72)
+    assert my == lba and alt == want_alt, f"GPT LBA links wrong at {lba}: my={my} alt={alt}"
+    arr = img[ent_lba * SEC: ent_lba * SEC + n_ent * ent_sz]
+    assert zlib.crc32(arr) & 0xFFFFFFFF == ent_crc, f"GPT entry array CRC mismatch (LBA {lba})"
+    return arr, first, last
+arr, first, last = check_gpt(1, total - 1)
+arr_b, _, _ = check_gpt(total - 1, 1)
+assert arr == arr_b, "primary/backup GPT entry arrays differ"
+esp_guid = bytes.fromhex("28732ac11ff8d211ba4b00a0c93ec93b")
+assert arr[0:16] == esp_guid, "partition 1 is not an EFI System Partition"
+p_first, p_last = struct.unpack_from("<QQ", arr, 32)
+assert first <= p_first <= p_last <= last, "ESP outside GPT usable range"
+
+# 2. Independent FAT32 walk: `/EFI/BOOT/BOOTX64.EFI`
+vol = img[p_first * SEC:(p_last + 1) * SEC]
+bps, spc, rsvd, nfats = struct.unpack_from("<HBHB", vol, 11)
+fatsz, root_clus = struct.unpack_from("<I", vol, 36)[0], struct.unpack_from("<I", vol, 44)[0]
+assert vol[82:90] == b"FAT32   " and vol[510:512] == b"\x55\xAA" and bps == 512, "ESP is not a FAT32 volume"
+data_off = (rsvd + nfats * fatsz) * bps
+clus_bytes = spc * bps
+n_clusters = (len(vol) - data_off) // clus_bytes
+assert n_clusters >= 65525, f"only {n_clusters} clusters: not a spec-compliant FAT32 volume"
+fat = vol[rsvd * bps:(rsvd + fatsz) * bps]
+assert fat == vol[(rsvd + fatsz) * bps:(rsvd + 2 * fatsz) * bps], "FAT1 != FAT2"
+def chain(c):
+    out = []
+    while 2 <= c < 0x0FFFFFF8:
+        out.append(c)
+        c = struct.unpack_from("<I", fat, c * 4)[0] & 0x0FFFFFFF
+        assert len(out) < 1 << 20
+    return out
+def read_clusters(c):
+    return b"".join(vol[data_off + (k - 2) * clus_bytes: data_off + (k - 1) * clus_bytes] for k in chain(c))
+def find(dir_clus, name83):
+    d = read_clusters(dir_clus)
+    for o in range(0, len(d), 32):
+        if d[o] == 0:
+            break
+        if d[o:o + 11] == name83 and d[o + 11] != 0x0F:
+            clus = (struct.unpack_from("<H", d, o + 20)[0] << 16) | struct.unpack_from("<H", d, o + 26)[0]
+            return clus, struct.unpack_from("<I", d, o + 28)[0], d[o + 11]
+    raise AssertionError(f"{name83!r} not found in FAT32 directory")
+efi_c, _, a1 = find(root_clus, b"EFI        ")
+boot_c, _, a2 = find(efi_c, b"BOOT       ")
+f_c, f_sz, _ = find(boot_c, b"BOOTX64 EFI")
+assert a1 & 0x10 and a2 & 0x10, "EFI/BOOT are not directories"
+payload = read_clusters(f_c)[:f_sz]
+laptop = open("build/gate1_laptop_z2.efi", "rb").read()
+assert payload == laptop, "USB /EFI/BOOT/BOOTX64.EFI != independently compiled zero2 qemu_debug=0 gate1_laptop_z2.efi"
+open("build/usb_extracted_BOOTX64.EFI", "wb").write(payload)
+print(f"  [PASS] build/zeroos_usb.img: protective MBR + CRC-valid primary/backup GPT + FAT32 ESP ({n_clusters} clusters) "
+      f"-> /EFI/BOOT/BOOTX64.EFI ({f_sz} B) byte-identical to zero2 laptop build")
+
+# 3. Boot the raw USB image on OVMF via xHCI `usb-storage` (as a physical stick) and verify the Command Deck + i8042 input
+ovmf = "/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+accel = ["-enable-kvm", "-cpu", "host"] if kvm else ["-cpu", "max"]
+sock_p, ppm_p, dbg_p = "build/usb_boot.sock", "build/usb_boot.ppm", "build/usb_boot_debugcon.log"
+for p in (sock_p, ppm_p, dbg_p):
+    if os.path.exists(p):
+        os.remove(p)
+proc = subprocess.Popen(["qemu-system-x86_64", "-machine", "q35", *accel, "-smp", "4", "-m", "512M",
+                         "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
+                         "-drive", f"if=none,id=usb0,format=raw,file={IMG},snapshot=on",
+                         "-device", "qemu-xhci", "-device", "usb-storage,drive=usb0,bootindex=0",
+                         "-debugcon", f"file:{dbg_p}", "-global", "isa-debugcon.iobase=0xe9",
+                         "-monitor", f"unix:{sock_p},server,nowait", "-display", "none", "-no-reboot"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def mon(cmd):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_p)
+    s.sendall((cmd + "\n").encode())
+    time.sleep(0.25)
+    s.close()
+def dump():
+    if os.path.exists(ppm_p):
+        os.remove(ppm_p)
+    mon(f"screendump {ppm_p}")
+    for _ in range(20):
+        if os.path.exists(ppm_p) and os.path.getsize(ppm_p) > 0:
+            break
+        time.sleep(0.05)
+    with open(ppm_p, "rb") as f:
+        assert f.readline().strip() == b"P6"
+        w, h = map(int, f.readline().split())
+        f.readline()
+        data = f.read()
+    return w, h, (lambda x, y: tuple(data[(y * w + x) * 3:(y * w + x) * 3 + 3]))
+exp_px = lambda x, y: ((x ^ y) & 0xFF, (y * 3 + (x >> 2)) & 0xFF, x & 0xFF)
+try:
+    t0 = time.time()
+    while not os.path.exists(sock_p) and time.time() - t0 < 5:
+        time.sleep(0.05)
+    booted = False
+    while time.time() - t0 < 15.0:
+        time.sleep(0.4)
+        try:
+            w, h, px = dump()
+        except Exception:
+            continue
+        if w >= 640 and px(32, 84) == (0x00, 0xE5, 0xFF) and px(0, 0) == exp_px(0, 0) and px(w - 1, h - 1) == exp_px(w - 1, h - 1):
+            booted = True
+            break
+    if not booted:
+        print("  [FAIL] USB image did not reach the ZeroOS Command Deck under OVMF xHCI usb-storage boot", file=sys.stderr)
+        sys.exit(1)
+    t_boot = time.time() - t0
+    for core_i in range(4):
+        assert px(204 + core_i * 16, 12) == (0x00, 0xFF, 0xAA), f"USB boot: core pip {core_i} missing"
+    mon("sendkey a")
+    time.sleep(0.4)
+    w, h, px = dump()
+    assert px(40, 40) == ((0x1E ^ 0xA5) & 0xFF, 0xFF, 0x1E), f"USB boot: scancode cell mismatch {px(40, 40)}"
+    assert px(36 + 4 * 24, 12) == (0x00, 0xE6, 0x76), "USB boot: keyboard LED 4 not lit"
+    mon("quit")
+    proc.wait(timeout=4)
+finally:
+    if proc.poll() is None:
+        proc.kill()
+dbg_bytes = os.path.getsize(dbg_p) if os.path.exists(dbg_p) else 0
+assert dbg_bytes == 0, f"qemu_debug=0 USB image wrote {dbg_bytes} bytes to port 0xE9!"
+print(f"  [PASS] USB image booted via OVMF xHCI usb-storage in {t_boot:.1f}s -> {w}x{h} Command Deck, 4 core pips, i8042 'a' (0x1E) cell, 0 bytes on 0xE9")
 PY
 
 echo "=== Binary Footprint Summary ==="
-ls -lh --block-size=1 "$ZERO0" "$BUILD/zero1" "$BUILD/zero2" "$BUILD/zero3" "$BUILD/first" "$BUILD/z2_first" "$BUILD/capsule_compute.zcap" "$BUILD/capsule_z2.zcap" "$BUILD/gate1_os.efi" "$BUILD/gate1_laptop.efi"
+ls -lh --block-size=1 "$ZERO0" "$BUILD/zero1" "$ZERO2" "$BUILD/zero3" "$BUILD/z2_first" "$BUILD/z2_phase2_zero_power" "$BUILD/z2_phase3_reactor_fabric" "$BUILD/z2_phase4_avx512_simd" "$BUILD/capsule_z2.zcap" "$BUILD/cap_avx512_wave.zcap" "$BUILD/cap_matrix_crc.zcap" "$BUILD/gate1_os_z2.efi" "$BUILD/gate1_laptop_z2.efi" "$BUILD/zeroos_usb.img"

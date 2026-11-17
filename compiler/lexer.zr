@@ -56,7 +56,12 @@ fn lexer_init() {
     reg_kw("slab",     KW_SLAB)
     reg_kw("arena",    KW_ARENA)
     reg_kw("capsule",  KW_CAPSULE)
+    reg_kw("ring",     KW_RING)
+    reg_kw("mmio",     KW_MMIO)
+    reg_kw("cell64",   KW_CELL64)
+    reg_kw("cold",     KW_COLD)
 
+    // Core contextual symbols
     g[G_SYM_MAIN]      = sym_intern_str("main")
     g[G_SYM_USE]       = sym_intern_str("use")
     g[G_SYM_MAX]       = sym_intern_str("max")
@@ -78,6 +83,121 @@ fn lexer_init() {
     g[G_SYM_SIZEOF]    = sym_intern_str("sizeof")
     g[G_SYM_ALIGNOF]   = sym_intern_str("alignof")
     g[G_SYM_TILE]      = sym_intern_str("tile")
+
+    // Builtin primitive & span type names (`TOK_IDENT`)
+    g[G_SYM_I64]       = sym_intern_str("i64")
+    g[G_SYM_U64]       = sym_intern_str("u64")
+    g[G_SYM_I32]       = sym_intern_str("i32")
+    g[G_SYM_U32]       = sym_intern_str("u32")
+    g[G_SYM_I16]       = sym_intern_str("i16")
+    g[G_SYM_U16]       = sym_intern_str("u16")
+    g[G_SYM_I8]        = sym_intern_str("i8")
+    g[G_SYM_U8]        = sym_intern_str("u8")
+    g[G_SYM_STR]       = sym_intern_str("str")
+    g[G_SYM_BYTES]     = sym_intern_str("bytes")
+    g[G_SYM_BOOL]      = sym_intern_str("bool")
+    g[G_SYM_BIT]       = sym_intern_str("bit")
+    g[G_SYM_MASK64]    = sym_intern_str("mask64")
+
+    // Space, Struct, Custom `@ptr`, View, Atomic, Loop, & Statement Symbols
+    g[G_SYM_SLAB]       = sym_intern_str("slab")
+    g[G_SYM_ARENA]      = sym_intern_str("arena")
+    g[G_SYM_CAPSULE]    = sym_intern_str("capsule")
+    g[G_SYM_RING]       = sym_intern_str("ring")
+    g[G_SYM_MMIO]       = sym_intern_str("mmio")
+    g[G_SYM_CELL64]     = sym_intern_str("cell64")
+    g[G_SYM_COLD]       = sym_intern_str("cold")
+    g[G_SYM_PORT]       = sym_intern_str("port")
+    g[G_SYM_DMA_QUEUE]  = sym_intern_str("dma_queue")
+    g[G_SYM_PACKED]     = sym_intern_str("packed")
+    g[G_SYM_ALIGN]      = sym_intern_str("align")
+    g[G_SYM_BSWAP]      = sym_intern_str("bswap")
+    g[G_SYM_WRAP]       = sym_intern_str("wrap")
+    g[G_SYM_STRIDE]     = sym_intern_str("stride")
+    g[G_SYM_MASK]       = sym_intern_str("mask")
+    g[G_SYM_RAW]        = sym_intern_str("raw")
+    g[G_SYM_READ]       = sym_intern_str("read")
+    g[G_SYM_WRITE]      = sym_intern_str("write")
+    g[G_SYM_LOAD]       = sym_intern_str("load")
+    g[G_SYM_STORE]      = sym_intern_str("store")
+    g[G_SYM_SWAP]       = sym_intern_str("swap")
+    g[G_SYM_ADD]        = sym_intern_str("add")
+    g[G_SYM_SUB]        = sym_intern_str("sub")
+    g[G_SYM_CAS]        = sym_intern_str("cas")
+    g[G_SYM_SLOT_ADDR]  = sym_intern_str("slot_addr")
+    g[G_SYM_SPAN]       = sym_intern_str("span")
+    g[G_SYM_PUBLISH]    = sym_intern_str("publish")
+    g[G_SYM_WAIT]       = sym_intern_str("wait")
+    g[G_SYM_MATCH]      = sym_intern_str("match")
+    g[G_SYM_WILDCARD]   = sym_intern_str("_")
+    g[G_SYM_REV]        = sym_intern_str("rev")
+    g[G_SYM_UNROLL]     = sym_intern_str("unroll")
+    g[G_SYM_PREFETCH]   = sym_intern_str("prefetch")
+    g[G_SYM_SIMD]       = sym_intern_str("simd")
+    g[G_SYM_STREAM]     = sym_intern_str("stream")
+    g[G_SYM_ATOMIC]     = sym_intern_str("atomic")
+    g[G_SYM_CODE_BYTES] = sym_intern_str("code_bytes")
+    g[G_SYM_EMIT]       = sym_intern_str("emit")
+    g[G_SYM_ISR]        = sym_intern_str("isr")
+    g[G_SYM_ISR_OK]     = sym_intern_str("isr_ok")
+
+    // Silicon, Ring-0, & Reactor Intrinsics
+    g[G_SYM_CLI]           = sym_intern_str("cli")
+    g[G_SYM_STI]           = sym_intern_str("sti")
+    g[G_SYM_HLT]           = sym_intern_str("hlt")
+    g[G_SYM_HALT]          = sym_intern_str("halt")
+    g[G_SYM_PAUSE]         = sym_intern_str("pause")
+    g[G_SYM_RDTSC]         = sym_intern_str("rdtsc")
+    g[G_SYM_LGDT]          = sym_intern_str("lgdt")
+    g[G_SYM_LIDT]          = sym_intern_str("lidt")
+    g[G_SYM_LTR]           = sym_intern_str("ltr")
+    g[G_SYM_CR_READ]       = sym_intern_str("cr_read")
+    g[G_SYM_CR_WRITE]      = sym_intern_str("cr_write")
+    g[G_SYM_MSR_READ]      = sym_intern_str("msr_read")
+    g[G_SYM_MSR_WRITE]     = sym_intern_str("msr_write")
+    g[G_SYM_XSETBV]        = sym_intern_str("xsetbv")
+    g[G_SYM_WRPKRU]        = sym_intern_str("wrpkru")
+    g[G_SYM_PORT_IN8]      = sym_intern_str("port_in8")
+    g[G_SYM_PORT_OUT8]     = sym_intern_str("port_out8")
+    g[G_SYM_MM_READ32]     = sym_intern_str("mm_read32")
+    g[G_SYM_MM_READ64]     = sym_intern_str("mm_read64")
+    g[G_SYM_MM_WRITE32]    = sym_intern_str("mm_write32")
+    g[G_SYM_MM_WRITE64]    = sym_intern_str("mm_write64")
+    g[G_SYM_ISR_STUB_BASE] = sym_intern_str("isr_stub_base")
+    g[G_SYM_EOI]           = sym_intern_str("eoi")
+    g[G_SYM_WRGSBASE]      = sym_intern_str("wrgsbase")
+    g[G_SYM_RDGSBASE]      = sym_intern_str("rdgsbase")
+    g[G_SYM_INBOX_BASE]    = sym_intern_str("inbox_base")
+    g[G_SYM_SCRATCH_BASE]  = sym_intern_str("scratch_base")
+    g[G_SYM_LOCAL_BASE]    = sym_intern_str("local_base")
+    g[G_SYM_REACTOR_BIND]  = sym_intern_str("reactor_bind")
+    g[G_SYM_MOVDIRI]       = sym_intern_str("movdiri")
+    g[G_SYM_CPUID_ECX]     = sym_intern_str("cpuid_ecx")
+    g[G_SYM_CPUID_EBX]     = sym_intern_str("cpuid_ebx")
+    g[G_SYM_BSWAP16]       = sym_intern_str("bswap16")
+    g[G_SYM_BSWAP32]       = sym_intern_str("bswap32")
+    g[G_SYM_BSWAP64]       = sym_intern_str("bswap64")
+    g[G_SYM_PDEP]          = sym_intern_str("pdep")
+    g[G_SYM_PEXT]          = sym_intern_str("pext")
+    g[G_SYM_CLFLUSH]       = sym_intern_str("clflush")
+    g[G_SYM_LFENCE]        = sym_intern_str("lfence")
+    g[G_SYM_SFENCE]        = sym_intern_str("sfence")
+    g[G_SYM_MFENCE]        = sym_intern_str("mfence")
+
+    // Track 2: 512-Bit `AVX-512` (`EVEX` `ZMM`) Vector Types & `@vec_*` Intrinsics
+    g[G_SYM_U32X16]        = sym_intern_str("u32x16")
+    g[G_SYM_U64X8]         = sym_intern_str("u64x8")
+    g[G_SYM_VEC_SPLAT32]   = sym_intern_str("vec_splat32")
+    g[G_SYM_VEC_SPLAT64]   = sym_intern_str("vec_splat64")
+    g[G_SYM_VEC_IOTA32]    = sym_intern_str("vec_iota32")
+    g[G_SYM_VEC_IOTA64]    = sym_intern_str("vec_iota64")
+    g[G_SYM_VEC_LOAD32]    = sym_intern_str("vec_load32")
+    g[G_SYM_VEC_LOAD64]    = sym_intern_str("vec_load64")
+    g[G_SYM_VEC_STORE32]   = sym_intern_str("vec_store32")
+    g[G_SYM_VEC_STORE64]   = sym_intern_str("vec_store64")
+    g[G_SYM_VEC_STREAM]    = sym_intern_str("vec_stream")
+    g[G_SYM_VEC_SUM32]     = sym_intern_str("vec_sum32")
+    g[G_SYM_VEC_SUM64]     = sym_intern_str("vec_sum64")
 }
 
 // Canonicalizes `path_scratch[0..raw_len)` into `canon_buf[0..out_len)` (NUL-terminated)
@@ -365,7 +485,7 @@ fn tokenize_range(start_off: i64, end_off: i64, allow_imports: i64, dir_pool_off
             continue
         }
 
-        // Integer Literals (`0x...`, `0b...`, decimal, `_` separators, `KB`/`MB`/`GB`)
+        // Integer Literals (`0x...`, `0b...`, decimal, `_` separators, `B`/`KB`/`MB`/`GB`)
         if is_digit(c) == 1 {
             val: u64 = 0
             if c == '0' && pos + 1 < end_off && (src_buf[pos + 1] == 'x' || src_buf[pos + 1] == 'X') {
@@ -423,20 +543,24 @@ fn tokenize_range(start_off: i64, end_off: i64, allow_imports: i64, dir_pool_off
                         }
                         break
                     }
-                    // Optional `KB`, `MB`, `GB` suffixes
-                    if pos + 1 < end_off && src_buf[pos + 1] == 'B' {
-                        sc: u8 = src_buf[pos]
-                        if sc == 'K' {
-                            val = val << 10
-                            pos += 2
-                        } else {
-                            if sc == 'M' {
-                                val = val << 20
+                    // Optional `B`, `KB`, `MB`, `GB` byte-unit suffixes
+                    if pos < end_off && src_buf[pos] == 'B' {
+                        pos += 1
+                    } else {
+                        if pos + 1 < end_off && src_buf[pos + 1] == 'B' {
+                            sc: u8 = src_buf[pos]
+                            if sc == 'K' {
+                                val = val << 10
                                 pos += 2
                             } else {
-                                if sc == 'G' {
-                                    val = val << 30
+                                if sc == 'M' {
+                                    val = val << 20
                                     pos += 2
+                                } else {
+                                    if sc == 'G' {
+                                        val = val << 30
+                                        pos += 2
+                                    }
                                 }
                             }
                         }

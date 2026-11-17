@@ -1,0 +1,376 @@
+// =============================================================================
+// Zero Self-Hosted Compiler — 512-Bit `AVX-512` (`EVEX`) Emitter (`compiler/evex_zmm.zr`)
+// =============================================================================
+// Emits verified 4-byte `EVEX` (`0x62`) & `VEX` machine instructions for:
+//   - 512-bit `ZMM0..ZMM7` (`u32x16` & `u64x8`) vector registers
+//   - `k1` hardware opmask register (`{k1}{z}` zero-masked loads & `{k1}` stores)
+//   - Non-temporal 64B streaming stores (`vmovntdq [rcx], zmm`)
+//   - GPR broadcasts (`vpbroadcastd`/`q`), `iota32`/`iota64`, `sum32`/`sum64`
+//   - Ring-0 Zero-XSAVE `<tile>` hygiene (`vzeroupper`)
+// =============================================================================
+
+EVEX_UNMASKED :: 0x00   // P2 = 0x48 (L'L=10 512b, V'=1, k0)
+EVEX_K1       :: 0x01   // P2 = 0x49 (L'L=10 512b, V'=1, {k1})
+EVEX_K1Z      :: 0x81   // P2 = 0xC9 (L'L=10 512b, V'=1, {k1}{z})
+
+// Emits 4-byte 512-bit `EVEX` prefix (`0x62 P0 P1 P2`) for `ZMM0..ZMM7` & GPRs `0..7`:
+//   mm:      1 = 0F, 2 = 0F38, 3 = 0F3A
+//   w:       0 = 32-bit lane, 1 = 64-bit lane
+//   vvvv:    NDS source ZMM (0..7; pass 0 when unused)
+//   pp:      0 = none, 1 = 0x66, 2 = 0xF3, 3 = 0xF2
+//   p2_mask: EVEX_UNMASKED (0), EVEX_K1 (1), or EVEX_K1Z (0x81)
+fn emit_evex_zmm(mm: i64, w: i64, vvvv: i64, pp: i64, p2_mask: i64) {
+    p0 := 0xF0 | (mm & 3)
+    p1 := ((w & 1) << 7) | (((15 - (vvvv & 7)) & 15) << 3) | 4 | (pp & 3)
+    p2 := 0x48 | p2_mask
+    emit_u8(0x62)
+    emit_u8(p0)
+    emit_u8(p1)
+    emit_u8(p2)
+}
+
+fn emit_vzeroupper() {
+    emit_u8(0xC5)  emit_u8(0xF8)  emit_u8(0x77) // vzeroupper
+}
+
+// Allocates / releases a 64-byte (8-qword) temporary vector spill slot in the frame
+fn alloc_temp_vec() i64 {
+    g[G_TEMP_DEPTH] += 8
+    total := g[G_FRAME_QW] + g[G_TEMP_DEPTH]
+    if total > g[G_MAX_FRAME_QW] {
+        g[G_MAX_FRAME_QW] = total
+    }
+    return -(total * 8)
+}
+
+fn free_temp_vec() {
+    g[G_TEMP_DEPTH] -= 8
+}
+
+// --- Register Moves & `[rbp + disp]` 64B Spill / Reload (`EVEX disp8*64` aware) ---
+
+fn emit_zmm_mov(zdst: i64, zsrc: i64) {
+    if zdst == zsrc { return }
+    emit_evex_zmm(1, 1, 0, 1, EVEX_UNMASKED)     // vmovdqa64 zdst, zsrc
+    emit_u8(0x6F)
+    emit_u8(0xC0 | ((zdst & 7) << 3) | (zsrc & 7))
+}
+
+fn emit_zmm1_from_zmm0() {
+    emit_zmm_mov(1, 0)
+}
+
+fn emit_zmm_load_rbp(zreg: i64, disp: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_UNMASKED)     // vmovdqu64 zreg, [rbp + disp]
+    emit_u8(0x6F)
+    cd8 := disp >> 6
+    if (disp & 63) == 0 && cd8 >= -128 && cd8 <= 127 {
+        emit_u8(0x45 | ((zreg & 7) << 3))
+        emit_u8(cd8)
+    } else {
+        emit_u8(0x85 | ((zreg & 7) << 3))
+        emit_u32(disp)
+    }
+}
+
+fn emit_zmm_store_rbp(zreg: i64, disp: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_UNMASKED)     // vmovdqu64 [rbp + disp], zreg
+    emit_u8(0x7F)
+    cd8 := disp >> 6
+    if (disp & 63) == 0 && cd8 >= -128 && cd8 <= 127 {
+        emit_u8(0x45 | ((zreg & 7) << 3))
+        emit_u8(cd8)
+    } else {
+        emit_u8(0x85 | ((zreg & 7) << 3))
+        emit_u32(disp)
+    }
+}
+
+fn emit_zmm0_load_rbp(disp: i64)  { emit_zmm_load_rbp(0, disp) }
+fn emit_zmm1_load_rbp(disp: i64)  { emit_zmm_load_rbp(1, disp) }
+fn emit_zmm0_store_rbp(disp: i64) { emit_zmm_store_rbp(0, disp) }
+
+// --- `k1` Hardware Opmask Builders (`0..16` / `0..8` Active Lanes) ---
+
+fn emit_kmovw_k1_eax() {
+    emit_u8(0xC5)  emit_u8(0xF8)  emit_u8(0x92)  emit_u8(0xC8) // kmovw k1, eax
+}
+
+// Input: `rax` = runtime `active_lanes` (`i64`/`u64`), `max_lanes` = `16` or `8`.
+// Builds `k1 = (1 << clamp(rax, 0, max_lanes)) - 1` branchlessly using BMI2 `BZHI`!
+// Preserves `rcx`! (Clobbers only `rax` and `rdx`.)
+fn emit_k1_lane_mask_eax(max_lanes: i64) {
+    full_mask := (1 << max_lanes) - 1
+    // Clamp negative `rax < 0` to `0`: `xor edx, edx; test rax, rax; cmovs rax, rdx`
+    emit_u8(0x31)  emit_u8(0xD2)
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0)
+    emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0x48)  emit_u8(0xC2)
+    // Clamp `rax > max_lanes` to `max_lanes`: `mov edx, max_lanes; cmp rax, rdx; cmova rax, rdx`
+    emit_u8(0xBA)  emit_u32(max_lanes)
+    emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xD0)
+    emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0x47)  emit_u8(0xC2)
+    // `mov edx, full_mask; bzhi eax, edx, eax; kmovw k1, eax`
+    emit_u8(0xBA)  emit_u32(full_mask)
+    emit_u8(0xC4)  emit_u8(0xE2)  emit_u8(0x78)  emit_u8(0xF5)  emit_u8(0xC2)
+    emit_kmovw_k1_eax()
+}
+
+// --- Unmasked, `{k1}{z}` Zero-Masked, `{k1}` Write-Masked, & Non-Temporal Memory Ops ---
+
+fn emit_zmm_load32_rax(zdst: i64) {
+    emit_evex_zmm(1, 0, 0, 2, EVEX_UNMASKED)  emit_u8(0x6F)  emit_u8((zdst & 7) << 3)
+}
+
+fn emit_zmm_load64_rax(zdst: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_UNMASKED)  emit_u8(0x6F)  emit_u8((zdst & 7) << 3)
+}
+
+fn emit_zmm_load32_rcx(zdst: i64) {
+    emit_evex_zmm(1, 0, 0, 2, EVEX_UNMASKED)  emit_u8(0x6F)  emit_u8(0x01 | ((zdst & 7) << 3))
+}
+
+fn emit_zmm_load64_rcx(zdst: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_UNMASKED)  emit_u8(0x6F)  emit_u8(0x01 | ((zdst & 7) << 3))
+}
+
+fn emit_zmm_load32_k1z_rax(zdst: i64) {
+    emit_evex_zmm(1, 0, 0, 2, EVEX_K1Z)  emit_u8(0x6F)  emit_u8((zdst & 7) << 3)
+}
+
+fn emit_zmm_load64_k1z_rax(zdst: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_K1Z)  emit_u8(0x6F)  emit_u8((zdst & 7) << 3)
+}
+
+fn emit_zmm_load32_k1z_rcx(zdst: i64) {
+    emit_evex_zmm(1, 0, 0, 2, EVEX_K1Z)  emit_u8(0x6F)  emit_u8(0x01 | ((zdst & 7) << 3))
+}
+
+fn emit_zmm_load64_k1z_rcx(zdst: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_K1Z)  emit_u8(0x6F)  emit_u8(0x01 | ((zdst & 7) << 3))
+}
+
+fn emit_zmm_store32_rcx(zsrc: i64) {
+    emit_evex_zmm(1, 0, 0, 2, EVEX_UNMASKED)  emit_u8(0x7F)  emit_u8(0x01 | ((zsrc & 7) << 3))
+}
+
+fn emit_zmm_store64_rcx(zsrc: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_UNMASKED)  emit_u8(0x7F)  emit_u8(0x01 | ((zsrc & 7) << 3))
+}
+
+fn emit_zmm_store32_k1_rcx(zsrc: i64) {
+    emit_evex_zmm(1, 0, 0, 2, EVEX_K1)  emit_u8(0x7F)  emit_u8(0x01 | ((zsrc & 7) << 3))
+}
+
+fn emit_zmm_store64_k1_rcx(zsrc: i64) {
+    emit_evex_zmm(1, 1, 0, 2, EVEX_K1)  emit_u8(0x7F)  emit_u8(0x01 | ((zsrc & 7) << 3))
+}
+
+// 64B-aligned non-temporal cache-bypassing store: `vmovntdq [rcx], zsrc`
+fn emit_zmm_stream_rcx(zsrc: i64) {
+    emit_evex_zmm(1, 0, 0, 1, EVEX_UNMASKED)  emit_u8(0xE7)  emit_u8(0x01 | ((zsrc & 7) << 3))
+}
+
+// Alignment-adaptive streaming store for `<simd>` loops on `@stream` spans
+fn emit_zmm_stream_safe_rcx(zsrc: i64, is_64: i64) {
+    emit_u8(0xF6)  emit_u8(0xC1)  emit_u8(0x3F) // test cl, 63
+    emit_u8(0x75)  emit_u8(0x08)                // jnz .unaligned (+8)
+    emit_zmm_stream_rcx(zsrc)                   // 6 bytes
+    emit_u8(0xEB)  emit_u8(0x06)                // jmp .done (+6)
+    if is_64 == 1 {
+        emit_zmm_store64_rcx(zsrc)              // 6 bytes
+    } else {
+        emit_zmm_store32_rcx(zsrc)              // 6 bytes
+    }
+}
+
+fn emit_zmm0_load32_rax()      { emit_zmm_load32_rax(0) }
+fn emit_zmm0_load64_rax()      { emit_zmm_load64_rax(0) }
+fn emit_zmm0_load32_rcx()      { emit_zmm_load32_rcx(0) }
+fn emit_zmm0_load64_rcx()      { emit_zmm_load64_rcx(0) }
+fn emit_zmm0_load32_k1z_rax()  { emit_zmm_load32_k1z_rax(0) }
+fn emit_zmm0_load64_k1z_rax()  { emit_zmm_load64_k1z_rax(0) }
+fn emit_zmm0_load32_k1z_rcx()  { emit_zmm_load32_k1z_rcx(0) }
+fn emit_zmm0_load64_k1z_rcx()  { emit_zmm_load64_k1z_rcx(0) }
+fn emit_zmm0_store32_rcx()     { emit_zmm_store32_rcx(0) }
+fn emit_zmm0_store64_rcx()     { emit_zmm_store64_rcx(0) }
+fn emit_zmm0_store32_k1_rcx()  { emit_zmm_store32_k1_rcx(0) }
+fn emit_zmm0_store64_k1_rcx()  { emit_zmm_store64_k1_rcx(0) }
+fn emit_zmm0_stream_rcx()      { emit_zmm_stream_rcx(0) }
+
+// --- Broadcast (`@vec_splat32/64`) & Position-Independent `@vec_iota32/64` ---
+
+fn emit_zmm_splat32_eax(zdst: i64) {
+    emit_evex_zmm(2, 0, 0, 1, EVEX_UNMASKED)     // vpbroadcastd zdst, eax
+    emit_u8(0x7C)
+    emit_u8(0xC0 | ((zdst & 7) << 3))
+}
+
+fn emit_zmm_splat64_rax(zdst: i64) {
+    emit_evex_zmm(2, 1, 0, 1, EVEX_UNMASKED)     // vpbroadcastq zdst, rax
+    emit_u8(0x7C)
+    emit_u8(0xC0 | ((zdst & 7) << 3))
+}
+
+fn emit_zmm0_splat32_eax() { emit_zmm_splat32_eax(0) }
+fn emit_zmm0_splat64_rax() { emit_zmm_splat64_rax(0) }
+
+fn emit_zmm_iota32(zdst: i64) {
+    emit_u8(0xEB)  emit_u8(64)                  // jmp short +64
+    c_off := g[G_CODE_OFF]
+    for lane in 0..16 {
+        emit_u32(lane)
+    }
+    emit_evex_zmm(1, 0, 0, 2, EVEX_UNMASKED)     // vmovdqu32 zdst, [rip + rel32]
+    emit_u8(0x6F)
+    emit_u8(0x05 | ((zdst & 7) << 3))
+    emit_u32(c_off - (g[G_CODE_OFF] + 4))
+}
+
+fn emit_zmm_iota64(zdst: i64) {
+    emit_u8(0xEB)  emit_u8(64)                  // jmp short +64
+    c_off := g[G_CODE_OFF]
+    for lane in 0..8 {
+        emit_u64(lane)
+    }
+    emit_evex_zmm(1, 1, 0, 2, EVEX_UNMASKED)     // vmovdqu64 zdst, [rip + rel32]
+    emit_u8(0x6F)
+    emit_u8(0x05 | ((zdst & 7) << 3))
+    emit_u32(c_off - (g[G_CODE_OFF] + 4))
+}
+
+fn emit_zmm0_iota32() { emit_zmm_iota32(0) }
+fn emit_zmm0_iota64() { emit_zmm_iota64(0) }
+
+// --- 512-Bit Vector ALU (`+ - * & | ^`) & Immediate / Scalar-Count / Per-Lane Shifts ---
+
+fn emit_zmm_binop(op_tok: i64, is_64: i64, zdst: i64, zs1: i64, zs2: i64) {
+    modrm := 0xC0 | ((zdst & 7) << 3) | (zs2 & 7)
+    if op_tok == TOK_PLUS {
+        if is_64 == 1 {
+            emit_evex_zmm(1, 1, zs1, 1, EVEX_UNMASKED)  emit_u8(0xD4)  emit_u8(modrm) // vpaddq
+        } else {
+            emit_evex_zmm(1, 0, zs1, 1, EVEX_UNMASKED)  emit_u8(0xFE)  emit_u8(modrm) // vpaddd
+        }
+        return
+    }
+    if op_tok == TOK_MINUS {
+        if is_64 == 1 {
+            emit_evex_zmm(1, 1, zs1, 1, EVEX_UNMASKED)  emit_u8(0xFB)  emit_u8(modrm) // vpsubq
+        } else {
+            emit_evex_zmm(1, 0, zs1, 1, EVEX_UNMASKED)  emit_u8(0xFA)  emit_u8(modrm) // vpsubd
+        }
+        return
+    }
+    if op_tok == TOK_STAR {
+        if is_64 == 1 {
+            emit_evex_zmm(2, 1, zs1, 1, EVEX_UNMASKED)  emit_u8(0x40)  emit_u8(modrm) // vpmullq
+        } else {
+            emit_evex_zmm(2, 0, zs1, 1, EVEX_UNMASKED)  emit_u8(0x40)  emit_u8(modrm) // vpmulld
+        }
+        return
+    }
+    if op_tok == TOK_AMP {
+        emit_evex_zmm(1, 1, zs1, 1, EVEX_UNMASKED)  emit_u8(0xDB)  emit_u8(modrm)     // vpandq
+        return
+    }
+    if op_tok == TOK_PIPE {
+        emit_evex_zmm(1, 1, zs1, 1, EVEX_UNMASKED)  emit_u8(0xEB)  emit_u8(modrm)     // vporq
+        return
+    }
+    if op_tok == TOK_CARET {
+        emit_evex_zmm(1, 1, zs1, 1, EVEX_UNMASKED)  emit_u8(0xEF)  emit_u8(modrm)     // vpxorq
+        return
+    }
+    if op_tok == TOK_SHL {
+        emit_evex_zmm(2, is_64, zs1, 1, EVEX_UNMASKED)  emit_u8(0x47)  emit_u8(modrm) // vpsllvd/q
+        return
+    }
+    if op_tok == TOK_SHR {
+        emit_evex_zmm(2, is_64, zs1, 1, EVEX_UNMASKED)  emit_u8(0x45)  emit_u8(modrm) // vpsrlvd/q
+        return
+    }
+    die_cur("error: parse fault (unsupported vector binary operator)")
+}
+
+// `zmm0 = zmm0 op zmm1`
+fn emit_zmm0_binop(op_tok: i64, is_64: i64) {
+    emit_zmm_binop(op_tok, is_64, 0, 0, 1)
+}
+
+fn emit_zmm_shl_imm(zdst: i64, zsrc: i64, imm: i64, is_64: i64) {
+    emit_evex_zmm(1, is_64, zdst, 1, EVEX_UNMASKED)
+    if is_64 == 1 { emit_u8(0x73) } else { emit_u8(0x72) }
+    emit_u8(0xF0 | (zsrc & 7))
+    emit_u8(imm & 0xFF)
+}
+
+fn emit_zmm_shr_imm(zdst: i64, zsrc: i64, imm: i64, is_64: i64) {
+    emit_evex_zmm(1, is_64, zdst, 1, EVEX_UNMASKED)
+    if is_64 == 1 { emit_u8(0x73) } else { emit_u8(0x72) }
+    emit_u8(0xD0 | (zsrc & 7))
+    emit_u8(imm & 0xFF)
+}
+
+// Shifts `zsrc` by dynamic scalar shift count in `rax` (via scratch `xmm7`)
+fn emit_zmm_shl_rax(zdst: i64, zsrc: i64, is_64: i64) {
+    emit_u8(0xC4)  emit_u8(0xE1)  emit_u8(0xF9)  emit_u8(0x6E)  emit_u8(0xF8) // vmovq xmm7, rax
+    emit_evex_zmm(1, is_64, zsrc, 1, EVEX_UNMASKED)
+    if is_64 == 1 { emit_u8(0xF3) } else { emit_u8(0xF2) }
+    emit_u8(0xC0 | ((zdst & 7) << 3) | 7)
+}
+
+fn emit_zmm_shr_rax(zdst: i64, zsrc: i64, is_64: i64) {
+    emit_u8(0xC4)  emit_u8(0xE1)  emit_u8(0xF9)  emit_u8(0x6E)  emit_u8(0xF8) // vmovq xmm7, rax
+    emit_evex_zmm(1, is_64, zsrc, 1, EVEX_UNMASKED)
+    if is_64 == 1 { emit_u8(0xD3) } else { emit_u8(0xD2) }
+    emit_u8(0xC0 | ((zdst & 7) << 3) | 7)
+}
+
+fn emit_zmm0_shl_imm(imm: i64, is_64: i64) { emit_zmm_shl_imm(0, 0, imm, is_64) }
+fn emit_zmm0_shr_imm(imm: i64, is_64: i64) { emit_zmm_shr_imm(0, 0, imm, is_64) }
+fn emit_zmm0_shl_rax(is_64: i64)           { emit_zmm_shl_rax(0, 0, is_64) }
+fn emit_zmm0_shr_rax(is_64: i64)           { emit_zmm_shr_rax(0, 0, is_64) }
+
+fn emit_zmm_shlv(zdst: i64, zs1: i64, zs2: i64, is_64: i64) {
+    emit_zmm_binop(TOK_SHL, is_64, zdst, zs1, zs2)
+}
+
+fn emit_zmm_shrv(zdst: i64, zs1: i64, zs2: i64, is_64: i64) {
+    emit_zmm_binop(TOK_SHR, is_64, zdst, zs1, zs2)
+}
+
+fn emit_zmm0_shlv(is_64: i64) { emit_zmm_binop(TOK_SHL, is_64, 0, 0, 1) }
+fn emit_zmm0_shrv(is_64: i64) { emit_zmm_binop(TOK_SHR, is_64, 0, 0, 1) }
+
+// --- Horizontal Reductions (`@vec_sum64` & Overflow-Free 64b `@vec_sum32` -> `rax`) ---
+
+// Reduces 8 x `u64` lanes in `zmm0` -> `rax` (clobbers `zmm0`, `zmm1`)
+fn emit_zmm0_sum64_rax() {
+    // 1. `vextracti64x4 ymm1, zmm0, 1` (`62 F3 FD 48 3B C1 01`)
+    emit_evex_zmm(3, 1, 0, 1, EVEX_UNMASKED)  emit_u8(0x3B)  emit_u8(0xC1)  emit_u8(0x01)
+    // 2. `vpaddq ymm0, ymm0, ymm1` (`C5 FD D4 C1`)
+    emit_u8(0xC5)  emit_u8(0xFD)  emit_u8(0xD4)  emit_u8(0xC1)
+    // 3. `vextracti128 xmm1, ymm0, 1` (`C4 E3 7D 39 C1 01`)
+    emit_u8(0xC4)  emit_u8(0xE3)  emit_u8(0x7D)  emit_u8(0x39)  emit_u8(0xC1)  emit_u8(0x01)
+    // 4. `vpaddq xmm0, xmm0, xmm1` (`C5 F9 D4 C1`)
+    emit_u8(0xC5)  emit_u8(0xF9)  emit_u8(0xD4)  emit_u8(0xC1)
+    // 5. `vpsrldq xmm1, xmm0, 8` (`C5 F1 73 D8 08`)
+    emit_u8(0xC5)  emit_u8(0xF1)  emit_u8(0x73)  emit_u8(0xD8)  emit_u8(0x08)
+    // 6. `vpaddq xmm0, xmm0, xmm1` (`C5 F9 D4 C1`)
+    emit_u8(0xC5)  emit_u8(0xF9)  emit_u8(0xD4)  emit_u8(0xC1)
+    // 7. `vmovq rax, xmm0` (`C4 E1 F9 7E C0`)
+    emit_u8(0xC4)  emit_u8(0xE1)  emit_u8(0xF9)  emit_u8(0x7E)  emit_u8(0xC0)
+}
+
+// Widens all 16 `u32` lanes of `zmm0` to `u64` before summing so lanes never wrap 32 bits!
+fn emit_zmm0_sum32_rax() {
+    // 1. `vpmovzxdq zmm1, ymm0` (`62 F2 7D 48 35 C8` -> lanes 0..7 as u64)
+    emit_evex_zmm(2, 0, 0, 1, EVEX_UNMASKED)  emit_u8(0x35)  emit_u8(0xC8)
+    // 2. `vextracti32x8 ymm0, zmm0, 1` (`62 F3 7D 48 3B C0 01` -> lanes 8..15 in ymm0)
+    emit_evex_zmm(3, 0, 0, 1, EVEX_UNMASKED)  emit_u8(0x3B)  emit_u8(0xC0)  emit_u8(0x01)
+    // 3. `vpmovzxdq zmm0, ymm0` (`62 F2 7D 48 35 C0` -> lanes 8..15 as u64)
+    emit_evex_zmm(2, 0, 0, 1, EVEX_UNMASKED)  emit_u8(0x35)  emit_u8(0xC0)
+    // 4. `vpaddq zmm0, zmm0, zmm1` -> exact 8-lane u64 partial sums
+    emit_zmm_binop(TOK_PLUS, 1, 0, 0, 1)
+    emit_zmm0_sum64_rax()
+}

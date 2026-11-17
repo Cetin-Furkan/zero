@@ -19,11 +19,22 @@ O_WR_TRUNC_CR   :: 577      // O_WRONLY(1) | O_CREAT(64) | O_TRUNC(512)
 MODE_0755       :: 493      // 0o755
 SEEK_END        :: 2
 
-// --- Target Layout Constants ---
-ELF_HDR_LEN     :: 176      // 64B Ehdr + 2 * 56B Phdr
-ELF_TEXT_BASE   :: 0x400000
-ELF_DATA_BASE   :: 0x10000000
-ZCAP_HDR_LEN    :: 64
+// --- Target Container & Bare-Metal UEFI Layout Constants ---
+ELF_HDR_LEN           :: 176        // 64B Ehdr + 2 * 56B Phdr
+ELF_TEXT_BASE         :: 0x400000
+ELF_DATA_BASE         :: 0x10000000
+ZCAP_HDR_LEN          :: 64
+
+PE_HDR_FILE_SIZE      :: 0x00200    // 512B PE32+ header
+PE_TEXT_RVA           :: 0x01000    // .text RVA in PE32+ image
+EFI_BSS_HANDOFF_OFF   :: 0x00040
+EFI_BSS_MEMMAP_OFF    :: 0x00100
+EFI_BSS_RAW_MMAP_OFF  :: 0x04000
+EFI_BSS_RAW_MMAP_CAP  :: 0x08000
+EFI_BSS_STACK_TOP_OFF :: 0x1C000
+EFI_BSS_ISR_LINE_OFF  :: 0x1C040
+EFI_BSS_REACTOR_OFF   :: 0x1E000
+EFI_BSS_USER_START    :: 0x20000
 
 // --- Token Kinds ---
 TOK_EOF         :: 0
@@ -91,7 +102,7 @@ TOK_ARROW       :: 66       // ->
 TOK_FAT_ARROW   :: 67       // =>
 TOK_PIPE_GT     :: 68       // |>
 
-// --- Keyword IDs ---
+// --- Keyword IDs (`TOK_KW`, `tok_kw[i] == KW_*`; `tok_val[i]` also holds `sym_id`) ---
 KW_FN           :: 1
 KW_RETURN       :: 2
 KW_IF           :: 3
@@ -110,6 +121,24 @@ KW_FALSE        :: 15
 KW_SLAB         :: 16
 KW_ARENA        :: 17
 KW_CAPSULE      :: 18
+KW_RING         :: 19
+KW_MMIO         :: 20
+KW_CELL64       :: 21
+KW_COLD         :: 22
+
+// --- User Type Kinds (`ut_kind[ut_idx]`) ---
+UKIND_BITPACK   :: 1
+UKIND_STRUCT    :: 2
+UKIND_CELL64    :: 3
+UKIND_PTR       :: 4
+
+// --- Topological Space Kinds (`sp_kind[si]`) ---
+SKIND_SLAB      :: 1
+SKIND_ARENA     :: 2
+SKIND_CAPSULE   :: 3
+SKIND_RING      :: 4
+SKIND_DMA_QUEUE :: 5
+SKIND_PORT      :: 6
 
 // --- Type Tags & Modifiers ---
 TY_VOID         :: 0
@@ -121,140 +150,318 @@ TY_I16          :: 5
 TY_U16          :: 6
 TY_I8           :: 7
 TY_U8           :: 8
-TY_BP_BASE      :: 64       // 64 + bp_idx
+TY_U32X16       :: 9        // 512-bit AVX-512 16 x u32 ZMM vector (64B, 64B align)
+TY_U64X8        :: 10       // 512-bit AVX-512 8  x u64 ZMM vector (64B, 64B align)
+TY_BP_BASE      :: 0x100    // 0x100 + ut_idx -> BitPack (`bp_*[ut_idx]` & `ut_*[ut_idx]`)
+TY_STRUCT_BASE  :: 0x300    // 0x300 + ut_idx -> Struct or @cell64 (`ut_*[ut_idx]`)
+TY_PTR_BASE     :: 0x500    // 0x500 + ut_idx -> Custom @ptr (`ptr_*[ut_idx]` & `ut_*[ut_idx]`)
 
 TY_BASE_MASK    :: 0x0FFF
-TY_FLAG_VIEW1   :: 0x1000   // @view<T>(addr) single pointer overlay
-TY_FLAG_SPAN    :: 0x2000   // 16B `{ ptr: u64, len: u64 }` (`str`, `bytes`, `[]T`)
+TY_FLAG_VIEW1   :: 0x1000   // @Type / @view<T>(addr) / @mmio<T>(addr) 8B pointer overlay
+TY_FLAG_SPAN    :: 0x2000   // 16B `{ ptr: u64, len: u64 }` (`str`, `bytes`, `[]T`, `@span`, `@view(a,n)`)
+TY_FLAG_MMIO    :: 0x4000   // @mmio<T> volatile aperture modifier (no null fault)
+TY_FLAG_STREAM  :: 0x8000   // @stream<u32|u64> non-temporal `movnti` span modifier
+TY_FLAG_ATOMIC  :: 0x10000  // @atomic<u32|u64> hardware `lock` pointer
 
 // --- Global Compiler State Indices (`g[G_*]`) ---
-G_MODE_CAPSULE  :: 0
-G_MODE_LEX      :: 1
-G_SRC_OFF       :: 2
-G_IMP_CNT       :: 3
-G_STR_OFF       :: 4
-G_SYM_CNT       :: 5
-G_TOK_CNT       :: 6
-G_TOK_IDX       :: 7
-G_CST_CNT       :: 8
-G_CST_TRIAL     :: 9
-G_CST_UNRES     :: 10
-G_BP_CNT        :: 11
-G_BPF_CNT       :: 12
-G_SP_CNT        :: 13
-G_BSS_OFF       :: 14
-G_FN_CNT        :: 15
-G_FNP_CNT       :: 16
-G_CODE_OFF      :: 17
-G_TGT_RO_OFF    :: 18
-G_RO_FIX_CNT    :: 19
-G_CALL_FIX_CNT  :: 20
-G_RT_WRITE_OFF  :: 21
-G_TOTAL_OUT     :: 22
-G_LOC_CNT       :: 23
-G_SCOPE_DEPTH   :: 24
-G_FRAME_QW      :: 25
-G_TEMP_DEPTH    :: 26
-G_MAX_FRAME_QW  :: 27
-G_CUR_RET_TY    :: 28
-G_LAST_EXPR_TY  :: 29
-G_LP_DEPTH      :: 30
-G_REC_DEPTH     :: 31
-G_TILE_DEPTH    :: 32
-G_PATCH_CNT     :: 33
+G_MODE_CAPSULE        :: 0  // 1 on `--target=capsule`
+G_MODE_LEX            :: 1  // 1 on `--lex`
+G_SRC_OFF             :: 2
+G_IMP_CNT             :: 3
+G_STR_OFF             :: 4
+G_SYM_CNT             :: 5
+G_TOK_CNT             :: 6
+G_TOK_IDX             :: 7
+G_CST_CNT             :: 8
+G_CST_TRIAL           :: 9
+G_CST_UNRES           :: 10
+G_BP_CNT              :: 11
+G_BPF_CNT             :: 12
+G_SP_CNT              :: 13
+G_BSS_OFF             :: 14
+G_FN_CNT              :: 15
+G_FNP_CNT             :: 16
+G_CODE_OFF            :: 17
+G_TGT_RO_OFF          :: 18
+G_RO_FIX_CNT          :: 19
+G_CALL_FIX_CNT        :: 20
+G_RT_WRITE_OFF        :: 21
+G_TOTAL_OUT           :: 22
+G_LOC_CNT             :: 23
+G_SCOPE_DEPTH         :: 24
+G_FRAME_QW            :: 25
+G_TEMP_DEPTH          :: 26
+G_MAX_FRAME_QW        :: 27
+G_CUR_RET_TY          :: 28
+G_LAST_EXPR_TY        :: 29
+G_LP_DEPTH            :: 30
+G_REC_DEPTH           :: 31
+G_TILE_DEPTH          :: 32
+G_PATCH_CNT           :: 33
+G_MODE_EFI            :: 34 // 1 on `--target=efi-os` AND `--target=capsule`, 0 on `ELF64`
+G_IN_ISR_MODE         :: 35 // 0 = normal fn, 1 = `@isr`, 2 = `@isr_ok`
+G_IN_FN_BODY          :: 36 // 1 while emitting fn body
+G_UT_CNT              :: 37 // user type count (`ut_*`)
+G_FLD_CNT             :: 38 // struct field count (`fld_*`)
+G_FNLEN_FIX_CNT       :: 39 // `@code_bytes` length fixup count (`fnlen_fix_*`)
+G_BSS_FIX_CNT         :: 40 // EFI RIP-relative `.bss` fixup count (`bss_fix_*`)
+G_EFI_ISR_STUBS_OFF   :: 41 // `.text` offset of 256-entry ISR stub table (`@isr_stub_base`)
+G_EFI_CODE_SPAN_PATCH :: 42 // `.text` offset of `BootHandoff.code_bytes` imm32 patch
+G_TILE_USED_ZMM       :: 43 // 1 if active `<tile>` emitted any 512-bit ZMM op (`vzeroupper` on exit)
 
-// Pre-interned contextual symbol IDs
-G_SYM_MAIN      :: 40
-G_SYM_USE       :: 41
-G_SYM_MAX       :: 42
-G_SYM_CAP       :: 43
-G_SYM_UNTIL     :: 44
-G_SYM_BITS      :: 45
-G_SYM_BASE      :: 46
-G_SYM_PTR       :: 47
-G_SYM_LEN       :: 48
-G_SYM_VIEW      :: 49
-G_SYM_RSP_ALIGN :: 50
-G_SYM_CRC32C    :: 51
-G_SYM_POPCNT    :: 52
-G_SYM_LZCNT     :: 53
-G_SYM_TZCNT     :: 54
-G_SYM_RID       :: 55
-G_SYM_CALL      :: 56
-G_SYM_FN_ADDR   :: 57
-G_SYM_SIZEOF    :: 58
-G_SYM_ALIGNOF   :: 59
-G_SYM_TILE      :: 60
+// --- Pre-Interned Contextual & Intrinsic Symbol IDs (`g[G_SYM_*]`) ---
+G_SYM_MAIN            :: 64
+G_SYM_USE             :: 65
+G_SYM_MAX             :: 66
+G_SYM_CAP             :: 67
+G_SYM_UNTIL           :: 68
+G_SYM_BITS            :: 69
+G_SYM_BASE            :: 70
+G_SYM_PTR             :: 71
+G_SYM_LEN             :: 72
+G_SYM_VIEW            :: 73
+G_SYM_RSP_ALIGN       :: 74
+G_SYM_CRC32C          :: 75
+G_SYM_POPCNT          :: 76
+G_SYM_LZCNT           :: 77
+G_SYM_TZCNT           :: 78
+G_SYM_RID             :: 79
+G_SYM_REACTOR_ID      :: 79 // alias for `G_SYM_RID`
+G_SYM_CALL            :: 80
+G_SYM_FN_ADDR         :: 81
+G_SYM_SIZEOF          :: 82
+G_SYM_ALIGNOF         :: 83
+G_SYM_TILE            :: 84
 
-// --- Static `@slab` Arenas (Zero-Initialized in `Phdr[1]` `.bss`) ---
-@slab g            : <i64 | max: 64>
+// Builtin primitive & span type names (`TOK_IDENT`)
+G_SYM_I64             :: 85
+G_SYM_U64             :: 86
+G_SYM_I32             :: 87
+G_SYM_U32             :: 88
+G_SYM_I16             :: 89
+G_SYM_U16             :: 90
+G_SYM_I8              :: 91
+G_SYM_U8              :: 92
+G_SYM_STR             :: 93
+G_SYM_BYTES           :: 94
+G_SYM_BOOL            :: 95
+G_SYM_BIT             :: 96
+G_SYM_MASK64          :: 97
 
-@slab src_buf      : <u8  | max: 524288>
-@slab imp_syms     : <u32 | max: 128>
-@slab path_scratch : <u8  | max: 4096>
-@slab canon_buf    : <u8  | max: 4096>
+// Space, Struct, Custom `@ptr`, View, Atomic, Loop, & Statement Symbols
+G_SYM_SLAB            :: 98
+G_SYM_ARENA           :: 99
+G_SYM_CAPSULE         :: 100
+G_SYM_RING            :: 101
+G_SYM_MMIO            :: 102
+G_SYM_CELL64          :: 103
+G_SYM_COLD            :: 104
+G_SYM_PORT            :: 105
+G_SYM_DMA_QUEUE       :: 106
+G_SYM_PACKED          :: 107
+G_SYM_ALIGN           :: 108
+G_SYM_BSWAP           :: 109
+G_SYM_WRAP            :: 110
+G_SYM_STRIDE          :: 111
+G_SYM_MASK            :: 112
+G_SYM_RAW             :: 113
+G_SYM_READ            :: 114
+G_SYM_WRITE           :: 115
+G_SYM_LOAD            :: 116
+G_SYM_STORE           :: 117
+G_SYM_SWAP            :: 118
+G_SYM_ADD             :: 119
+G_SYM_SUB             :: 120
+G_SYM_CAS             :: 121
+G_SYM_SLOT_ADDR       :: 122
+G_SYM_SPAN            :: 123
+G_SYM_PUBLISH         :: 124
+G_SYM_WAIT            :: 125
+G_SYM_MATCH           :: 126
+G_SYM_WILDCARD        :: 127 // "_"
+G_SYM_REV             :: 128
+G_SYM_UNROLL          :: 129
+G_SYM_PREFETCH        :: 130
+G_SYM_SIMD            :: 131
+G_SYM_STREAM          :: 132
+G_SYM_ATOMIC          :: 133
+G_SYM_CODE_BYTES      :: 134
+G_SYM_EMIT            :: 135
+G_SYM_ISR             :: 136
+G_SYM_ISR_OK          :: 137
 
-@slab str_pool     : <u8  | max: 262144>
-@slab sym_off      : <u32 | max: 8192>
-@slab sym_len      : <u32 | max: 8192>
-@slab sym_kw       : <u8  | max: 8192>
-@slab sym_ht       : <u32 | max: 16384>     // power-of-2 open-addressing table
+// Silicon, Ring-0, & Reactor Intrinsics
+G_SYM_CLI             :: 138
+G_SYM_STI             :: 139
+G_SYM_HLT             :: 140
+G_SYM_HALT            :: 141
+G_SYM_PAUSE           :: 142
+G_SYM_RDTSC           :: 143
+G_SYM_LGDT            :: 144
+G_SYM_LIDT            :: 145
+G_SYM_LTR             :: 146
+G_SYM_CR_READ         :: 147
+G_SYM_CR_WRITE        :: 148
+G_SYM_MSR_READ        :: 149
+G_SYM_MSR_WRITE       :: 150
+G_SYM_XSETBV          :: 151
+G_SYM_WRPKRU          :: 152
+G_SYM_PORT_IN8        :: 153
+G_SYM_PORT_OUT8       :: 154
+G_SYM_MM_READ32       :: 155
+G_SYM_MM_READ64       :: 156
+G_SYM_MM_WRITE32      :: 157
+G_SYM_MM_WRITE64      :: 158
+G_SYM_ISR_STUB_BASE   :: 159
+G_SYM_EOI             :: 160
+G_SYM_WRGSBASE        :: 161
+G_SYM_RDGSBASE        :: 162
+G_SYM_INBOX_BASE      :: 163
+G_SYM_SCRATCH_BASE    :: 164
+G_SYM_LOCAL_BASE      :: 165
+G_SYM_REACTOR_BIND    :: 166
+G_SYM_MOVDIRI         :: 167
+G_SYM_CPUID_ECX       :: 168
+G_SYM_CPUID_EBX       :: 169
+G_SYM_BSWAP16         :: 170
+G_SYM_BSWAP32         :: 171
+G_SYM_BSWAP64         :: 172
+G_SYM_PDEP            :: 173
+G_SYM_PEXT            :: 174
+G_SYM_CLFLUSH         :: 175
+G_SYM_LFENCE          :: 176
+G_SYM_SFENCE          :: 177
+G_SYM_MFENCE          :: 178
 
-@slab tok_kind     : <u8  | max: 131072>
-@slab tok_kw       : <u8  | max: 131072>
-@slab tok_line     : <u32 | max: 131072>
-@slab tok_val      : <i64 | max: 131072>
-@slab tok_aux      : <u32 | max: 131072>
+// Track 2: 512-Bit `AVX-512` (`EVEX` `ZMM`) Vector Types & `@vec_*` Intrinsics
+G_SYM_U32X16          :: 179
+G_SYM_U64X8           :: 180
+G_SYM_VEC_SPLAT32     :: 181
+G_SYM_VEC_SPLAT64     :: 182
+G_SYM_VEC_IOTA32      :: 183
+G_SYM_VEC_IOTA64      :: 184
+G_SYM_VEC_LOAD32      :: 185
+G_SYM_VEC_LOAD64      :: 186
+G_SYM_VEC_STORE32     :: 187
+G_SYM_VEC_STORE64     :: 188
+G_SYM_VEC_STREAM      :: 189
+G_SYM_VEC_SUM32       :: 190
+G_SYM_VEC_SUM64       :: 191
 
-@slab cst_sym      : <u32 | max: 2048>
-@slab cst_tok      : <u32 | max: 2048>
-@slab cst_done     : <u8  | max: 2048>
-@slab cst_val      : <i64 | max: 2048>
+// --- Static `@slab` Arenas (Zero-Initialized in `Phdr[1]` `.bss`, 0 disk bytes) ---
+@slab g             : <i64 | max: 512>
 
-@slab bp_sym       : <u32 | max: 128>
-@slab bp_bytes     : <u32 | max: 128>
-@slab bp_fstart    : <u32 | max: 128>
-@slab bp_fcnt      : <u32 | max: 128>
-@slab bpf_sym      : <u32 | max: 1024>
-@slab bpf_shift    : <u32 | max: 1024>
-@slab bpf_width    : <u32 | max: 1024>
+@slab src_buf       : <u8  | max: 2097152>
+@slab imp_syms      : <u32 | max: 256>
+@slab path_scratch  : <u8  | max: 4096>
+@slab canon_buf     : <u8  | max: 4096>
 
-@slab sp_sym       : <u32 | max: 512>
-@slab sp_elem_ty   : <u32 | max: 512>
-@slab sp_elem_sz   : <u32 | max: 512>
-@slab sp_cap       : <u64 | max: 512>
-@slab sp_vaddr     : <u64 | max: 512>
+@slab str_pool      : <u8  | max: 1048576>
+@slab sym_off       : <u32 | max: 16384>
+@slab sym_len       : <u32 | max: 16384>
+@slab sym_kw        : <u8  | max: 16384>
+@slab sym_ht        : <u32 | max: 32768>    // power-of-2 open-addressing table (& 32767)
 
-@slab fn_sym       : <u32 | max: 1024>
-@slab fn_defined   : <u8  | max: 1024>
-@slab fn_ret_ty    : <u32 | max: 1024>
-@slab fn_arity     : <u32 | max: 1024>
-@slab fn_pstart    : <u32 | max: 1024>
-@slab fn_code_off  : <u32 | max: 1024>
-@slab fn_param_ty  : <u32 | max: 8192>
+@slab tok_kind      : <u8  | max: 262144>
+@slab tok_kw        : <u8  | max: 262144>
+@slab tok_line      : <u32 | max: 262144>
+@slab tok_val       : <i64 | max: 262144>
+@slab tok_aux       : <u32 | max: 262144>
 
-@slab loc_sym      : <u32 | max: 2048>
-@slab loc_ty       : <u32 | max: 2048>
-@slab loc_disp     : <i64 | max: 2048>
-@slab loc_depth    : <u32 | max: 2048>
+@slab cst_sym       : <u32 | max: 4096>
+@slab cst_tok       : <u32 | max: 4096>
+@slab cst_line      : <u32 | max: 4096>
+@slab cst_done      : <u8  | max: 4096>
+@slab cst_val       : <i64 | max: 4096>
 
-@slab lp_cont_tgt  : <i64 | max: 64>
-@slab lp_brk_head  : <i64 | max: 64>
-@slab lp_cont_head : <i64 | max: 64>
-@slab lp_tile_base : <i64 | max: 64>
+// Unified User Type table (`0 .. g[G_UT_CNT] - 1`):
+//   - BitPack  -> `TY_BP_BASE + ut_idx`     (also mirrored in `bp_*[ut_idx]`)
+//   - Struct   -> `TY_STRUCT_BASE + ut_idx` (`ut_kind == UKIND_STRUCT` or `UKIND_CELL64`)
+//   - CustomPtr-> `TY_PTR_BASE + ut_idx`    (metadata in `ptr_*[ut_idx]`)
+@slab ut_sym        : <u32 | max: 512>
+@slab ut_kind       : <u8  | max: 512>
+@slab ut_size       : <u32 | max: 512>      // 0 until resolved; byte size once resolved
+@slab ut_align      : <u32 | max: 512>      // alignment in bytes (1 for <packed>, 64 for @cell64)
+@slab ut_packed     : <u8  | max: 512>      // 1 if <packed>, else 0
+@slab ut_fstart     : <u32 | max: 512>      // start in `fld_*` (structs) or `bpf_*` (bitpacks)
+@slab ut_fcnt       : <u32 | max: 512>      // field count
+@slab ut_tok        : <u32 | max: 512>      // prescan saved token index
+@slab ut_line       : <u32 | max: 512>      // declaration line
 
-@slab rec_jmp_head : <i64 | max: 64>
-@slab rec_tile_base: <i64 | max: 64>
+// BitPack tables (indexed by `ut_idx = base - TY_BP_BASE`)
+@slab bp_sym        : <u32 | max: 512>
+@slab bp_bytes      : <u32 | max: 512>
+@slab bp_fstart     : <u32 | max: 512>
+@slab bp_fcnt       : <u32 | max: 512>
+@slab bpf_sym       : <u32 | max: 2048>
+@slab bpf_shift     : <u32 | max: 2048>
+@slab bpf_width     : <u32 | max: 2048>
 
-@slab patch_loc    : <u32 | max: 8192>
-@slab patch_next   : <i64 | max: 8192>
+// Struct / `@cell64` field tables (indexed by `ut_fstart[ut_idx] .. +ut_fcnt[ut_idx]`)
+@slab fld_sym       : <u32 | max: 4096>
+@slab fld_ty        : <u32 | max: 4096>
+@slab fld_off       : <u32 | max: 4096>
+@slab fld_sz        : <u32 | max: 4096>
 
-@slab out_buf      : <u8  | max: 1048576>
-@slab tgt_ro_buf   : <u8  | max: 262144>
-@slab ro_fix_code  : <u32 | max: 16384>
-@slab ro_fix_off   : <u32 | max: 16384>
-@slab call_fix_off : <u32 | max: 32768>
-@slab call_fix_fn  : <u32 | max: 32768>
+// Custom `@ptr<...>` metadata tables (indexed by `ut_idx = base - TY_PTR_BASE`)
+@slab ptr_elem_ty   : <u32 | max: 512>
+@slab ptr_stride    : <u32 | max: 512>      // byte stride (defaults to elem_size)
+@slab ptr_mask      : <i64 | max: 512>      // 0 if unmasked; M if `mask: M`
+@slab ptr_wrap_mask : <i64 | max: 512>      // 0 if unwrapped; (N - 1) if `wrap: N`
+@slab ptr_bswap     : <u8  | max: 512>      // 1 if `bswap`, else 0
+@slab ptr_has_mask  : <u8  | max: 512>      // 1 if `mask: M`, else 0
+@slab ptr_has_wrap  : <u8  | max: 512>      // 1 if `wrap: N`, else 0
+
+// Topological `@slab` / `@arena` / `@capsule` / `@ring` / `@dma_queue` / `@port` spaces
+@slab sp_sym        : <u32 | max: 512>
+@slab sp_kind       : <u32 | max: 512>      // SKIND_*
+@slab sp_elem_ty    : <u32 | max: 512>
+@slab sp_elem_sz    : <u32 | max: 512>
+@slab sp_cap        : <u64 | max: 512>
+@slab sp_vaddr      : <u64 | max: 512>      // ELF_DATA_BASE + sp_bss_off (or port_num for SKIND_PORT)
+@slab sp_bss_off    : <u64 | max: 512>      // byte offset in `.bss` (4KiB-aligned)
+@slab sp_port_num   : <u32 | max: 512>      // 0..0xFFFF for SKIND_PORT
+@slab sp_align      : <u32 | max: 512>      // 4096 for `.bss` spaces, 0 for SKIND_PORT
+@slab sp_tok        : <u32 | max: 512>      // prescan saved `<` token index
+@slab sp_line       : <u32 | max: 512>      // prescan saved line
+
+// Function symbol, parameter, `@isr`/`@isr_ok` attribute, & `@code_bytes` tables
+@slab fn_sym        : <u32 | max: 2048>
+@slab fn_defined    : <u8  | max: 2048>
+@slab fn_isr_attr   : <u8  | max: 2048>     // 0 = normal, 1 = @isr, 2 = @isr_ok
+@slab fn_ret_ty     : <u32 | max: 2048>
+@slab fn_arity      : <u32 | max: 2048>
+@slab fn_pstart     : <u32 | max: 2048>
+@slab fn_code_off   : <u32 | max: 2048>
+@slab fn_code_len   : <u32 | max: 2048>     // byte length of compiled fn
+@slab fn_param_ty   : <u32 | max: 16384>
+
+@slab loc_sym       : <u32 | max: 4096>
+@slab loc_ty        : <u32 | max: 4096>
+@slab loc_disp      : <i64 | max: 4096>
+@slab loc_depth     : <u32 | max: 4096>
+
+@slab lp_cont_tgt   : <i64 | max: 64>
+@slab lp_brk_head   : <i64 | max: 64>
+@slab lp_cont_head  : <i64 | max: 64>
+@slab lp_tile_base  : <i64 | max: 64>
+
+@slab rec_jmp_head  : <i64 | max: 64>
+@slab rec_tile_base : <i64 | max: 64>
+
+@slab patch_loc     : <u32 | max: 16384>
+@slab patch_next    : <i64 | max: 16384>
+
+@slab out_buf       : <u8  | max: 4194304>
+@slab tgt_ro_buf    : <u8  | max: 262144>
+@slab ro_fix_code   : <u32 | max: 16384>
+@slab ro_fix_off    : <u32 | max: 16384>
+@slab call_fix_off  : <u32 | max: 65536>
+@slab call_fix_fn   : <u32 | max: 65536>
+@slab fnlen_fix_off : <u32 | max: 4096>     // out_buf patch pos for `@code_bytes(fn)` len imm32
+@slab fnlen_fix_fn  : <u32 | max: 4096>     // target fn_idx for `@code_bytes(fn)`
+@slab bss_fix_code  : <u32 | max: 32768>    // out_buf patch pos for EFI RIP-rel `.bss` disp32
+@slab bss_fix_off   : <i64 | max: 32768>    // signed `.bss` byte offset (`target_rva = bss_rva + bss_fix_off`)
 
 // --- Fatal Diagnostics & Host Syscall Helpers ---
 
@@ -352,8 +559,8 @@ fn pool_append_bytes(ptr: u64, len: u64) i64 {
 
 fn sym_intern_pool(off: i64, len: i64) i64 {
     h: u64 = hash_bytes_pool(off, len)
-    slot: u64 = h & 16383
-    for probe in 0..16384 {
+    slot: u64 = h & 32767
+    for probe in 0..32768 {
         id: u64 = sym_ht[slot]
         if id == 0 {
             new_id := g[G_SYM_CNT] + 1
@@ -377,7 +584,7 @@ fn sym_intern_pool(off: i64, len: i64) i64 {
                 return id
             }
         }
-        slot = (slot + 1) & 16383
+        slot = (slot + 1) & 32767
     }
     die_msg("error: symbol table full")
     return 0

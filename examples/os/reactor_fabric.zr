@@ -1,14 +1,24 @@
 // =============================================================================
-// ZeroOS Gate-2 Pinned Reactor Fabric (`examples/os/reactor_fabric.zr`)
+// ZeroOS Gate-2..4 Pinned Reactor & Live `@capsule` Worker Fabric (`examples/os/reactor_fabric.zr`)
 // =============================================================================
-// Exercises & measures real modern direct-silicon primitives across cores:
+// Exercises & orchestrates real modern direct-silicon primitives across cores:
 //   1. Pinned Reactor ABI (`r12`=id, `r13`=inbox, `r14`=scratch, `r15`/`gs:0`=local)
 //   2. Per-core isolated `gs:0` scalar fault unwinding (`fail` / `recover` in parallel)
 //   3. Zero-XSAVE `@isr` + `@isr_ok` hardware interrupt gate (`iretq`)
 //   4. Cross-core `publish` (`movdir64b`) + `wait` (`monitor`/`mwait`) + `<tile>`
-//      cooperative compute pipeline measured in live `@rdtsc()` hardware cycles!
+//      persistent worker fabric executing both built-in SIMD kernels AND live
+//      NVMe-streamed `W^X`-sealed `@capsule` compute workloads across all APs!
 // =============================================================================
 use "hw_types.zr"
+
+// Ring-0 Zero-XSAVE `AVX-512` `<tile | simd: 8>` vs Scalar `rdtsc` Benchmark Slabs
+// (`515 = 64 * 8 + 3`: 64 full 512-bit `ZMM` vectors + 3-lane `{k1}` opmask tail + sentinel!)
+SIMD_BENCH_LEN  :: 515
+SIMD_BENCH_SENT :: 0xDEAD_BEEF_CAFE_7777
+@slab simd_bench_src : <u64 | max: 528>
+@slab simd_bench_dst : <u64 | max: 528>
+@slab simd_bench_ref : <u64 | max: 528>
+@slab simd_telemetry : <u64 | max: 8>
 
 // Compiler-verified leaf helper (`@isr_ok`: zero `r12..r15`, zero `fail`/`publish`/`wait`/`tile`)
 @isr_ok fn isr_bump_spurious(counter_addr: u64) u64 {
@@ -36,7 +46,7 @@ fn install_reactor_isr_gate(vec: u64) i64 {
     return 0
 }
 
-// Deterministic `<tile>` compute kernel (`CRC32C` + `PEXT` + `POPCNT` + 64b rotate)
+// Deterministic `<tile>` compute kernel (`AVX-512` `u64x8` + `CRC32C` + `PEXT` + `POPCNT` + 64b rotate)
 fn execute_tile_kernel(seed0: u64, seed1: u64, rid: u64) u64 {
     acc: u64 = seed0 ^ (rid * 0x9E37_79B9_7F4A_7C15)
     mix: u64 = seed1 + rid
@@ -47,10 +57,91 @@ fn execute_tile_kernel(seed0: u64, seed1: u64, rid: u64) u64 {
         bits: u64 = @popcnt(extracted)
         mix = (mix <<< 7) ^ (acc + bits + ustep)
     }
+    tile {
+        vlanes: u64x8 = (@vec_iota64() * @vec_splat64(0x9E37_79B9_7F4A_7C15)) ^ @vec_splat64(acc)
+        vmixed: u64x8 = (vlanes + @vec_splat64(mix)) >> 3
+        mix ^= @vec_sum64(vmixed)
+    }
     return acc ^ mix
 }
 
+// Live Ring-0 Zero-XSAVE `AVX-512` `<tile | simd: 8>` vs scalar `rdtsc` verification (`N = 515`)
+fn verify_and_bench_ring0_simd(loc: @ReactorLocal) i64 {
+    for k in 0..524 {
+        uk: u64 = k
+        simd_bench_src[uk] = uk * 0x0101_0101_0000_0007 + 0xA5A5
+        simd_bench_dst[uk] = SIMD_BENCH_SENT
+        simd_bench_ref[uk] = SIMD_BENCH_SENT
+    }
+
+    // Warm I-cache & D-cache for both paths before `@rdtsc()` timing
+    for i in 0..SIMD_BENCH_LEN {
+        ui: u64 = i
+        t0_s: u64 = (simd_bench_src[i] * 13 + (ui ^ 0x5A5A)) ^ (simd_bench_src[i + 3] >> 2)
+        simd_bench_ref[i] = t0_s + (ui << 3)
+    }
+    for i in 0..SIMD_BENCH_LEN <tile | simd: 8> {
+        t0_v := (simd_bench_src[i] * 13 + (i ^ 0x5A5A)) ^ (simd_bench_src[i + 3] >> 2)
+        simd_bench_dst[i] = t0_v + (i << 3)
+    }
+
+    // Best-of-4 timed passes (`@lfence` + `@rdtsc`) to filter hypervisor VM-exit jitter
+    sc_cyc: u64  = 0xFFFF_FFFF
+    vec_cyc: u64 = 0xFFFF_FFFF
+    for pass in 0..4 {
+        simd_bench_ref[SIMD_BENCH_LEN] = SIMD_BENCH_SENT
+        simd_bench_dst[SIMD_BENCH_LEN] = SIMD_BENCH_SENT
+
+        @lfence()
+        tsc_s0: u64 = @rdtsc()
+        for i in 0..SIMD_BENCH_LEN {
+            ui: u64 = i
+            ts: u64 = (simd_bench_src[i] * 13 + (ui ^ 0x5A5A)) ^ (simd_bench_src[i + 3] >> 2)
+            simd_bench_ref[i] = ts + (ui << 3)
+        }
+        @lfence()
+        tsc_s1: u64 = @rdtsc()
+        dt_s: u64 = tsc_s1 - tsc_s0
+        if dt_s < sc_cyc {
+            sc_cyc = dt_s
+        }
+
+        @lfence()
+        tsc_v0: u64 = @rdtsc()
+        for i in 0..SIMD_BENCH_LEN <tile | simd: 8> {
+            tv := (simd_bench_src[i] * 13 + (i ^ 0x5A5A)) ^ (simd_bench_src[i + 3] >> 2)
+            simd_bench_dst[i] = tv + (i << 3)
+        }
+        @lfence()
+        tsc_v1: u64 = @rdtsc()
+        dt_v: u64 = tsc_v1 - tsc_v0
+        if dt_v < vec_cyc {
+            vec_cyc = dt_v
+        }
+    }
+
+    // Verify `<tile>` depth unwound to `0` (`vzeroupper` ran!) and all 515 lanes + sentinel match!
+    if loc.tile_depth != 0 || simd_bench_dst[SIMD_BENCH_LEN] != SIMD_BENCH_SENT {
+        @halt()
+    }
+    for k in 0..516 {
+        if simd_bench_dst[k] != simd_bench_ref[k] {
+            @halt()
+        }
+    }
+
+    if sc_cyc == 0 { sc_cyc = 1 }
+    if vec_cyc == 0 { vec_cyc = 1 }
+
+    simd_telemetry[0] = 1
+    simd_telemetry[1] = sc_cyc
+    simd_telemetry[2] = vec_cyc
+    return 0
+}
+
 // Executed by each awakened Application Processor (`slot = 1..15`) after MADT bring-up!
+// Remains persistently parked in hardware `MWAIT` ready for `CMD_COMPUTE`,
+// `CMD_EXEC_CAPSULE` (live NVMe `@capsule` execution!), and `CMD_PARK`.
 fn reactor_worker_entry(slot: u64) i64 {
     my_inbox:   u64 = worker_inbox.slot_addr(slot)
     my_scratch: u64 = reactor_scratch.base + slot * 64
@@ -71,12 +162,12 @@ fn reactor_worker_entry(slot: u64) i64 {
     scratch_cell := @mmio<u64>(@scratch_base())
     scratch_cell.write(my_fault)
 
-    // 2. Pinned `MOVDIR64B` + `MONITOR`/`MWAIT` + `<tile>` Worker Loop
+    // 2. Persistent Pinned `MOVDIR64B` + `MONITOR`/`MWAIT` + `<tile>` Worker Loop
     loc := @view<ReactorLocal>(@local_base())
     seq_mmio := @mmio<u64>(my_inbox)
     expect_seq: u64 = 1
 
-    loop <max: 1000000000 | until: expect_seq > 1000> {
+    loop <max: 1000000000000 | until: expect_seq > 1000000000> {
         cur_seq: u64 = seq_mmio.read()
         if cur_seq < expect_seq {
             // Race-free Intel SDM §9.10.4 `MONITOR` + recheck + `MWAIT` cacheline sleep!
@@ -105,6 +196,39 @@ fn reactor_worker_entry(slot: u64) i64 {
                 }
                 publish(bsp_completions.slot_addr(@reactor_id()), res)
             }
+            if task.cmd == CMD_EXEC_CAPSULE {
+                obs_dep_c: u64 = 0
+                ret_val:   u64 = 0
+                exec_cyc:  u64 = 0
+                arg1_u64:  u64 = task.src
+                tile {
+                    obs_dep_c = loc.tile_depth
+                    t_c0: u64 = @rdtsc()
+                    {
+                        ret_val = @call(task.seed0, task.seed1, arg1_u64)
+                    } recover _cap_err {
+                        ret_val = 0
+                    }
+                    t_c1: u64 = @rdtsc()
+                    exec_cyc = t_c1 - t_c0
+                    @emit(0xC5, 0xF8, 0x77) // vzeroupper before outer <tile> exit
+                }
+                if exec_cyc == 0 {
+                    exec_cyc = 1
+                }
+                loc.wake_count += 1
+                loc.inbox_seq = expect_seq
+                loc.last_latency_tsc = exec_cyc
+
+                cap_res := ResultCell{
+                    seq:       expect_seq,
+                    worker_id: @reactor_id(),
+                    gs_fault:  exec_cyc,
+                    digest:    ret_val,
+                    tile_dep:  obs_dep_c
+                }
+                publish(bsp_completions.slot_addr(@reactor_id()), cap_res)
+            }
             expect_seq += 1
         }
     }
@@ -112,12 +236,18 @@ fn reactor_worker_entry(slot: u64) i64 {
     return 0
 }
 
-// Executed on BSP (`Reactor 0`): verifies `gs:0`, nested `<tile>`, `@isr`, & cross-core `MOVDIR64B` + `MWAIT`!
+// Executed on BSP (`Reactor 0`): verifies `gs:0`, nested `<tile>`, `@isr`, & cross-core `MOVDIR64B` + `MWAIT`,
+// leaving all awakened worker cores (`1..online_cores-1`) alive in `MWAIT` for interactive `@capsule` dispatch!
 fn run_reactor_fabric(online_cores: u64) u64 {
     @reactor_bind(0, bsp_completions.slot_addr(0), reactor_scratch.base)
     if @reactor_id() != 0 {
         @halt()
     }
+
+    fabric_state[0] = 1
+    fabric_state[1] = 0
+    fabric_state[2] = 0
+    fabric_state[3] = 0
 
     // 1. Install compiler-verified `@isr` gate at vector `0xFF`
     install_reactor_isr_gate(0xFF)
@@ -173,6 +303,9 @@ fn run_reactor_fabric(online_cores: u64) u64 {
         @halt()
     }
 
+    // Verify Ring-0 Zero-XSAVE `AVX-512` `<tile | simd: 8>` + `{k1}` tail vs scalar `rdtsc`!
+    verify_and_bench_ring0_simd(bsp_loc)
+
     // 3. Single-core (`C=1`) loopback `MOVDIR64B` + `<tile>` self-test (always verified!)
     t_self0: u64 = @rdtsc()
     self_dig: u64 = execute_tile_kernel(0xCAFE_BABE_1234_5678, 0x0102_0304_0506_0708, 0)
@@ -195,6 +328,8 @@ fn run_reactor_fabric(online_cores: u64) u64 {
             cyc1 = 1
         }
         bsp_loc.last_latency_tsc = cyc1
+        fabric_state[0] = 5
+        fabric_state[2] = cyc1
         return cyc1
     }
 
@@ -239,11 +374,109 @@ fn run_reactor_fabric(online_cores: u64) u64 {
         }
     }
 
-    // 5. Cleanly park all worker reactors via `CMD_PARK` `@cell64` direct store
+    // Keep workers `1..online_cores-1` alive in `MWAIT` at `expect_seq == 5`!
+    fabric_state[0] = 5
+
+    if measured_cycles == 0 {
+        measured_cycles = 1
+    }
+    fabric_state[2] = measured_cycles
+    bsp_loc.last_latency_tsc = measured_cycles
+    return measured_cycles
+}
+
+// Fans out `CMD_EXEC_CAPSULE` via `MOVDIR64B` across all awakened worker cores (`1..online_cores-1`),
+// sleeps via `MONITOR`/`MWAIT` until all workers publish their `ResultCell`, and returns the sum
+// of worker return values (or runs directly on BSP when `online_cores <= 1`).
+fn dispatch_capsule_workers(online_cores: u64, entry_addr: u64, arg0: u64, arg1: u64) u64 {
+    if entry_addr == 0 {
+        return 0
+    }
+
+    if online_cores <= 1 {
+        ret_bsp: u64 = 0
+        cyc_bsp: u64 = 0
+        tile {
+            t_b0: u64 = @rdtsc()
+            {
+                ret_bsp = @call(entry_addr, arg0, arg1)
+            } recover _e_bsp {
+                ret_bsp = 0
+            }
+            t_b1: u64 = @rdtsc()
+            cyc_bsp = t_b1 - t_b0
+            @emit(0xC5, 0xF8, 0x77)
+        }
+        if cyc_bsp == 0 {
+            cyc_bsp = 1
+        }
+        fabric_state[1] = ret_bsp
+        fabric_state[2] = cyc_bsp
+        fabric_state[3] = fabric_state[3] + 1
+        fabric_state[4] = ret_bsp
+        return ret_bsp
+    }
+
+    seq: u64 = fabric_state[0]
+    if seq < 5 {
+        seq = 5
+    }
+    fabric_state[0] = seq + 1
+
+    t0: u64 = @rdtsc()
+    for w in 1..online_cores {
+        uw: u64 = w
+        pkt := TaskCell{
+            seq:   seq,
+            cmd:   CMD_EXEC_CAPSULE,
+            src:   arg1,
+            seed0: entry_addr,
+            seed1: arg0
+        }
+        publish(worker_inbox.slot_addr(uw), pkt)
+    }
+
+    total_ret: u64 = 0
+    for w in 1..online_cores {
+        uw: u64 = w
+        comp_addr: u64 = bsp_completions.slot_addr(uw)
+        comp_seq := @mmio<u64>(comp_addr)
+        loop <max: 500000000 | until: comp_seq.read() >= seq> {
+            wait(comp_addr, 0, seq - 1)
+        }
+        got := bsp_completions[uw]
+        total_ret += got.digest
+        if uw < 12 {
+            fabric_state[4 + uw] = got.digest
+        }
+    }
+    t1: u64 = @rdtsc()
+    rt_cyc: u64 = (t1 - t0) / (online_cores - 1)
+    if rt_cyc == 0 {
+        rt_cyc = 1
+    }
+
+    fabric_state[1] = total_ret
+    fabric_state[2] = rt_cyc
+    fabric_state[3] = fabric_state[3] + 1
+    return total_ret
+}
+
+// Cleanly parks all awakened worker reactors (`1..online_cores-1`) via `CMD_PARK` (`@halt()`)
+fn park_all_workers(online_cores: u64) i64 {
+    if online_cores <= 1 {
+        return 0
+    }
+    seq: u64 = fabric_state[0]
+    if seq < 5 {
+        seq = 5
+    }
+    fabric_state[0] = seq + 1
+
     for w in 1..online_cores {
         uw: u64 = w
         park_pkt := TaskCell{
-            seq:   5,
+            seq:   seq,
             cmd:   CMD_PARK,
             src:   0,
             seed0: 0,
@@ -251,10 +484,8 @@ fn run_reactor_fabric(online_cores: u64) u64 {
         }
         publish(worker_inbox.slot_addr(uw), park_pkt)
     }
-
-    if measured_cycles == 0 {
-        measured_cycles = 1
+    for spin in 0..2048 {
+        @pause()
     }
-    bsp_loc.last_latency_tsc = measured_cycles
-    return measured_cycles
+    return 0
 }

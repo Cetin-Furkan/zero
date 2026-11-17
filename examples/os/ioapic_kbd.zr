@@ -1,0 +1,331 @@
+// =============================================================================
+// ZeroOS Gate-4 Tickless `I/O APIC` `IRQ1` Keyboard & `MWAIT` Wake Engine (`os/ioapic_kbd.zr`)
+// =============================================================================
+// Implements zero-tick interrupt-driven PS/2 keyboard input over the Reactor ABI:
+//   1. Masks legacy `8259A PIC` (`0x21`/`0xA1` = `0xFF`) and drains stale `i8042` bytes.
+//   2. Parses ACPI `MADT` Type 1 (`I/O APIC`) & Type 2 (`ISO` `IRQ 1 -> GSI`).
+//   3. Maps `I/O APIC` MMIO (`PTE_UC_NX`), installs compiler-verified GPR-only
+//      `@isr fn kbd_irq1_isr()` at vector `0x21` (and optional `IA32_TSC_DEADLINE`
+//      wake gate at `0xFE`), and unmasks `IRQ 1` -> BSP Local APIC.
+//   4. Sleeps ticklessly in `wait_next_scancode` via `MONITOR`/`MWAIT` on the
+//      64B-aligned `kbd_state[0]` sequence word with race-free `i8042` fallback!
+// =============================================================================
+use "hw_types.zr"
+use "paging_wx.zr"
+
+fn kbd_read_u16_le(s: bytes, off: u64) u16 {
+    b0: u16 = s[off]
+    b1: u16 = s[off + 1]
+    return b0 | (b1 << 8)
+}
+
+fn kbd_read_u32_le(s: bytes, off: u64) u32 {
+    b0: u32 = s[off]
+    b1: u32 = s[off + 1]
+    b2: u32 = s[off + 2]
+    b3: u32 = s[off + 3]
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn ioapic_read_reg(ioapic_base: u64, reg_idx: u32) u32 {
+    sel := @mmio<u32>(ioapic_base)
+    win := @mmio<u32>(ioapic_base + 0x10)
+    sel.write(reg_idx)
+    return win.read()
+}
+
+fn ioapic_write_reg(ioapic_base: u64, reg_idx: u32, val: u32) i64 {
+    sel := @mmio<u32>(ioapic_base)
+    win := @mmio<u32>(ioapic_base + 0x10)
+    sel.write(reg_idx)
+    win.write(val)
+    return 0
+}
+
+fn install_idt_isr_gate(vec: u64, fn_addr: u64) i64 {
+    lo: u64 = 0
+    lo[15:0]  = fn_addr[15:0]
+    lo[31:16] = 0x0008
+    lo[47:32] = 0x8E00
+    lo[63:48] = fn_addr[31:16]
+    idt_slab[vec * 2]     = lo
+    idt_slab[vec * 2 + 1] = fn_addr[63:32]
+    return 0
+}
+
+// Compiler-verified leaf ISR helper (`@isr_ok`: 0 XSAVE, 0 `r12..r15`, 0 `fail`)
+// Drains `i8042` port `0x60`, pushes make-codes (`0x01..0x7F`) into `kbd_ring`,
+// and increments `[kbd_state.base + 0]` to immediately trip BSP `MONITOR`/`MWAIT`!
+@isr_ok fn isr_service_kbd_irq1(state_base: u64, ring_base: u64) u64 {
+    icnt := @mmio<u64>(state_base + 40)
+    icnt.write(icnt.read() + 1)
+
+    st: u8 = kbd_status.read()
+    if (st & 1) != 0 {
+        sc: u8 = kbd_data.read()
+        if (st & 0x20) == 0 && sc > 0 && sc < 0x80 {
+            wseq_m := @mmio<u64>(state_base)
+            cur_w: u64 = wseq_m.read()
+            slot_m := @mmio<u8>(ring_base + (cur_w & 63))
+            slot_m.write(sc)
+            wseq_m.write(cur_w + 1)
+        }
+    }
+    @eoi()
+    return 0
+}
+
+@isr fn kbd_irq1_isr() {
+    isr_service_kbd_irq1(kbd_state.base, kbd_ring.base)
+}
+
+// Silent `IA32_TSC_DEADLINE` wakeup gate (`0xFE`) for bounded `MWAIT` fallback windows
+@isr fn kbd_tsc_deadline_isr() {
+    @eoi()
+}
+
+fn drain_i8042_output() i64 {
+    loop <max: 32 | until: (kbd_status.read() & 1) == 0> {
+        _discard: u8 = kbd_data.read()
+    }
+    return 0
+}
+
+// Discovers `I/O APIC` + `IRQ 1` GSI from `MADT`, installs `@isr` gates, and unmasks `IRQ 1`.
+// Returns `1` when hardware `IRQ 1 -> vector 0x21` is armed, or `0` on poll-only fallback.
+fn init_ioapic_kbd(handoff: @BootHandoff) u64 {
+    // 1. Mask all legacy 8259A PIC lines before `@sti()`
+    pic1_data.write(0xFF)
+    pic2_data.write(0xFF)
+    drain_i8042_output()
+
+    kbd_state[0] = 0
+    kbd_state[1] = 0
+    kbd_state[2] = 0
+    kbd_state[3] = 1
+    kbd_state[4] = 0
+    kbd_state[5] = 0
+    kbd_state[6] = 0
+
+    // Install both `0x21` (`IRQ 1`) and `0xFE` (`TSC-Deadline` wake) `@isr` gates in IDT
+    install_idt_isr_gate(KBD_IRQ_VECTOR, @fn_addr(kbd_irq1_isr))
+    install_idt_isr_gate(0xFE,           @fn_addr(kbd_tsc_deadline_isr))
+
+    // Ensure BSP Local APIC is in x2APIC mode (`IA32_APIC_BASE | 0xC00`, `SIVR | 0x1FF`)
+    // so `init_ioapic_kbd` is 100% order-independent relative to `bring_up_madt_cores`!
+    apic_base_msr: u64 = @msr_read(IA32_APIC_BASE_MSR)
+    if (apic_base_msr & 0xC00) != 0xC00 {
+        @msr_write(IA32_APIC_BASE_MSR, apic_base_msr | 0xC00)
+    }
+    sivr_msr: u64 = @msr_read(X2APIC_SIVR_MSR)
+    if (sivr_msr & 0x100) == 0 {
+        @msr_write(X2APIC_SIVR_MSR, sivr_msr | 0x1FF)
+    }
+    bsp_apic64: u64 = @msr_read(X2APIC_ID_MSR)
+    bsp_apic:   u32 = bsp_apic64
+
+    // Configure x2APIC `LVT Timer` (`MSR 0x832`) in `TSC-Deadline` mode (`0b10`) if supported!
+    ecx1: u32 = @cpuid_ecx(1, 0)
+    if ecx1[24:24] != 0 {
+        @msr_write(0x832, 0x0004_00FE)
+        @mfence()
+        @msr_write(0x6E0, 0)
+        kbd_state[6] = 1
+    }
+
+    if handoff.madt == 0 {
+        return 0
+    }
+    hdr := @view<AcpiSdtHeader>(handoff.madt)
+    madt_len: u64 = hdr.length
+    if hdr.signature != MADT_SIG || madt_len < 44 {
+        return 0
+    }
+
+    // 2. Walk `MADT` for Type 1 (`I/O APIC`) and Type 2 (`Interrupt Source Override` for ISA `IRQ 1`)
+    raw := @view<u8>(handoff.madt, madt_len)
+    ioapic_phys: u64 = 0
+    ioapic_gsi_base: u64 = 0
+    kbd_gsi: u64 = 1
+    iso_flags: u16 = 0
+
+    off: u64 = 44
+    loop <max: 4096 | until: off + 2 > madt_len> {
+        rec_type: u64 = raw[off]
+        rec_len:  u64 = raw[off + 1]
+        if rec_len < 2 || off + rec_len > madt_len {
+            break
+        }
+        match rec_type {
+            1 => {
+                if rec_len >= 12 {
+                    addr32: u64 = kbd_read_u32_le(raw, off + 4)
+                    gbase:  u64 = kbd_read_u32_le(raw, off + 8)
+                    if addr32 != 0 && (ioapic_phys == 0 || gbase <= 1) {
+                        ioapic_phys     = addr32
+                        ioapic_gsi_base = gbase
+                    }
+                }
+            }
+            2 => {
+                if rec_len >= 10 {
+                    bus: u8 = raw[off + 2]
+                    src: u8 = raw[off + 3]
+                    if bus == 0 && src == 1 {
+                        kbd_gsi   = kbd_read_u32_le(raw, off + 4)
+                        iso_flags = kbd_read_u16_le(raw, off + 8)
+                    }
+                }
+            }
+            _ => {}
+        }
+        off += rec_len
+    }
+
+    if ioapic_phys == 0 || kbd_gsi < ioapic_gsi_base {
+        return 0
+    }
+
+    // 3. Map `I/O APIC` aperture as UC MMIO (`PTE_UC_NX`) and verify pin bounds
+    ensure_uc_mmio_mapped(ioapic_phys, 4096)
+    ver_reg: u32 = ioapic_read_reg(ioapic_phys, 1)
+    if ver_reg == 0xFFFF_FFFF {
+        return 0
+    }
+    max_redir: u64 = ver_reg[23:16]
+    pin: u64 = kbd_gsi - ioapic_gsi_base
+    if pin > max_redir {
+        return 0
+    }
+
+    // Target BSP Local APIC ID (`bits [31:24]` of high redirection register in physical mode)
+    if bsp_apic > 255 {
+        return 0
+    }
+
+    reg_lo_idx: u32 = 0x10 + pin * 2
+    reg_hi_idx: u32 = reg_lo_idx + 1
+    redir_hi:   u32 = bsp_apic << 24
+    redir_lo:   u32 = KBD_IRQ_VECTOR
+    if (iso_flags & 3) == 3 {
+        redir_lo = redir_lo | (1 << 13) // Active-Low polarity
+    }
+    if ((iso_flags >> 2) & 3) == 3 {
+        redir_lo = redir_lo | (1 << 15) // Level-Triggered
+    }
+
+    // Mask pin -> program destination -> unmask pin -> drain any latched byte
+    ioapic_write_reg(ioapic_phys, reg_lo_idx, 0x0001_0000)
+    ioapic_write_reg(ioapic_phys, reg_hi_idx, redir_hi)
+    ioapic_write_reg(ioapic_phys, reg_lo_idx, redir_lo)
+    drain_i8042_output()
+
+    kbd_state[2] = ioapic_phys
+    kbd_state[3] = kbd_gsi
+    kbd_state[4] = 1
+    return 1
+}
+
+// Tickless interrupt-woken scancode waiter:
+//   - Fast path: pops make-code (`0x01..0x7F`) pushed by `kbd_irq1_isr()` into `kbd_ring`.
+//   - Hardware sleep path:
+//     * Bare-metal (`mwait_capable == 1`): race-free `wait(kbd_state.base, dl, rseq)` (`MONITOR`/`MWAIT`).
+//     * Hypervisor without MWAIT (`mwait_capable == 0`): atomic race-free `sti; hlt` (`0xFB, 0xF4`).
+//     * Once the first hardware `IRQ 1` is proven (`kbd_state[5] > 0`), `dl = 0` for 100% pure
+//       zero-timer tickless wakeup; before the first `IRQ 1`, uses a quiet `10 ms` `IA32_TSC_DEADLINE`
+//       window so SMI/unrouted `i8042` laptop firmware also wakes reliably!
+fn wait_next_scancode(tsc_per_ms: u64) u8 {
+    tsc_ms: u64 = tsc_per_ms
+    if tsc_ms < 100000 {
+        tsc_ms = 2000000
+    }
+    win_tsc: u64 = tsc_ms * 10
+    wseq_m := @mmio<u64>(kbd_state.base)
+    irq_cnt_m := @mmio<u64>(kbd_state.base + 40)
+    loc := @view<ReactorLocal>(@local_base())
+
+    loop <max: 1000000000000 | until: 0 == 1> {
+        rseq: u64 = kbd_state[1]
+        wseq: u64 = wseq_m.read()
+        if wseq > rseq {
+            sc: u8 = kbd_ring[rseq & 63]
+            kbd_state[1] = rseq + 1
+            return sc
+        }
+
+        if kbd_state[4] == 1 {
+            dl: u64 = 0
+            if kbd_state[6] == 1 && irq_cnt_m.read() == 0 {
+                dl = @rdtsc() + win_tsc
+            }
+
+            if loc.mwait_capable != 0 {
+                @sti()
+                wait(kbd_state.base, dl, rseq)
+                if dl != 0 {
+                    @msr_write(0x6E0, 0)
+                }
+            } else {
+                if dl != 0 || irq_cnt_m.read() != 0 {
+                    if dl != 0 {
+                        @msr_write(0x6E0, dl)
+                    }
+                    @cli()
+                    if wseq_m.read() == rseq {
+                        @emit(0xFB, 0xF4) // atomic `sti; hlt` — zero lost-wakeup race!
+                    } else {
+                        @sti()
+                    }
+                    if dl != 0 {
+                        @msr_write(0x6E0, 0)
+                    }
+                } else {
+                    @sti()
+                    t_spin0: u64 = @rdtsc()
+                    loop <max: 100000 | until: wseq_m.read() > rseq || (@rdtsc() - t_spin0) >= tsc_ms> {
+                        @pause()
+                    }
+                }
+            }
+
+            if wseq_m.read() > rseq {
+                sc_irq: u8 = kbd_ring[rseq & 63]
+                kbd_state[1] = rseq + 1
+                return sc_irq
+            }
+
+            // Race-free fallback check ONLY when hardware `IRQ 1` has never fired yet
+            if irq_cnt_m.read() == 0 {
+                @cli()
+                got_poll: u64 = 0
+                poll_sc:  u8  = 0
+                if wseq_m.read() == rseq {
+                    st: u8 = kbd_status.read()
+                    if (st & 1) != 0 {
+                        b: u8 = kbd_data.read()
+                        if (st & 0x20) == 0 && b > 0 && b < 0x80 {
+                            poll_sc  = b
+                            got_poll = 1
+                        }
+                    }
+                }
+                @sti()
+                if got_poll == 1 {
+                    return poll_sc
+                }
+            }
+        } else {
+            // Pure poll-with-pause fallback when booted without MADT / I/O APIC
+            st_p: u8 = kbd_status.read()
+            if (st_p & 1) != 0 {
+                bp: u8 = kbd_data.read()
+                if (st_p & 0x20) == 0 && bp > 0 && bp < 0x80 {
+                    return bp
+                }
+            } else {
+                @pause()
+            }
+        }
+    }
+    return 0
+}

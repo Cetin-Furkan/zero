@@ -1,23 +1,33 @@
 // =============================================================================
-// ZeroOS Gate-3 PCIe `ECAM` + NVMe `@dma_queue` + `@capsule` Engine (`os/nvme_capsule.zr`)
+// ZeroOS Gate-3/4 PCIe `ECAM` + NVMe `@dma_queue` + Multi-`@capsule` Engine (`os/nvme_capsule.zr`)
 // =============================================================================
-// Implements `ZERO_OS_ARCHITECTURE.md` §3 & §6 Gate 3 without VFS/FAT/ext4:
+// Implements `ZERO_OS_ARCHITECTURE.md` §3 & §6 without VFS/FAT/ext4:
 //   1. Discovers PCIe `ECAM` from ACPI `MCFG` & locates NVMe (`01h:08h:02h`)
 //   2. Initializes Admin + I/O `@dma_queue` rings (`ASQ`/`ACQ` + `SQ1`/`CQ1`)
 //   3. Queries `Identify Namespace` for exact hardware LBA shift (`512e` vs `4Kn`)
-//   4. DMAs Master Extent Table (LBA 0) & `@capsule` extent straight into DRAM
-//   5. Verifies hardware SSE4.2 `@crc32c`, seals capsule `PTE_RX` (`WX=0`), and
-//      executes the live capsule inside the Reactor ABI (including `gs:0` recover)!
+//   4. Discovers up to 4 sealed extents (`Extent 0..3`) in `MasterExtentSuper` (LBA 0),
+//      DMAs each extent into `boot_capsule.base + idx * 65536`, verifies hardware
+//      SSE4.2 `@crc32c`, seals all capsule slots `PTE_RX` / `PTE_RO_NX` (`WX=0`),
+//      populates `cap_dir_entries`, and verifies `Extent 0` (`fail 88` + `777`)!
 // =============================================================================
 use "hw_types.zr"
 use "paging_wx.zr"
 
+fn get_loaded_capsule_entry(idx: u64) u64 {
+    if idx >= CAPSULE_MAX_SLOTS {
+        return 0
+    }
+    return cap_dir_entries[idx]
+}
+
+fn get_loaded_capsule_count() u64 => cap_dir_entries[4]
+
 fn nvme_submit_and_poll(
-    sq_slot_addr:  u64,
-    cq_slot_addr:  u64,
-    cmd:           @NvmeCmd,
-    sq_db_addr:    u64,
-    cq_db_addr:    u64,
+    sq_slot_addr:   u64,
+    cq_slot_addr:   u64,
+    cmd:            @NvmeCmd,
+    sq_db_addr:     u64,
+    cq_db_addr:     u64,
     tail_and_phase: u64
 ) u64 {
     next_tail: u32 = tail_and_phase[31:1]
@@ -62,6 +72,35 @@ fn nvme_submit_and_poll(
         return 0
     }
     return 1
+}
+
+// Submits one 4KiB NVMe I/O Read (`Opcode = 0x02`) on `SQ1`/`CQ1` (`cap = 16`)
+// with proper ring wrap (`(io_seq + 1) & 15`) and CQ phase toggle (`((io_seq >> 4) & 1) ^ 1`).
+fn nvme_io_read_4k(
+    lba_start:   u64,
+    dst_phys:    u64,
+    blks_per_4k: u32,
+    iosq_db:     u64,
+    iocq_db:     u64,
+    io_seq:      u64
+) u64 {
+    next_tail: u64 = (io_seq + 1) & 15
+    exp_phase: u64 = ((io_seq >> 4) & 1) ^ 1
+    cid_v:     u32 = 0x10 + (io_seq & 0x7FFF)
+    rd_cmd := NvmeCmd{
+        cdw0: (cid_v << 16) | 0x02, nsid: 1, rsv0: 0, mptr: 0,
+        prp1: dst_phys, prp2: 0,
+        cdw10: lba_start[31:0], cdw11: lba_start[63:32], cdw12: blks_per_4k,
+        cdw13: 0, cdw14: 0, cdw15: 0
+    }
+    return nvme_submit_and_poll(
+        nvme_io_sq1.slot_addr(io_seq),
+        nvme_io_cq1.slot_addr(io_seq),
+        rd_cmd,
+        iosq_db,
+        iocq_db,
+        (next_tail << 1) | exp_phase
+    )
 }
 
 fn find_nvme_bar0_via_mcfg(handoff: @BootHandoff) u64 {
@@ -126,9 +165,14 @@ fn find_nvme_bar0_via_mcfg(handoff: @BootHandoff) u64 {
     return 0
 }
 
-// Probes NVMe via `MCFG`, streams & CRC32C-verifies `@capsule` 0, seals `PTE_RX` (`WX=0`), & runs it!
-// Returns `0` cleanly when booted without an NVMe namespace / Master Extent disk attached.
+// Probes NVMe via `MCFG`, streams & CRC32C-verifies up to 4 `@capsule` extents (`Extent 0..3`),
+// seals all `256 KiB` capsule slots `PTE_RX` / `PTE_RO_NX` (`WX=0`), populates `cap_dir_entries`,
+// and verifies `Extent 0` (`fail 88` `recover` + `@call(ext0, 40, 2) == 777`)!
 fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
+    for ci in 0..16 {
+        cap_dir_entries[ci] = 0
+    }
+
     bar0: u64 = find_nvme_bar0_via_mcfg(handoff)
     if bar0 == 0 {
         return 0
@@ -176,8 +220,8 @@ fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
         return 0
     }
 
-    asq_db: u64 = bar0 + 0x1000
-    acq_db: u64 = bar0 + 0x1000 + db_stride
+    asq_db:  u64 = bar0 + 0x1000
+    acq_db:  u64 = bar0 + 0x1000 + db_stride
     iosq_db: u64 = bar0 + 0x1000 + 2 * db_stride
     iocq_db: u64 = bar0 + 0x1000 + 3 * db_stride
 
@@ -217,73 +261,78 @@ fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
 
     // 5. Lock-Free I/O Read (`Opcode = 0x02`) of Master Extent Table at LBA 0 (`4 KiB`)
     blks_per_4k: u32 = (4096 >> lbads) - 1
-    meta_rd := NvmeCmd{
-        cdw0: 0x0010_0002, nsid: 1, rsv0: 0, mptr: 0,
-        prp1: nvme_meta_page.base, prp2: 0,
-        cdw10: 0, cdw11: 0, cdw12: blks_per_4k, cdw13: 0, cdw14: 0, cdw15: 0
-    }
-    if nvme_submit_and_poll(nvme_io_sq1.slot_addr(0), nvme_io_cq1.slot_addr(0), meta_rd, iosq_db, iocq_db, (1 << 1) | 1) == 0 {
+    io_seq: u64 = 0
+    if nvme_io_read_4k(0, nvme_meta_page.base, blks_per_4k, iosq_db, iocq_db, io_seq) == 0 {
         return 0
     }
+    io_seq += 1
 
     super := @view<MasterExtentSuper>(nvme_meta_page.base)
     if super.magic != ZEXT_MAGIC || super.version != 1 || super.extent_count == 0 {
         return 0
     }
-    ext0 := @view<MasterExtentEntry>(nvme_meta_page.base + 64)
-    if ext0.byte_len < 72 || ext0.byte_len > boot_capsule.cap || (ext0.start_byte & 4095) != 0 {
-        return 0
+
+    ext_cnt: u64 = super.extent_count
+    if ext_cnt > CAPSULE_MAX_SLOTS {
+        ext_cnt = CAPSULE_MAX_SLOTS
     }
 
-    // 6. Stream `@capsule` extent in 4KiB DMA pages directly into `boot_capsule` (`PTE_RW_NX`)
-    pages_needed: u64 = (ext0.byte_len + 4095) >> 12
-    if pages_needed > 14 {
-        return 0
-    }
-    for pg in 0..pages_needed {
-        upg: u64 = pg
-        lba_start: u64 = (ext0.start_byte + upg * 4096) >> lbads
-        sq_idx: u64 = 1 + upg
-        tail_v: u32 = sq_idx + 1
-        cid_v:  u32 = 0x20 + upg
-        cap_rd := NvmeCmd{
-            cdw0: (cid_v << 16) | 0x02, nsid: 1, rsv0: 0, mptr: 0,
-            prp1: boot_capsule.base + upg * 4096, prp2: 0,
-            cdw10: lba_start[31:0], cdw11: lba_start[63:32], cdw12: blks_per_4k,
-            cdw13: 0, cdw14: 0, cdw15: 0
-        }
-        tail_u64: u64 = sq_idx + 1
-        if nvme_submit_and_poll(nvme_io_sq1.slot_addr(sq_idx), nvme_io_cq1.slot_addr(sq_idx), cap_rd, iosq_db, iocq_db, (tail_u64 << 1) | 1) == 0 {
+    // 6. Stream, `@crc32c`-verify, and `W^X`-seal all `ext_cnt` extents (`Extent 0..ext_cnt-1`)
+    for idx in 0..ext_cnt {
+        u_idx: u64 = idx
+        ext := @view<MasterExtentEntry>(nvme_meta_page.base + 64 + u_idx * 32)
+        if ext.byte_len < 72 || ext.byte_len > CAPSULE_SLOT_BYTES || (ext.start_byte & 4095) != 0 {
             return 0
         }
+
+        slot_base:    u64 = boot_capsule.base + u_idx * CAPSULE_SLOT_BYTES
+        pages_needed: u64 = (ext.byte_len + 4095) >> 12
+        for pg in 0..pages_needed {
+            upg: u64 = pg
+            lba_start: u64 = (ext.start_byte + upg * 4096) >> lbads
+            if nvme_io_read_4k(lba_start, slot_base + upg * 4096, blks_per_4k, iosq_db, iocq_db, io_seq) == 0 {
+                return 0
+            }
+            io_seq += 1
+        }
+
+        cap_hdr := @view<ZeroCapsuleHeader>(slot_base)
+        if cap_hdr.magic != ZCAP_MAGIC || cap_hdr.version != 1 || cap_hdr.entry_off != 64 {
+            return 0
+        }
+        code_bytes: u64 = cap_hdr.code_bytes
+        if code_bytes == 0 || (code_bytes & 7) != 0 || 64 + code_bytes > ext.byte_len {
+            return 0
+        }
+        qwords := @view<u64>(slot_base + 64, code_bytes / 8)
+        crc_acc: u64 = 0xFFFF_FFFF
+        for qw in qwords {
+            crc_acc = @crc32c(crc_acc, qw)
+        }
+        calc_crc: u32 = (~crc_acc)[31:0]
+        if calc_crc != cap_hdr.crc32c || calc_crc != ext.crc32c {
+            @halt()
+        }
+
+        seal_capsule_wx_rx(slot_base, 64 + code_bytes, CAPSULE_SLOT_BYTES)
+
+        cap_dir_entries[u_idx]      = slot_base + cap_hdr.entry_off
+        cap_dir_entries[8 + u_idx]  = ext.byte_len
+        cap_dir_entries[12 + u_idx] = calc_crc
+        cap_dir_entries[4]          = u_idx + 1
     }
 
-    // 7. Verify `ZeroCapsuleHeader` & Hardware SSE4.2 `@crc32c` Digest
-    cap_hdr := @view<ZeroCapsuleHeader>(boot_capsule.base)
-    if cap_hdr.magic != ZCAP_MAGIC || cap_hdr.version != 1 || cap_hdr.entry_off != 64 {
-        return 0
-    }
-    code_bytes: u64 = cap_hdr.code_bytes
-    if code_bytes == 0 || (code_bytes & 7) != 0 || 64 + code_bytes > ext0.byte_len {
-        return 0
-    }
-    qwords := @view<u64>(boot_capsule.base + 64, code_bytes / 8)
-    crc_acc: u64 = 0xFFFF_FFFF
-    for qw in qwords {
-        crc_acc = @crc32c(crc_acc, qw)
-    }
-    calc_crc: u32 = (~crc_acc)[31:0]
-    if calc_crc != cap_hdr.crc32c || calc_crc != ext0.crc32c {
-        @halt()
+    // Seal any trailing unused capsule slots (`ext_cnt..CAPSULE_MAX_SLOTS`) as `PTE_RO_NX`
+    for rem_idx in ext_cnt..CAPSULE_MAX_SLOTS {
+        u_rem: u64 = rem_idx
+        seal_capsule_wx_rx(boot_capsule.base + u_rem * CAPSULE_SLOT_BYTES, 0, CAPSULE_SLOT_BYTES)
     }
 
-    // 8. Seal `@capsule` pages from `PTE_RW_NX` -> `PTE_RX` (`WX=0` verified!) & execute!
-    seal_capsule_wx_rx(boot_capsule.base, 64 + code_bytes, boot_capsule.cap)
-
-    entry_fn: u64 = boot_capsule.base + cap_hdr.entry_off
+    // 7. Verify `Extent 0` per-core `gs:0` `fail 88` `recover` + boot compute (`777`)!
+    ext0_entry: u64 = cap_dir_entries[0]
     caught_cap_fault: u64 = 0
     {
-        _bad_call := @call(entry_fn, 0, 0)
+        _bad_call := @call(ext0_entry, 0, 0)
     } recover cerr {
         caught_cap_fault = cerr
     }
@@ -291,6 +340,8 @@ fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
         @halt()
     }
 
-    cap_ret: u64 = @call(entry_fn, 40, 2)
+    cap_ret: u64 = @call(ext0_entry, 40, 2)
     return cap_ret
 }
+
+fn load_and_run_nvme_capsule(handoff: @BootHandoff) u64 => probe_and_exec_nvme_capsule(handoff)

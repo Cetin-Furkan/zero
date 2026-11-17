@@ -1,5 +1,5 @@
 // =============================================================================
-// ZeroOS Gate-1b Modular Bare-Metal UEFI Entry (`examples/gate1_os.zr`)
+// ZeroOS Gate-4 Tickless Interrupt-Woken Command Deck & Multi-Capsule OS (`examples/gate1_os.zr`)
 // =============================================================================
 // Set `qemu_debug :: 0` for physical laptop media without port `0xE9` (§8.5)
 qemu_debug :: 1
@@ -10,7 +10,45 @@ use "os/paging_wx.zr"
 use "os/reactor_fabric.zr"
 use "os/smp_madt.zr"
 use "os/nvme_capsule.zr"
+use "os/ioapic_kbd.zr"
 use "os/hud_render.zr"
+
+fn dbg_u64_dec(val: u64) i64 {
+    if qemu_debug == 1 {
+        if val == 0 {
+            debug_con.write('0')
+            return 0
+        }
+        div_u: u64 = 1000000000
+        div_u = div_u * 1000000000 * 10
+        started: u64 = 0
+        v: u64 = val
+        loop <max: 20 | until: div_u == 0> {
+            dig: u64 = v / div_u
+            v %= div_u
+            if dig != 0 || started == 1 {
+                debug_con.write(48 + dig)
+                started = 1
+            }
+            div_u /= 10
+        }
+    }
+    return 0
+}
+
+fn exec_deck_capsule(handoff: @BootHandoff, online_cores: u64, ext_idx: u64, boot_cap_val: u64) u64 {
+    entry: u64 = get_loaded_capsule_entry(ext_idx)
+    sum_val: u64 = 0
+    if entry != 0 {
+        sum_val = dispatch_capsule_workers(online_cores, entry, 40, 2)
+    } else {
+        fabric_state[1] = 0
+        fabric_state[2] = 0
+    }
+    draw_command_deck(handoff, online_cores, ext_idx + 1, boot_cap_val)
+    @sfence()
+    return sum_val
+}
 
 fn main(handoff: @BootHandoff) i64 {
     // 1. Mask interrupts & validate typed BootHandoff contract
@@ -77,7 +115,7 @@ fn main(handoff: @BootHandoff) i64 {
 
     @cr_write(3, new_cr3)
 
-    // 5. Verify ACPI post-CR3, install IDT, test `recover` (`fail 2`, `fail 3`), & wake MADT APs!
+    // 5. Verify ACPI post-CR3, install IDT, test `recover` (`fail 2`, `fail 3`), wake MADT APs, & arm NVMe + IRQ1!
     acpi_ok: u64 = verify_acpi_post_cr3(handoff)
     if acpi_ok != 1 {
         @halt()
@@ -103,12 +141,14 @@ fn main(handoff: @BootHandoff) i64 {
 
     online_cores:  u64 = bring_up_madt_cores(handoff)
     fabric_cycles: u64 = run_reactor_fabric(online_cores)
-    cap_val:       u64 = probe_and_exec_nvme_capsule(handoff)
+    cap_val:       u64 = load_and_run_nvme_capsule(handoff)
+    init_ioapic_kbd(handoff)
 
-    // Recheck hardware W^X page tables AFTER dynamic NVMe `@capsule` sealing!
+    // Recheck hardware W^X page tables AFTER dynamic NVMe `@capsule` sealing & I/O APIC UC MMIO map!
     wx_hits = verify_no_wx_pages()
+    @sti()
 
-    // 6. Non-temporal `movnti` GOP paint + checkpoint LEDs + per-core pips + live `rdtsc`/`CAP` HUD!
+    // 6. 512-bit AVX-512 `vmovntdq` GOP scanout + LEDs + core pips + top HUD + Obsidian Command Deck!
     stream_paint_gop(handoff)
     draw_led(handoff, 0, 0x00, 0xE5, 0xFF)
     draw_led(handoff, 1, 0x29, 0x79, 0xFF)
@@ -122,6 +162,8 @@ fn main(handoff: @BootHandoff) i64 {
         draw_core_pip(handoff, uci)
     }
     draw_status_hud(handoff, online_cores, fabric_cycles, cap_val)
+    draw_command_deck(handoff, online_cores, 0, cap_val)
+    @sfence()
 
     // 7. Emit `0xE9` telemetry banner (`elided when qemu_debug :: 0`)
     if qemu_debug == 1 {
@@ -143,49 +185,94 @@ fn main(handoff: @BootHandoff) i64 {
         dbg_u32_dec(wx_hits)
         dbg_str(" ACPI=")
         dbg_u32_dec(acpi_ok)
-        dbg_str(" GS=1 FAB=1 CYC=")
+        dbg_str(" GS=1 FAB=1 SIMD=")
+        dbg_u32_dec(simd_telemetry[0])
+        dbg_str(" VEC=")
+        dbg_u32_dec(simd_telemetry[2])
+        dbg_str("/")
+        dbg_u32_dec(simd_telemetry[1])
+        dbg_str(" CYC=")
         dbg_u32_dec(fabric_cycles)
         dbg_str(" CAP=")
         dbg_u32_dec(cap_val)
         dbg_str(" KBD\n")
     }
 
-    // 8. Drain residual i8042 byte, poll `kbd_status` bit 0, read `kbd_data`
-    loop <max: 16 | until: kbd_status.read()[0:0] == 0> {
-        _discard: u8 = kbd_data.read()
-    }
-
-    got_make: u64 = 0
-    make_sc:  u64 = 0
-    if qemu_debug == 1 {
-        loop <max: 80000000 | until: got_make == 1> {
-            if kbd_status.read()[0:0] != 0 {
-                sc: u8 = kbd_data.read()
-                if sc > 0 && sc < 0x80 {
-                    make_sc = sc
-                    got_make = 1
-                }
-            }
+    // 8. Persistent Tickless Interrupt-Woken `MONITOR`/`MWAIT` Command Deck Loop
+    cur_slot: u64 = 0
+    loop <max: 1000000000 | until: 0 == 1> {
+        sc: u8 = wait_next_scancode(handoff.tsc_per_ms)
+        if sc == 0 {
+            continue
         }
-    } else {
-        loop <max: 1000000000000 | until: got_make == 1> {
-            if kbd_status.read()[0:0] != 0 {
-                sc: u8 = kbd_data.read()
-                if sc > 0 && sc < 0x80 {
-                    make_sc = sc
-                    got_make = 1
-                }
-            }
-        }
-    }
 
-    if got_make == 1 {
-        draw_led(handoff, 4, 0x00, 0xE6, 0x76)
-        paint_scancode_cell(handoff, make_sc)
-        if qemu_debug == 1 {
-            dbg_str("SCAN=")
-            dbg_hex32(make_sc)
-            dbg_str(" GATE1B_OK\n")
+        if sc == 0x02 {
+            cur_slot = 1
+            v1: u64 = exec_deck_capsule(handoff, online_cores, 0, cap_val)
+            if qemu_debug == 1 {
+                dbg_str("CAP1=")
+                dbg_u64_dec(v1)
+                dbg_str("\n")
+            }
+            continue
+        }
+
+        if sc == 0x03 {
+            cur_slot = 2
+            v2: u64 = exec_deck_capsule(handoff, online_cores, 1, cap_val)
+            if qemu_debug == 1 {
+                dbg_str("CAP2=")
+                dbg_u64_dec(v2)
+                dbg_str("\n")
+            }
+            continue
+        }
+
+        if sc == 0x04 {
+            cur_slot = 3
+            v3: u64 = exec_deck_capsule(handoff, online_cores, 2, cap_val)
+            if qemu_debug == 1 {
+                dbg_str("CAP3=")
+                dbg_u64_dec(v3)
+                dbg_str("\n")
+            }
+            continue
+        }
+
+        if sc == 0x30 {
+            bsp_loc := @view<ReactorLocal>(@local_base())
+            verify_and_bench_ring0_simd(bsp_loc)
+            draw_command_deck(handoff, online_cores, cur_slot, cap_val)
+            @sfence()
+            if qemu_debug == 1 {
+                dbg_str("BENCH=OK\n")
+            }
+            continue
+        }
+
+        if sc == 0x1E {
+            draw_led(handoff, 4, 0x00, 0xE6, 0x76)
+            paint_scancode_cell(handoff, 0x1E)
+            @sfence()
+            if qemu_debug == 1 {
+                dbg_str("SCAN=0x0000001E GATE1B_OK\n")
+            }
+            continue
+        }
+
+        if sc == 0x10 || sc == 0x01 {
+            park_all_workers(online_cores)
+            if qemu_debug == 1 {
+                dbg_str("SHUTDOWN_OK\n")
+            }
+            @cli()
+            @halt()
+        }
+
+        if qemu_debug == 0 {
+            draw_led(handoff, 4, 0x00, 0xE6, 0x76)
+            paint_scancode_cell(handoff, sc)
+            @sfence()
         }
     }
 

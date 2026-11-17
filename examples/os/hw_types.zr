@@ -34,11 +34,18 @@ PAGE_4K             :: 0x1000
 PAGE_2M             :: 0x20_0000
 PAGE_1G             :: 0x4000_0000
 
+IOAPIC_DEFAULT_PHYS :: 0xFEC0_0000
+KBD_IRQ_VECTOR      :: 0x21
+CAPSULE_SLOT_BYTES  :: 65536
+CAPSULE_MAX_SLOTS   :: 4
+
 // Programmable hardware Page-Table Entry pointer: masks `[51:12]` inline on `pt[i]`!
 PtePtr :: @ptr<u64 | mask: ADDR_MASK_4K>
 
-// Typed hardware I/O port channels (`0xE9` debugcon, `i8042` PS/2 keyboard)
+// Typed hardware I/O port channels (`0xE9` debugcon, `8259 PIC` mask, `i8042` PS/2 keyboard)
 @port debug_con     : <u8 | 0xE9>
+@port pic1_data     : <u8 | 0x21>
+@port pic2_data     : <u8 | 0xA1>
 @port kbd_data      : <u8 | 0x60>
 @port kbd_status    : <u8 | 0x64>
 
@@ -128,10 +135,11 @@ BootHandoff :: <align: 64B> {
 @slab core_release_ack   : <u64 | max: 16>
 
 // =============================================================================
-// Gate-2 / Phase-3 Pinned Reactor ABI & Direct-Silicon `MOVDIR64B` Ring Fabric
+// Gate-2..4 Pinned Reactor ABI & Direct-Silicon `MOVDIR64B` Multi-Core Fabric
 // =============================================================================
-CMD_COMPUTE :: 1
-CMD_PARK    :: 2
+CMD_COMPUTE      :: 1
+CMD_EXEC_CAPSULE :: 2
+CMD_PARK         :: 3
 
 ReactorLocal :: <align: 64B> {
     fault:             u64
@@ -164,9 +172,23 @@ ResultCell :: @cell64 {
 @ring bsp_completions : <ResultCell | cap: 16>
 @slab reactor_scratch : <u64        | max: 1024>
 @slab irq_telemetry   : <u64        | max: 8>
+// `fabric_state`: [0]=next_seq, [1]=last_cap_sum, [2]=last_cap_cycles, [3]=dispatch_count
+@slab fabric_state    : <u64        | max: 16>
 
 // =============================================================================
-// Gate-3 PCIe `MCFG`/`ECAM` + Lock-Free NVMe `@dma_queue` + `@capsule` Storage
+// Gate-4 Tickless I/O APIC `IRQ1` Keyboard & Multi-Capsule NVMe Directory State
+// =============================================================================
+// `kbd_state`: [0]=write_seq (64B-aligned MWAIT word!), [1]=read_seq,
+//              [2]=ioapic_phys, [3]=kbd_gsi, [4]=irq1_ready, [5]=irq1_count
+@slab kbd_state       : <u64 | max: 16>
+@slab kbd_ring        : <u8  | max: 64>
+
+// `cap_dir_entries`: [0..3]=sealed entry_fn for Extent 0..3, [4]=loaded_count,
+//                    [8..11]=extent byte_len, [12..15]=extent crc32c
+@slab cap_dir_entries : <u64 | max: 16>
+
+// =============================================================================
+// Gate-3/4 PCIe `MCFG`/`ECAM` + Lock-Free NVMe `@dma_queue` + `@capsule` Arena
 // =============================================================================
 AcpiMcfgEntry :: <packed> {
     ecam_base: u64
@@ -228,4 +250,4 @@ ZeroCapsuleHeader :: <packed> {
 @dma_queue nvme_io_sq1    : <NvmeCmd | cap: 16>
 @dma_queue nvme_io_cq1    : <NvmeCqe | cap: 16>
 @slab      nvme_meta_page : <u8      | max: 4096>
-@capsule   boot_capsule   : <cap: 65536>
+@capsule   boot_capsule   : <cap: 262144>
