@@ -18,7 +18,7 @@ parse_efi_intrinsic:
     mov     ebx, [rax + 8]          ; intrinsic sym_id
     mov     r12d, [rax + 4]         ; source line
 
-    ; `@rsp_align()`, `@sizeof(T)`, `@alignof(T)`, `@view<T>(...)` work on BOTH targets!
+    ; `@rsp_align()`, `@sizeof(T)`, `@alignof(T)`, `@view<T>(...)`, `@fn_addr(f)` work on BOTH targets!
     cmp     ebx, [sym_rsp_align_id]
     je      .do_rsp_align
     cmp     ebx, [sym_sizeof_id]
@@ -27,6 +27,12 @@ parse_efi_intrinsic:
     je      .do_alignof
     cmp     ebx, [sym_view_id]
     je      .do_view
+    cmp     ebx, [sym_fn_addr_id]
+    je      .do_fn_addr
+
+    call    try_parse_ext_intrinsic
+    test    eax, eax
+    jnz     .done
 
     ; All Ring-0 hardware intrinsics require `--target=efi-os`!
     cmp     byte [mode_efi], 1
@@ -40,6 +46,10 @@ parse_efi_intrinsic:
     je      .do_hlt
     cmp     ebx, [sym_halt_id]
     je      .do_halt
+    cmp     ebx, [sym_pause_id]
+    je      .do_pause
+    cmp     ebx, [sym_rdtsc_id]
+    je      .do_rdtsc
     cmp     ebx, [sym_lgdt_id]
     je      .do_lgdt
     cmp     ebx, [sym_lidt_id]
@@ -120,6 +130,50 @@ parse_efi_intrinsic:
     xor     edi, edi
     call    parse_view_or_mmio_call
     jmp     .done
+
+.do_fn_addr:
+    mov     al, TOK_LPAREN
+    call    expect_tok_kind
+    call    next_tok_ptr
+    cmp     byte [rax], TOK_IDENT
+    jne     parse_err_at_tok
+    mov     edi, [rax + 8]          ; fn sym_id
+    call    find_or_add_fn          ; eax = fn_idx
+    mov     ebx, eax
+    mov     al, TOK_RPAREN
+    call    expect_tok_kind
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0x058D              ; 48 8D 05 <rel32> = lea rax, [rip + rel32]
+    call    emit_u16
+    mov     edx, [code_off]
+    mov     rcx, [space_ast]
+    add     rcx, AST_CALLFIX_OFF
+    mov     eax, [call_fix_cnt]
+    mov     [rcx + rax * 8],     edx
+    mov     [rcx + rax * 8 + 4], ebx
+    inc     dword [call_fix_cnt]
+    xor     eax, eax
+    call    emit_u32
+    jmp     .done_u64
+
+.do_pause:
+    call    .expect_empty_parens
+    mov     ax, 0x90F3              ; F3 90 = pause
+    call    emit_u16
+    jmp     .done_u64
+
+.do_rdtsc:
+    call    .expect_empty_parens
+    mov     ax, 0x310F              ; 0F 31 = rdtsc
+    call    emit_u16
+    mov     eax, 0x20E2C148         ; 48 C1 E2 20 = shl rdx, 32
+    call    emit_u32
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xD009              ; 48 09 D0 = or rax, rdx
+    call    emit_u16
+    jmp     .done_u64
 
 .do_cli:
     call    .expect_empty_parens

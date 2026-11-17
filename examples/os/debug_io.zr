@@ -1,0 +1,57 @@
+// =============================================================================
+// ZeroOS Port `0xE9` Telemetry (`os/debug_io.zr`) — Dead-Code Elided on Laptop
+// =============================================================================
+use "hw_types.zr"
+
+fn dbg_putc(ch: u8) i64 {
+    if qemu_debug == 1 {
+        debug_con.write(ch)
+    }
+    return 0
+}
+
+fn dbg_str(s: str) i64 {
+    if qemu_debug == 1 {
+        for ch in s {
+            debug_con.write(ch)
+        }
+    }
+    return 0
+}
+
+fn dbg_hex_nibble(v: u64) u8 => "0123456789ABCDEF"[v[3:0]]
+
+fn dbg_hex32(v: u64) i64 {
+    if qemu_debug == 1 {
+        dbg_str("0x")
+        sh: i64 = 28
+        loop <max: 8 | until: sh < 0> {
+            u_sh: u64 = sh
+            debug_con.write(dbg_hex_nibble(v >> u_sh))
+            sh -= 4
+        }
+    }
+    return 0
+}
+
+fn dbg_u32_dec(val: u64) i64 {
+    if qemu_debug == 1 {
+        if val == 0 {
+            debug_con.write('0')
+            return 0
+        }
+        div_u: u64 = 1000000000
+        started: u64 = 0
+        v: u64 = val
+        loop <max: 10 | until: div_u == 0> {
+            dig: u64 = v / div_u
+            v %= div_u
+            if dig != 0 || started == 1 {
+                debug_con.write(48 + dig)
+                started = 1
+            }
+            div_u /= 10
+        }
+    }
+    return 0
+}

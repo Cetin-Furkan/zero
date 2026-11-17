@@ -1,0 +1,229 @@
+// =============================================================================
+// ZeroOS Gate-1b MADT + `x2APIC` Multi-Core Bring-Up (`os/smp_madt.zr`)
+// =============================================================================
+use "hw_types.zr"
+use "paging_wx.zr"
+use "reactor_fabric.zr"
+
+fn enable_x2apic_and_id() u32 {
+    apic_base: u64 = @msr_read(IA32_APIC_BASE_MSR)
+    @msr_write(IA32_APIC_BASE_MSR, apic_base | 0xC00)
+    sivr: u64 = @msr_read(X2APIC_SIVR_MSR)
+    @msr_write(X2APIC_SIVR_MSR, sivr | 0x1FF)
+    id64: u64 = @msr_read(X2APIC_ID_MSR)
+    id32: u32 = id64
+    return id32
+}
+
+fn delay_tsc(ticks: u64) i64 {
+    t0: u64 = @rdtsc()
+    elapsed: u64 = 0
+    loop <max: 1000000000 | until: elapsed >= ticks> {
+        @pause()
+        elapsed = @rdtsc() - t0
+    }
+    return 0
+}
+
+fn read_u32_le(s: bytes, off: u64) u32 {
+    b0: u32 = s[off]
+    b1: u32 = s[off + 1]
+    b2: u32 = s[off + 2]
+    b3: u32 = s[off + 3]
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn try_register_ap(apic_id: u32, cur_count: u64) u64 {
+    if cur_count >= MAX_CORES {
+        return cur_count
+    }
+    for i in 0..cur_count {
+        ui: u64 = i
+        if core_apic_expected[ui] == apic_id {
+            return cur_count
+        }
+    }
+    core_apic_expected[cur_count] = apic_id
+    return cur_count + 1
+}
+
+// 64-bit Ring-0 entry executed by each awakened Application Processor (`slot = 1..15`)
+fn ap_main(slot: u64) i64 {
+    @cli()
+    setup_core_gdt_and_tss(slot)
+    @lidt(idt_slab.base, 4095)
+
+    cr0: u64 = @cr_read(0)
+    u_em_mask: u64 = 4
+    @cr_write(0, (cr0 & ~u_em_mask) | 0x10022)
+
+    cr4: u64 = @cr_read(4)
+    @cr_write(4, cr4 | 0x470600)
+    @wrpkru(0)
+    @xsetbv(0, 0xE7)
+    @msr_write(IA32_PAT_MSR, PAT_PA1_WC_VALUE)
+
+    hw_apic: u32 = enable_x2apic_and_id()
+    core_apic_hw[slot] = hw_apic
+
+    // Hardware atomic & volatile MMIO synchronization (`xchg` + `pause`)
+    ready_atom := @atomic<u64>(ap_mbox.base + 24)
+    rel_mmio   := @mmio<u64>(ap_mbox.base + 32)
+    ack_atom   := @atomic<u64>(core_release_ack.base + slot * 8)
+
+    ready_atom.store(1)
+    loop <max: 1000000000000 | until: rel_mmio.read() != 0> {
+        @pause()
+    }
+    ack_atom.store(1)
+    reactor_worker_entry(slot)
+    @halt()
+    return 0
+}
+
+fn bring_up_madt_cores(handoff: @BootHandoff) u64 {
+    bsp_apic: u32 = enable_x2apic_and_id()
+    core_apic_expected[0] = bsp_apic
+    core_apic_hw[0]       = bsp_apic
+    core_release_ack[0]   = 1
+
+    if handoff.madt == 0 || handoff.ap_trampoline == 0 || handoff.ap_stack_base == 0 {
+        handoff.core_count = 1
+        return 1
+    }
+
+    hdr := @view<AcpiSdtHeader>(handoff.madt)
+    madt_len: u64 = hdr.length
+    if hdr.signature != MADT_SIG || madt_len < 44 {
+        handoff.core_count = 1
+        return 1
+    }
+
+    raw := @view<u8>(handoff.madt, madt_len)
+    expected_cores: u64 = 1
+    off: u64 = 44
+    loop <max: 4096 | until: off + 2 > madt_len> {
+        rec_type: u64 = raw[off]
+        rec_len:  u64 = raw[off + 1]
+        if rec_len < 2 || off + rec_len > madt_len {
+            break
+        }
+        match rec_type {
+            0 => {
+                if rec_len >= 8 {
+                    apic_id: u32 = raw[off + 3]
+                    flags:   u32 = read_u32_le(raw, off + 4)
+                    if flags[0:0] != 0 || flags[1:0] == 2 {
+                        expected_cores = try_register_ap(apic_id, expected_cores)
+                    }
+                }
+            }
+            9 => {
+                if rec_len >= 16 {
+                    x2_id: u32 = read_u32_le(raw, off + 4)
+                    flags: u32 = read_u32_le(raw, off + 8)
+                    if flags[0:0] != 0 || flags[1:0] == 2 {
+                        expected_cores = try_register_ap(x2_id, expected_cores)
+                    }
+                }
+            }
+            _ => {}
+        }
+        off += rec_len
+    }
+
+    if expected_cores <= 1 {
+        handoff.core_count = 1
+        return 1
+    }
+
+    tsc_ms: u64 = handoff.tsc_per_ms
+    if tsc_ms < 100000 {
+        tsc_ms = 2000000
+    }
+    vec: u64 = handoff.ap_trampoline[19:12]
+    mbox := @mmio<u64>(ap_mbox.base, 8)
+    ready_atom := @atomic<u64>(ap_mbox.base + 24)
+    online_cores: u64 = 1
+
+    for s in 1..expected_cores {
+        slot: u64 = s
+        target_apic: u64 = core_apic_expected[slot]
+        core_apic_hw[slot]     = 0xFFFFFFFF
+        core_release_ack[slot] = 0
+
+        bsp_loc := @view<ReactorLocal>(@local_base())
+        ap_loc_addr: u64 = @local_base() + slot * 64
+        ap_loc := @view<ReactorLocal>(ap_loc_addr)
+        ap_loc.fault             = 0
+        ap_loc.tile_depth        = 0
+        ap_loc.if_before_tile    = 0
+        ap_loc.inbox_seq         = 0
+        ap_loc.mwait_capable     = bsp_loc.mwait_capable
+        ap_loc.movdir64b_capable = bsp_loc.movdir64b_capable
+        ap_loc.wake_count        = 0
+        ap_loc.last_latency_tsc  = 0
+
+        mbox[0] = slot
+        mbox[1] = handoff.ap_stack_base + slot * 16384
+        mbox[2] = 0
+        mbox[5] = ap_loc_addr
+        ready_atom.store(0)
+
+        @msr_write(X2APIC_ESR_MSR, 0)
+        @msr_write(X2APIC_ICR_MSR, (target_apic << 32) | 0x4500)
+        delay_tsc(tsc_ms * 10)
+
+        @msr_write(X2APIC_ESR_MSR, 0)
+        @msr_write(X2APIC_ICR_MSR, (target_apic << 32) | 0x4600 | vec)
+
+        wait_250us: u64 = tsc_ms / 4
+        if wait_250us < 50000 {
+            wait_250us = 50000
+        }
+        t_sipi: u64 = @rdtsc()
+        el_s: u64 = 0
+        loop <max: 100000000 | until: mbox[2] != 0 || el_s >= wait_250us> {
+            @pause()
+            el_s = @rdtsc() - t_sipi
+        }
+        if mbox[2] == 0 {
+            @msr_write(X2APIC_ESR_MSR, 0)
+            @msr_write(X2APIC_ICR_MSR, (target_apic << 32) | 0x4600 | vec)
+        }
+
+        wait_rdy: u64 = tsc_ms * 100
+        t_rdy: u64 = @rdtsc()
+        el_r: u64 = 0
+        loop <max: 1000000000 | until: ready_atom.load() != 0 || el_r >= wait_rdy> {
+            @pause()
+            el_r = @rdtsc() - t_rdy
+        }
+        if ready_atom.load() == 0 || core_apic_hw[slot] != core_apic_expected[slot] {
+            @halt()
+        }
+        online_cores += 1
+    }
+
+    // Release all parked APs via `xchg` on `BootHandoff.ap_release` & verify ACKs
+    handoff.core_count = online_cores
+    rel_atom := @atomic<u64>(handoff.ap_release)
+    rel_atom.store(1)
+
+    for s in 1..online_cores {
+        slot: u64 = s
+        ack_atom := @atomic<u64>(core_release_ack.base + slot * 8)
+        wait_ack: u64 = tsc_ms * 50
+        t_ack: u64 = @rdtsc()
+        el_a: u64 = 0
+        loop <max: 1000000000 | until: ack_atom.load() == 1 || el_a >= wait_ack> {
+            @pause()
+            el_a = @rdtsc() - t_ack
+        }
+        if ack_atom.load() != 1 {
+            @halt()
+        }
+    }
+
+    return online_cores
+}

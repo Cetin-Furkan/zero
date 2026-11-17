@@ -1,0 +1,462 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — x86-64 Code Emitter (`compiler/emit_x64.zr`)
+// =============================================================================
+
+fn emit_u8(b: i64) {
+    off := g[G_CODE_OFF]
+    out_buf[off] = b & 0xFF
+    g[G_CODE_OFF] = off + 1
+}
+
+fn emit_u16(w: i64) {
+    emit_u8(w & 0xFF)
+    emit_u8((w >> 8) & 0xFF)
+}
+
+fn emit_u32(d: i64) {
+    emit_u8(d & 0xFF)
+    emit_u8((d >> 8) & 0xFF)
+    emit_u8((d >> 16) & 0xFF)
+    emit_u8((d >> 24) & 0xFF)
+}
+
+fn emit_u64(q: i64) {
+    emit_u32(q)
+    emit_u32(q >> 32)
+}
+
+fn patch_u32_at(pos: i64, val: i64) {
+    out_buf[pos + 0] = val & 0xFF
+    out_buf[pos + 1] = (val >> 8) & 0xFF
+    out_buf[pos + 2] = (val >> 16) & 0xFF
+    out_buf[pos + 3] = (val >> 24) & 0xFF
+}
+
+fn patch_u64_at(pos: i64, val: i64) {
+    patch_u32_at(pos, val)
+    patch_u32_at(pos + 4, val >> 32)
+}
+
+fn emit_mov_rax_imm64(val: i64) {
+    if val == 0 {
+        emit_u8(0x31)
+        emit_u8(0xC0)   // xor eax, eax
+        return
+    }
+    u: u64 = val
+    if (u >> 32) == 0 {
+        emit_u8(0xB8)   // mov eax, imm32 (zero-extends to 64-bit)
+        emit_u32(val)
+        return
+    }
+    emit_u8(0x48)
+    emit_u8(0xB8)       // movabs rax, imm64
+    emit_u64(val)
+}
+
+fn emit_mov_rcx_imm64(val: i64) {
+    emit_u8(0x48)
+    emit_u8(0xB9)       // movabs rcx, imm64
+    emit_u64(val)
+}
+
+// --- Frame-Allocated Temporaries & `[rbp + disp]` Local Accessors ---
+
+fn alloc_temp_qword() i64 {
+    g[G_TEMP_DEPTH] += 1
+    total := g[G_FRAME_QW] + g[G_TEMP_DEPTH]
+    if total > g[G_MAX_FRAME_QW] {
+        g[G_MAX_FRAME_QW] = total
+    }
+    return -(total * 8)
+}
+
+fn free_temp_qwords(cnt: i64) {
+    g[G_TEMP_DEPTH] -= cnt
+}
+
+fn alloc_anon_qwords(cnt: i64) i64 {
+    cur := g[G_FRAME_QW] + g[G_TEMP_DEPTH] + cnt
+    g[G_FRAME_QW] = cur
+    if cur > g[G_MAX_FRAME_QW] {
+        g[G_MAX_FRAME_QW] = cur
+    }
+    return -(cur * 8)
+}
+
+fn emit_load_local(disp: i64) {
+    if disp >= -128 && disp <= 127 {
+        emit_u8(0x48)
+        emit_u8(0x8B)
+        emit_u8(0x45)
+        emit_u8(disp)
+    } else {
+        emit_u8(0x48)
+        emit_u8(0x8B)
+        emit_u8(0x85)
+        emit_u32(disp)
+    }
+}
+
+fn emit_load_local_rcx(disp: i64) {
+    if disp >= -128 && disp <= 127 {
+        emit_u8(0x48)
+        emit_u8(0x8B)
+        emit_u8(0x4D)
+        emit_u8(disp)
+    } else {
+        emit_u8(0x48)
+        emit_u8(0x8B)
+        emit_u8(0x8D)
+        emit_u32(disp)
+    }
+}
+
+fn emit_store_local(disp: i64) {
+    if disp >= -128 && disp <= 127 {
+        emit_u8(0x48)
+        emit_u8(0x89)
+        emit_u8(0x45)
+        emit_u8(disp)
+    } else {
+        emit_u8(0x48)
+        emit_u8(0x89)
+        emit_u8(0x85)
+        emit_u32(disp)
+    }
+}
+
+fn emit_lea_local(disp: i64) {
+    if disp >= -128 && disp <= 127 {
+        emit_u8(0x48)
+        emit_u8(0x8D)
+        emit_u8(0x45)
+        emit_u8(disp)
+    } else {
+        emit_u8(0x48)
+        emit_u8(0x8D)
+        emit_u8(0x85)
+        emit_u32(disp)
+    }
+}
+
+// --- Relative Branches & Patch Chains ---
+
+fn emit_jmp_rel32() i64 {
+    emit_u8(0xE9)
+    pos := g[G_CODE_OFF]
+    emit_u32(0)
+    return pos
+}
+
+fn emit_jz_rel32() i64 {
+    emit_u8(0x48)
+    emit_u8(0x85)
+    emit_u8(0xC0)       // test rax, rax
+    emit_u8(0x0F)
+    emit_u8(0x84)       // jz rel32
+    pos := g[G_CODE_OFF]
+    emit_u32(0)
+    return pos
+}
+
+fn emit_jnz_rel32() i64 {
+    emit_u8(0x48)
+    emit_u8(0x85)
+    emit_u8(0xC0)       // test rax, rax
+    emit_u8(0x0F)
+    emit_u8(0x85)       // jnz rel32
+    pos := g[G_CODE_OFF]
+    emit_u32(0)
+    return pos
+}
+
+fn patch_rel32_here(pos: i64) {
+    disp_rel := g[G_CODE_OFF] - (pos + 4)
+    patch_u32_at(pos, disp_rel)
+}
+
+fn emit_jmp_to(target_off: i64) {
+    emit_u8(0xE9)
+    disp_rel := target_off - (g[G_CODE_OFF] + 4)
+    emit_u32(disp_rel)
+}
+
+fn emit_call_direct_off(target_off: i64) {
+    emit_u8(0xE8)
+    disp_rel := target_off - (g[G_CODE_OFF] + 4)
+    emit_u32(disp_rel)
+}
+
+fn emit_call_fn_idx(fn_idx: i64) {
+    emit_u8(0xE8)
+    fx := g[G_CALL_FIX_CNT]
+    call_fix_off[fx] = g[G_CODE_OFF]
+    call_fix_fn[fx]  = fn_idx
+    g[G_CALL_FIX_CNT] = fx + 1
+    emit_u32(0)
+}
+
+fn push_patch_node(head: i64, pos: i64) i64 {
+    idx := g[G_PATCH_CNT]
+    patch_loc[idx]  = pos
+    patch_next[idx] = head
+    g[G_PATCH_CNT] = idx + 1
+    return idx
+}
+
+fn resolve_patch_chain(head: i64) {
+    cur := head
+    loop <max: 8192 | until: cur < 0> {
+        patch_rel32_here(patch_loc[cur])
+        cur = patch_next[cur]
+    }
+}
+
+// --- Type Width Helpers, Narrow Truncation, & Memory Load/Store ---
+
+fn is_ty_unsigned(ty: i64) i64 {
+    if (ty & TY_FLAG_VIEW1) != 0 { return 1 }
+    if (ty & TY_FLAG_SPAN) != 0  { return 1 }
+    base := ty & TY_BASE_MASK
+    if base == TY_U64 || base == TY_U32 || base == TY_U16 || base == TY_U8 {
+        return 1
+    }
+    if base >= TY_BP_BASE {
+        return 1
+    }
+    return 0
+}
+
+fn ty_byte_size(ty: i64) i64 {
+    if (ty & TY_FLAG_SPAN) != 0  { return 16 }
+    if (ty & TY_FLAG_VIEW1) != 0 { return 8 }
+    base := ty & TY_BASE_MASK
+    if base == TY_U8  || base == TY_I8  { return 1 }
+    if base == TY_U16 || base == TY_I16 { return 2 }
+    if base == TY_U32 || base == TY_I32 { return 4 }
+    if base >= TY_BP_BASE {
+        return bp_bytes[base - TY_BP_BASE]
+    }
+    return 8
+}
+
+fn emit_narrow_rax(ty: i64) {
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_SPAN)) != 0 { return }
+    base := ty & TY_BASE_MASK
+    if base >= TY_BP_BASE {
+        bsz: i64 = bp_bytes[base - TY_BP_BASE]
+        if bsz == 1 { base = TY_U8 }
+        if bsz == 2 { base = TY_U16 }
+        if bsz == 4 { base = TY_U32 }
+        if bsz == 8 { return }
+    }
+    if base == TY_U8  { emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0xC0)  return }
+    if base == TY_I8  { emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBE)  emit_u8(0xC0)  return }
+    if base == TY_U16 { emit_u8(0x0F)  emit_u8(0xB7)  emit_u8(0xC0)  return }
+    if base == TY_I16 { emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBF)  emit_u8(0xC0)  return }
+    if base == TY_U32 { emit_u8(0x89)  emit_u8(0xC0)  return }
+    if base == TY_I32 { emit_u8(0x48)  emit_u8(0x63)  emit_u8(0xC0)  return }
+}
+
+fn emit_load_mem_typed(ty: i64) {
+    if (ty & TY_FLAG_VIEW1) != 0 {
+        emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x00)
+        return
+    }
+    base := ty & TY_BASE_MASK
+    if base >= TY_BP_BASE {
+        bsz: i64 = bp_bytes[base - TY_BP_BASE]
+        if bsz == 1 { base = TY_U8 }
+        if bsz == 2 { base = TY_U16 }
+        if bsz == 4 { base = TY_U32 }
+        if bsz == 8 { base = TY_U64 }
+    }
+    if base == TY_U8  { emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0x00)  return }
+    if base == TY_I8  { emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBE)  emit_u8(0x00)  return }
+    if base == TY_U16 { emit_u8(0x0F)  emit_u8(0xB7)  emit_u8(0x00)  return }
+    if base == TY_I16 { emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBF)  emit_u8(0x00)  return }
+    if base == TY_U32 { emit_u8(0x8B)  emit_u8(0x00)  return }
+    if base == TY_I32 { emit_u8(0x48)  emit_u8(0x63)  emit_u8(0x00)  return }
+    emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x00)
+}
+
+fn emit_store_mem_typed(ty: i64) {
+    if (ty & TY_FLAG_VIEW1) != 0 {
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x01)
+        return
+    }
+    base := ty & TY_BASE_MASK
+    if base >= TY_BP_BASE {
+        bsz: i64 = bp_bytes[base - TY_BP_BASE]
+        if bsz == 1 { base = TY_U8 }
+        if bsz == 2 { base = TY_U16 }
+        if bsz == 4 { base = TY_U32 }
+        if bsz == 8 { base = TY_U64 }
+    }
+    if base == TY_U8  || base == TY_I8  { emit_u8(0x88)  emit_u8(0x01)  return }
+    if base == TY_U16 || base == TY_I16 { emit_u8(0x66)  emit_u8(0x89)  emit_u8(0x01)  return }
+    if base == TY_U32 || base == TY_I32 { emit_u8(0x89)  emit_u8(0x01)  return }
+    emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x01)
+}
+
+// --- Target-Aware Scalar Fault Word & `<tile>` Unwind (`ELF64` vs `--target=capsule`) ---
+
+fn emit_tile_enter_seq() {
+    // cmp qword [gs:8], 0; jne +18; pushfq; pop rax; shr eax, 9; and eax, 1; mov [gs:16], rax; cli; inc qword [gs:8]
+    emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x83)  emit_u8(0x3C)  emit_u8(0x25)
+    emit_u32(8)    emit_u8(0)
+    emit_u8(0x75)  emit_u8(0x12)
+    emit_u8(0x9C)  emit_u8(0x58)
+    emit_u8(0xC1)  emit_u8(0xE8)  emit_u8(9)
+    emit_u8(0x83)  emit_u8(0xE0)  emit_u8(1)
+    emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x04)  emit_u8(0x25)
+    emit_u32(16)
+    emit_u8(0xFA)
+    emit_u8(0x65)  emit_u8(0x48)  emit_u8(0xFF)  emit_u8(0x04)  emit_u8(0x25)
+    emit_u32(8)
+}
+
+fn emit_tile_unwind_count(cnt: i64) {
+    if cnt <= 0 { return }
+    // sub qword [gs:8], cnt; jnz +13; cmp qword [gs:16], 0; je +1; sti
+    emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x83)  emit_u8(0x2C)  emit_u8(0x25)
+    emit_u32(8)    emit_u8(cnt & 0xFF)
+    emit_u8(0x75)  emit_u8(0x0D)
+    emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x83)  emit_u8(0x3C)  emit_u8(0x25)
+    emit_u32(16)   emit_u8(0)
+    emit_u8(0x74)  emit_u8(0x01)
+    emit_u8(0xFB)
+}
+
+fn emit_fault_store_imm(code: i64) {
+    if g[G_MODE_CAPSULE] == 1 {
+        emit_u8(0x65)  emit_u8(0x48)  emit_u8(0xC7)  emit_u8(0x04)  emit_u8(0x25)
+        emit_u32(0)
+        emit_u32(code)
+    } else {
+        emit_u8(0xBA)  emit_u32(ELF_DATA_BASE)
+        emit_u8(0x48)  emit_u8(0xC7)  emit_u8(0x02)
+        emit_u32(code)
+    }
+}
+
+fn emit_fault_store_rax() {
+    if g[G_MODE_CAPSULE] == 1 {
+        emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x04)  emit_u8(0x25)
+        emit_u32(0)
+    } else {
+        emit_u8(0xB9)  emit_u32(ELF_DATA_BASE)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x01)
+    }
+}
+
+fn emit_fault_cmp_zero() {
+    if g[G_MODE_CAPSULE] == 1 {
+        emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x83)  emit_u8(0x3C)  emit_u8(0x25)
+        emit_u32(0)    emit_u8(0)
+    } else {
+        emit_u8(0xB9)  emit_u32(ELF_DATA_BASE)
+        emit_u8(0x48)  emit_u8(0x83)  emit_u8(0x39)  emit_u8(0)
+    }
+}
+
+fn emit_fault_take_rax() {
+    if g[G_MODE_CAPSULE] == 1 {
+        emit_u8(0x65)  emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x04)  emit_u8(0x25)
+        emit_u32(0)
+        emit_u8(0x65)  emit_u8(0x48)  emit_u8(0xC7)  emit_u8(0x04)  emit_u8(0x25)
+        emit_u32(0)    emit_u32(0)
+    } else {
+        emit_u8(0xB9)  emit_u32(ELF_DATA_BASE)
+        emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x01)
+        emit_u8(0x31)  emit_u8(0xD2)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x11)
+    }
+}
+
+fn emit_unwind_or_return_fault() {
+    rd := g[G_REC_DEPTH]
+    if rd > 0 {
+        top := rd - 1
+        emit_tile_unwind_count(g[G_TILE_DEPTH] - rec_tile_base[top])
+        jpos := emit_jmp_rel32()
+        rec_jmp_head[top] = push_patch_node(rec_jmp_head[top], jpos)
+    } else {
+        emit_tile_unwind_count(g[G_TILE_DEPTH])
+        emit_u8(0x31)  emit_u8(0xC0)   // xor eax, eax
+        emit_u8(0xC9)  emit_u8(0xC3)   // leave; ret
+    }
+}
+
+fn emit_raise_fault_imm(code: i64) {
+    emit_fault_store_imm(code)
+    emit_unwind_or_return_fault()
+}
+
+fn emit_check_call_fault() {
+    emit_fault_cmp_zero()
+    emit_u8(0x0F)  emit_u8(0x84)       // jz .ok
+    ok_pos := g[G_CODE_OFF]
+    emit_u32(0)
+    emit_unwind_or_return_fault()
+    patch_rel32_here(ok_pos)
+}
+
+fn emit_move_rax_to_arg3() {
+    if g[G_MODE_CAPSULE] == 1 {
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC2) // mov r10, rax (Reactor ABI)
+    } else {
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC1) // mov rcx, rax (abi-host)
+    }
+}
+
+// --- Inline Position-Independent String Span & Host `.rodata` Write ---
+
+fn emit_str_literal_expr(pool_off: i64, slen: i64) {
+    slot := alloc_anon_qwords(2)
+    if slen > 0 {
+        emit_u8(0xE9)
+        emit_u32(slen)
+        for i in 0..slen {
+            emit_u8(str_pool[pool_off + i])
+        }
+        // lea rax, [rip - (slen + 7)]
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x05)
+        emit_u32(-(slen + 7))
+        emit_store_local(slot)
+        emit_mov_rax_imm64(slen)
+        emit_store_local(slot + 8)
+    } else {
+        emit_mov_rax_imm64(1)
+        emit_store_local(slot)
+        emit_mov_rax_imm64(0)
+        emit_store_local(slot + 8)
+    }
+    emit_lea_local(slot)
+    g[G_LAST_EXPR_TY] = TY_U8 | TY_FLAG_SPAN
+}
+
+fn emit_write_ro_slice(pool_off: i64, slen: i64, add_nl: i64) {
+    total_len := slen + add_nl
+    if total_len == 0 { return }
+    ro_start := g[G_TGT_RO_OFF]
+    for i in 0..slen {
+        tgt_ro_buf[ro_start + i] = str_pool[pool_off + i]
+    }
+    if add_nl == 1 {
+        tgt_ro_buf[ro_start + slen] = 10
+    }
+    g[G_TGT_RO_OFF] = ro_start + total_len
+
+    emit_u8(0xB8)  emit_u32(1)          // mov eax, 1 (SYS_WRITE)
+    emit_u8(0xBF)  emit_u32(1)          // mov edi, 1 (stdout)
+    emit_u8(0xBE)                       // mov esi, <rodata_vaddr>
+    fx := g[G_RO_FIX_CNT]
+    ro_fix_code[fx] = g[G_CODE_OFF]
+    ro_fix_off[fx]  = ro_start
+    g[G_RO_FIX_CNT] = fx + 1
+    emit_u32(0)
+    emit_u8(0xBA)  emit_u32(total_len)  // mov edx, len
+    emit_u8(0x0F)  emit_u8(0x05)        // syscall
+}

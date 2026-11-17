@@ -1,0 +1,1189 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — Types, Constants, & Expressions (`compiler/parser_expr.zr`)
+// =============================================================================
+
+fn peek_kind() i64 => tok_kind[g[G_TOK_IDX]]
+fn peek_kw() i64   => tok_kw[g[G_TOK_IDX]]
+fn peek_val() i64  => tok_val[g[G_TOK_IDX]]
+fn peek_aux() i64  => tok_aux[g[G_TOK_IDX]]
+fn peek_line() i64 => tok_line[g[G_TOK_IDX]]
+
+fn expect_kind(k: i64) {
+    if peek_kind() != k {
+        die_cur("error: parse fault (unexpected token)")
+    }
+    g[G_TOK_IDX] += 1
+}
+
+fn expect_kw(kw: i64) {
+    if peek_kind() != TOK_KW || peek_kw() != kw {
+        die_cur("error: parse fault (unexpected keyword)")
+    }
+    g[G_TOK_IDX] += 1
+}
+
+fn expect_ident() i64 {
+    if peek_kind() != TOK_IDENT {
+        die_cur("error: parse fault (expected identifier)")
+    }
+    id := peek_val()
+    g[G_TOK_IDX] += 1
+    return id
+}
+
+// --- Lookup Helpers (`const`, `bitpack`, `@slab`/`@arena`, `fn`, `local`) ---
+
+fn find_const(sym: i64) i64 {
+    cnt := g[G_CST_CNT]
+    for i in 0..cnt {
+        if cst_sym[i] == sym { return i }
+    }
+    return -1
+}
+
+fn find_bitpack(sym: i64) i64 {
+    cnt := g[G_BP_CNT]
+    for i in 0..cnt {
+        if bp_sym[i] == sym { return i }
+    }
+    return -1
+}
+
+fn find_bp_field(bp_idx: i64, fld_sym: i64) i64 {
+    fstart: i64 = bp_fstart[bp_idx]
+    fcnt: i64   = bp_fcnt[bp_idx]
+    for i in 0..fcnt {
+        if bpf_sym[fstart + i] == fld_sym {
+            return fstart + i
+        }
+    }
+    return -1
+}
+
+fn find_space(sym: i64) i64 {
+    cnt := g[G_SP_CNT]
+    for i in 0..cnt {
+        if sp_sym[i] == sym { return i }
+    }
+    return -1
+}
+
+fn find_or_add_fn(sym: i64) i64 {
+    cnt := g[G_FN_CNT]
+    for i in 0..cnt {
+        if fn_sym[i] == sym { return i }
+    }
+    fn_sym[cnt]     = sym
+    fn_defined[cnt] = 0
+    fn_ret_ty[cnt]  = TY_VOID
+    fn_arity[cnt]   = 0
+    g[G_FN_CNT]     = cnt + 1
+    return cnt
+}
+
+fn find_local(sym: i64) i64 {
+    i := g[G_LOC_CNT] - 1
+    loop <max: 2048 | until: i < 0> {
+        if loc_sym[i] == sym { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn alloc_local(sym: i64, ty: i64, line: i64) i64 {
+    // Reject duplicate declaration in the same lexical `{}` block
+    cur_depth := g[G_SCOPE_DEPTH]
+    i := g[G_LOC_CNT] - 1
+    loop <max: 2048 | until: i < 0> {
+        if loc_depth[i] < cur_depth { break }
+        if loc_sym[i] == sym {
+            die_line("error: duplicate variable in same block", line)
+        }
+        i -= 1
+    }
+
+    qwords: i64 = 1
+    if (ty & TY_FLAG_SPAN) != 0 { qwords = 2 }
+    disp := alloc_anon_qwords(qwords)
+
+    idx := g[G_LOC_CNT]
+    loc_sym[idx]   = sym
+    loc_ty[idx]    = ty
+    loc_disp[idx]  = disp
+    loc_depth[idx] = cur_depth
+    g[G_LOC_CNT]   = idx + 1
+    return disp
+}
+
+// --- Builtin & User Type Parser ---
+
+fn sym_eq_str(sym: i64, s: str) i64 {
+    slen: i64 = sym_len[sym]
+    if slen != s.len { return 0 }
+    soff: i64 = sym_off[sym]
+    for i in 0..slen {
+        if str_pool[soff + i] != s[i] { return 0 }
+    }
+    return 1
+}
+
+fn parse_type_tag() i64 {
+    // `!Fault` error-returning scalar shorthand -> `TY_I64`
+    if peek_kind() == TOK_BANG {
+        g[G_TOK_IDX] += 1
+        expect_ident()
+        return TY_I64
+    }
+    // `[]T` bounded span
+    if peek_kind() == TOK_LBRACK {
+        g[G_TOK_IDX] += 1
+        expect_kind(TOK_RBRACK)
+        elem := parse_type_tag()
+        return (elem & TY_BASE_MASK) | TY_FLAG_SPAN
+    }
+    // `@T` single overlay pointer
+    if peek_kind() == TOK_AT {
+        g[G_TOK_IDX] += 1
+        elem := parse_type_tag()
+        return (elem & TY_BASE_MASK) | TY_FLAG_VIEW1
+    }
+
+    sym := expect_ident()
+    if sym_eq_str(sym, "i64") == 1   { return TY_I64 }
+    if sym_eq_str(sym, "u64") == 1   { return TY_U64 }
+    if sym_eq_str(sym, "i32") == 1   { return TY_I32 }
+    if sym_eq_str(sym, "u32") == 1   { return TY_U32 }
+    if sym_eq_str(sym, "i16") == 1   { return TY_I16 }
+    if sym_eq_str(sym, "u16") == 1   { return TY_U16 }
+    if sym_eq_str(sym, "i8") == 1    { return TY_I8 }
+    if sym_eq_str(sym, "u8") == 1    { return TY_U8 }
+    if sym_eq_str(sym, "str") == 1   { return TY_U8 | TY_FLAG_SPAN }
+    if sym_eq_str(sym, "bytes") == 1 { return TY_U8 | TY_FLAG_SPAN }
+
+    bp := find_bitpack(sym)
+    if bp >= 0 {
+        return TY_BP_BASE + bp
+    }
+    die_cur("error: unknown type")
+    return TY_I64
+}
+
+fn parse_bitwidth_ident(sym: i64) i64 {
+    slen: i64 = sym_len[sym]
+    soff: i64 = sym_off[sym]
+    if slen < 2 || str_pool[soff] != 'u' {
+        die_cur("error: expected u1..u64 width in bit-layout")
+    }
+    w: i64 = 0
+    for i in 1..slen {
+        c: u8 = str_pool[soff + i]
+        if c < '0' || c > '9' {
+            die_cur("error: invalid bit-layout width")
+        }
+        w = w * 10 + (c - '0')
+    }
+    if w < 1 || w > 64 {
+        die_cur("error: bit-layout field width out of 1..64")
+    }
+    return w
+}
+
+// --- Compile-Time Constant Expression Evaluator (`NAME :: expr`) ---
+
+fn const_prec(k: i64) i64 {
+    if k == TOK_PIPE    { return 1 }
+    if k == TOK_CARET   { return 2 }
+    if k == TOK_AMP     { return 3 }
+    if k == TOK_SHL || k == TOK_SHR || k == TOK_ROL || k == TOK_ROR { return 4 }
+    if k == TOK_PLUS || k == TOK_MINUS { return 5 }
+    if k == TOK_STAR || k == TOK_SLASH || k == TOK_PERCENT { return 6 }
+    return 0
+}
+
+fn eval_const_unary() i64 {
+    k := peek_kind()
+    if k == TOK_MINUS {
+        g[G_TOK_IDX] += 1
+        return -eval_const_unary()
+    }
+    if k == TOK_TILDE {
+        g[G_TOK_IDX] += 1
+        return ~eval_const_unary()
+    }
+    if k == TOK_LPAREN {
+        g[G_TOK_IDX] += 1
+        v := eval_const_expr(1)
+        expect_kind(TOK_RPAREN)
+        return v
+    }
+    if k == TOK_INT || k == TOK_CHAR {
+        v := peek_val()
+        g[G_TOK_IDX] += 1
+        return v
+    }
+    if k == TOK_AT {
+        g[G_TOK_IDX] += 1
+        isym := expect_ident()
+        if isym == g[G_SYM_SIZEOF] {
+            expect_kind(TOK_LPAREN)
+            ty := parse_type_tag()
+            expect_kind(TOK_RPAREN)
+            return ty_byte_size(ty)
+        }
+        if isym == g[G_SYM_ALIGNOF] {
+            expect_kind(TOK_LPAREN)
+            ty := parse_type_tag()
+            expect_kind(TOK_RPAREN)
+            sz := ty_byte_size(ty)
+            if sz > 8 { return 8 }
+            return sz
+        }
+        die_cur("error: unsupported @ intrinsic in constant expression")
+    }
+    if k == TOK_IDENT {
+        sym := expect_ident()
+        ci := find_const(sym)
+        if ci < 0 {
+            die_cur("error: undefined constant identifier")
+        }
+        if cst_done[ci] == 0 {
+            if g[G_CST_TRIAL] == 1 {
+                g[G_CST_UNRES] = 1
+                return 0
+            }
+            die_cur("error: unresolved or cyclic constant")
+        }
+        return cst_val[ci]
+    }
+    die_cur("error: invalid constant expression")
+    return 0
+}
+
+fn eval_const_expr(min_prec: i64) i64 {
+    lhs := eval_const_unary()
+    loop <max: 1024 | until: 0 == 1> {
+        op := peek_kind()
+        prec := const_prec(op)
+        if prec < min_prec { break }
+        g[G_TOK_IDX] += 1
+        rhs := eval_const_expr(prec + 1)
+        if op == TOK_PLUS    { lhs = lhs + rhs }
+        if op == TOK_MINUS   { lhs = lhs - rhs }
+        if op == TOK_STAR    { lhs = lhs * rhs }
+        if op == TOK_SLASH {
+            if rhs == 0 {
+                if g[G_CST_TRIAL] == 1 { return 0 }
+                die_cur("error: division by zero in constant")
+            }
+            lhs = lhs / rhs
+        }
+        if op == TOK_PERCENT {
+            if rhs == 0 {
+                if g[G_CST_TRIAL] == 1 { return 0 }
+                die_cur("error: remainder by zero in constant")
+            }
+            lhs = lhs % rhs
+        }
+        if op == TOK_SHL   { lhs = lhs << rhs }
+        if op == TOK_SHR   { lhs = lhs >> rhs }
+        if op == TOK_ROL   { lhs = lhs <<< rhs }
+        if op == TOK_ROR   { lhs = lhs >>> rhs }
+        if op == TOK_AMP   { lhs = lhs & rhs }
+        if op == TOK_PIPE  { lhs = lhs | rhs }
+        if op == TOK_CARET { lhs = lhs ^ rhs }
+    }
+    return lhs
+}
+
+// --- Context-Exact `< ... >` Clause Delimiter Helpers (§5.4) ---
+
+fn is_descriptor_lt_at(idx: i64) i64 {
+    if tok_kind[idx] != TOK_LT { return 0 }
+    k1 := tok_kind[idx + 1]
+    if k1 != TOK_IDENT && k1 != TOK_KW { return 0 }
+    k2 := tok_kind[idx + 2]
+    if k2 == TOK_COLON || k2 == TOK_PIPE { return 1 }
+    if k2 == TOK_GT && tok_kind[idx + 3] == TOK_LBRACE { return 1 }
+    return 0
+}
+
+fn is_field_sep_pipe_at(idx: i64) i64 {
+    if tok_kind[idx] == TOK_PIPE && tok_kind[idx + 1] == TOK_IDENT && tok_kind[idx + 2] == TOK_COLON {
+        return 1
+    }
+    return 0
+}
+
+fn gt_starts_same_line_rhs(idx: i64) i64 {
+    if tok_line[idx] != tok_line[idx + 1] { return 0 }
+    k1 := tok_kind[idx + 1]
+    if k1 == TOK_INT || k1 == TOK_CHAR || k1 == TOK_LPAREN { return 1 }
+    if k1 == TOK_MINUS || k1 == TOK_TILDE || k1 == TOK_BANG || k1 == TOK_AT { return 1 }
+    if k1 == TOK_KW {
+        kw1 := tok_kw[idx + 1]
+        if kw1 == KW_TRUE || kw1 == KW_FALSE { return 1 }
+        return 0
+    }
+    if k1 == TOK_IDENT {
+        k2 := tok_kind[idx + 2]
+        if k2 == TOK_WALRUS || k2 == TOK_ASSIGN { return 0 }
+        return 1
+    }
+    return 0
+}
+
+fn scan_bitpack_clause_end() i64 {
+    pdepth := 0
+    idx := g[G_TOK_IDX]
+    loop <max: 65536 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF { die_cur("error: unclosed bitpack literal") }
+        if k == TOK_LPAREN { pdepth += 1  idx += 1  continue }
+        if k == TOK_RPAREN { pdepth -= 1  idx += 1  continue }
+        if pdepth == 0 {
+            if k == TOK_PIPE && is_field_sep_pipe_at(idx) == 1 { return idx }
+            if k == TOK_GT && gt_starts_same_line_rhs(idx) == 0 { return idx }
+        }
+        idx += 1
+    }
+    return idx
+}
+
+fn scan_loop_lens_clause_end() i64 {
+    pdepth := 0
+    idx := g[G_TOK_IDX]
+    loop <max: 65536 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF { die_cur("error: unclosed loop lens") }
+        if k == TOK_LPAREN { pdepth += 1  idx += 1  continue }
+        if k == TOK_RPAREN { pdepth -= 1  idx += 1  continue }
+        if pdepth == 0 {
+            if k == TOK_PIPE && is_field_sep_pipe_at(idx) == 1 { return idx }
+            if k == TOK_GT && tok_kind[idx + 1] == TOK_LBRACE { return idx }
+        }
+        idx += 1
+    }
+    return idx
+}
+
+fn parse_bounded_expr(end_idx: i64) {
+    saved_k := tok_kind[end_idx]
+    tok_kind[end_idx] = TOK_EOF
+    parse_expr(1)
+    tok_kind[end_idx] = saved_k
+    if g[G_TOK_IDX] != end_idx {
+        die_cur("error: trailing tokens inside <...> clause")
+    }
+}
+
+fn width_mask64(w: i64) i64 {
+    if w >= 64 { return -1 }
+    return (1 << w) - 1
+}
+
+fn emit_extract_bits(shift: i64, width: i64) {
+    if shift > 0 {
+        emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE8)  emit_u8(shift) // shr rax, imm8
+    }
+    if width < 64 {
+        emit_mov_rcx_imm64(width_mask64(width))
+        emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8)                 // and rax, rcx
+    }
+    g[G_LAST_EXPR_TY] = TY_U64
+}
+
+// --- Runtime Expression Compiler (`parse_expr` -> `rax` + `g[G_LAST_EXPR_TY]`) ---
+
+fn binop_prec(idx: i64) i64 {
+    k := tok_kind[idx]
+    if k == TOK_PIPE_GT { return 1 }
+    if k == TOK_OR2     { return 2 }
+    if k == TOK_AND2    { return 3 }
+    if k == TOK_PIPE    { return 4 }
+    if k == TOK_CARET   { return 5 }
+    if k == TOK_AMP     { return 6 }
+    if k == TOK_EQ || k == TOK_NE { return 7 }
+    if k == TOK_LT {
+        if is_descriptor_lt_at(idx) == 1 { return 0 }
+        return 8
+    }
+    if k == TOK_LE || k == TOK_GT || k == TOK_GE { return 8 }
+    if k == TOK_SHL || k == TOK_SHR || k == TOK_ROL || k == TOK_ROR { return 9 }
+    if k == TOK_PLUS || k == TOK_MINUS { return 10 }
+    if k == TOK_STAR || k == TOK_SLASH || k == TOK_PERCENT { return 11 }
+    return 0
+}
+
+fn emit_load_arg_regs_lo(cnt: i64, d0: i64, d1: i64, d2: i64) {
+    if cnt >= 1 { emit_load_local(d0)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC7) } // rdi
+    if cnt >= 2 { emit_load_local(d1)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC6) } // rsi
+    if cnt >= 3 { emit_load_local(d2)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2) } // rdx
+}
+
+fn emit_load_arg_regs_hi(cnt: i64, d3: i64, d4: i64, d5: i64) {
+    if cnt >= 4 { emit_load_local(d3)  emit_move_rax_to_arg3() }                     // rcx / r10
+    if cnt >= 5 { emit_load_local(d4)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0) } // r8
+    if cnt >= 6 { emit_load_local(d5)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC1) } // r9
+}
+
+fn parse_fn_call_expr(fn_idx: i64) {
+    expect_kind(TOK_LPAREN)
+    d0: i64 = 0  d1: i64 = 0  d2: i64 = 0
+    d3: i64 = 0  d4: i64 = 0  d5: i64 = 0
+    acnt: i64 = 0
+    if peek_kind() != TOK_RPAREN {
+        loop <max: 8 | until: 0 == 1> {
+            if acnt >= 6 { die_cur("error: maximum 6 call arguments") }
+            parse_expr(1)
+            slot := alloc_temp_qword()
+            emit_store_local(slot)
+            if acnt == 0 { d0 = slot }
+            if acnt == 1 { d1 = slot }
+            if acnt == 2 { d2 = slot }
+            if acnt == 3 { d3 = slot }
+            if acnt == 4 { d4 = slot }
+            if acnt == 5 { d5 = slot }
+            acnt += 1
+            if peek_kind() != TOK_COMMA { break }
+            g[G_TOK_IDX] += 1
+        }
+    }
+    expect_kind(TOK_RPAREN)
+
+    emit_load_arg_regs_lo(acnt, d0, d1, d2)
+    emit_load_arg_regs_hi(acnt, d3, d4, d5)
+    if acnt > 0 { free_temp_qwords(acnt) }
+
+    emit_call_fn_idx(fn_idx)
+    emit_check_call_fault()
+    rty: i64 = fn_ret_ty[fn_idx]
+    if rty == TY_VOID { rty = TY_I64 }
+    g[G_LAST_EXPR_TY] = rty
+}
+
+fn parse_at_expr() {
+    expect_kind(TOK_AT)
+    if peek_kind() == TOK_KW && peek_kw() == KW_SYSCALL {
+        if g[G_MODE_CAPSULE] == 1 {
+            die_cur("error: @syscall unavailable in --target=capsule")
+        }
+        g[G_TOK_IDX] += 1
+        expect_kind(TOK_LPAREN)
+        s0: i64 = 0  s1: i64 = 0  s2: i64 = 0  s3: i64 = 0
+        s4: i64 = 0  s5: i64 = 0  s6: i64 = 0
+        scnt: i64 = 0
+        loop <max: 8 | until: 0 == 1> {
+            if scnt >= 7 { die_cur("error: too many @syscall arguments") }
+            parse_expr(1)
+            slot := alloc_temp_qword()
+            emit_store_local(slot)
+            if scnt == 0 { s0 = slot }
+            if scnt == 1 { s1 = slot }
+            if scnt == 2 { s2 = slot }
+            if scnt == 3 { s3 = slot }
+            if scnt == 4 { s4 = slot }
+            if scnt == 5 { s5 = slot }
+            if scnt == 6 { s6 = slot }
+            scnt += 1
+            if peek_kind() != TOK_COMMA { break }
+            g[G_TOK_IDX] += 1
+        }
+        expect_kind(TOK_RPAREN)
+        if scnt >= 2 { emit_load_local(s1)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC7) } // rdi
+        if scnt >= 3 { emit_load_local(s2)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC6) } // rsi
+        if scnt >= 4 { emit_load_local(s3)  emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2) } // rdx
+        if scnt >= 5 { emit_load_local(s4)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC2) } // r10
+        if scnt >= 6 { emit_load_local(s5)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0) } // r8
+        if scnt >= 7 { emit_load_local(s6)  emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC1) } // r9
+        emit_load_local(s0)                                                               // rax = nr
+        free_temp_qwords(scnt)
+        emit_u8(0x0F)  emit_u8(0x05)                                                      // syscall
+        g[G_LAST_EXPR_TY] = TY_I64
+        return
+    }
+
+    sym := expect_ident()
+
+    // `@view<T>(base [, len])`
+    if sym == g[G_SYM_VIEW] {
+        expect_kind(TOK_LT)
+        elem_ty := parse_type_tag() & TY_BASE_MASK
+        expect_kind(TOK_GT)
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        if peek_kind() != TOK_COMMA {
+            expect_kind(TOK_RPAREN)
+            // Null guard: `test rax, rax; jnz ok; fail 3`
+            ok_p := emit_jnz_rel32()
+            emit_raise_fault_imm(3)
+            patch_rel32_here(ok_p)
+            g[G_LAST_EXPR_TY] = elem_ty | TY_FLAG_VIEW1
+            return
+        }
+        g[G_TOK_IDX] += 1
+        span_slot := alloc_anon_qwords(2)
+        emit_store_local(span_slot)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        // If `len != 0 && base == 0 -> fail 3`
+        zlen_p := emit_jz_rel32()
+        emit_load_local_rcx(span_slot)
+        emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9) // test rcx, rcx
+         emit_u8(0x0F)  emit_u8(0x85)
+        nz_p := g[G_CODE_OFF]
+        emit_u32(0)
+        emit_raise_fault_imm(3)
+        patch_rel32_here(nz_p)
+        patch_rel32_here(zlen_p)
+        emit_store_local(span_slot + 8)
+        emit_lea_local(span_slot)
+        g[G_LAST_EXPR_TY] = elem_ty | TY_FLAG_SPAN
+        return
+    }
+
+    if sym == g[G_SYM_RSP_ALIGN] {
+        expect_kind(TOK_LPAREN)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xE0)
+        emit_u8(0x83)  emit_u8(0xE0)  emit_u8(0x0F)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    if sym == g[G_SYM_CRC32C] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        t := alloc_temp_qword()
+        emit_store_local(t)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_load_local_rcx(t)
+        free_temp_qwords(1)
+        emit_u8(0x48)  emit_u8(0x91)                                        // xchg rax, rcx
+        emit_u8(0xF2)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0x38)  emit_u8(0xF1)  emit_u8(0xC1)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    if sym == g[G_SYM_POPCNT] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xB8)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    if sym == g[G_SYM_LZCNT] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBD)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    if sym == g[G_SYM_TZCNT] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBC)  emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    if sym == g[G_SYM_RID] {
+        if g[G_MODE_CAPSULE] == 0 {
+            die_cur("error: @reactor_id requires --target=capsule")
+        }
+        expect_kind(TOK_LPAREN)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x4C)  emit_u8(0x89)  emit_u8(0xE0) // mov rax, r12
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    if sym == g[G_SYM_FN_ADDR] {
+        expect_kind(TOK_LPAREN)
+        fsym := expect_ident()
+        fidx := find_or_add_fn(fsym)
+        expect_kind(TOK_RPAREN)
+        emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x05) // lea rax, [rip + rel32]
+        fx := g[G_CALL_FIX_CNT]
+        call_fix_off[fx] = g[G_CODE_OFF]
+        call_fix_fn[fx]  = fidx
+        g[G_CALL_FIX_CNT] = fx + 1
+        emit_u32(0)
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    if sym == g[G_SYM_CALL] {
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        fn_ptr_slot := alloc_temp_qword()
+        emit_store_local(fn_ptr_slot)
+        d0: i64 = 0  d1: i64 = 0  d2: i64 = 0
+        d3: i64 = 0  d4: i64 = 0  d5: i64 = 0
+        acnt: i64 = 0
+        if peek_kind() == TOK_COMMA {
+            g[G_TOK_IDX] += 1
+            loop <max: 8 | until: 0 == 1> {
+                if acnt >= 6 { die_cur("error: maximum 6 @call arguments") }
+                parse_expr(1)
+                slot := alloc_temp_qword()
+                emit_store_local(slot)
+                if acnt == 0 { d0 = slot }
+                if acnt == 1 { d1 = slot }
+                if acnt == 2 { d2 = slot }
+                if acnt == 3 { d3 = slot }
+                if acnt == 4 { d4 = slot }
+                if acnt == 5 { d5 = slot }
+                acnt += 1
+                if peek_kind() != TOK_COMMA { break }
+                g[G_TOK_IDX] += 1
+            }
+        }
+        expect_kind(TOK_RPAREN)
+        emit_load_local(fn_ptr_slot)
+        ok_fn := emit_jnz_rel32()
+        emit_raise_fault_imm(3)
+        patch_rel32_here(ok_fn)
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC3) // mov r11, rax
+        emit_load_arg_regs_lo(acnt, d0, d1, d2)
+        emit_load_arg_regs_hi(acnt, d3, d4, d5)
+        free_temp_qwords(acnt + 1)
+        emit_u8(0x41)  emit_u8(0xFF)  emit_u8(0xD3) // call r11
+        emit_check_call_fault()
+        g[G_LAST_EXPR_TY] = TY_I64
+        return
+    }
+
+    if sym == g[G_SYM_SIZEOF] {
+        expect_kind(TOK_LPAREN)
+        ty := parse_type_tag()
+        expect_kind(TOK_RPAREN)
+        emit_mov_rax_imm64(ty_byte_size(ty))
+        g[G_LAST_EXPR_TY] = TY_U64
+        return
+    }
+
+    die_cur("error: unknown @ intrinsic")
+}
+
+fn parse_primary() {
+    k := peek_kind()
+
+    if k == TOK_INT || k == TOK_CHAR {
+        v := peek_val()
+        g[G_TOK_IDX] += 1
+        emit_mov_rax_imm64(v)
+        g[G_LAST_EXPR_TY] = TY_I64
+        return
+    }
+
+    if k == TOK_STR {
+        poff := peek_val()
+        slen := peek_aux()
+        g[G_TOK_IDX] += 1
+        emit_str_literal_expr(poff, slen)
+        return
+    }
+
+    if k == TOK_KW {
+        kw := peek_kw()
+        if kw == KW_TRUE {
+            g[G_TOK_IDX] += 1
+            emit_mov_rax_imm64(1)
+            g[G_LAST_EXPR_TY] = TY_I64
+            return
+        }
+        if kw == KW_FALSE {
+            g[G_TOK_IDX] += 1
+            emit_mov_rax_imm64(0)
+            g[G_LAST_EXPR_TY] = TY_I64
+            return
+        }
+        die_cur("error: unexpected keyword in expression")
+    }
+
+    if k == TOK_LPAREN {
+        g[G_TOK_IDX] += 1
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        return
+    }
+
+    if k == TOK_AT {
+        parse_at_expr()
+        return
+    }
+
+    if k == TOK_IDENT {
+        sym := expect_ident()
+
+        // 1. Direct function call `fn_name(...)`
+        if peek_kind() == TOK_LPAREN {
+            fidx := find_or_add_fn(sym)
+            parse_fn_call_expr(fidx)
+            return
+        }
+
+        // 2. BitPack constructor `BpType<f0: e0 | f1: e1>`
+        bp := find_bitpack(sym)
+        if bp >= 0 && is_descriptor_lt_at(g[G_TOK_IDX]) == 1 {
+            expect_kind(TOK_LT)
+            acc_slot := alloc_temp_qword()
+            emit_mov_rax_imm64(0)
+            emit_store_local(acc_slot)
+            loop <max: 64 | until: 0 == 1> {
+                fsym := expect_ident()
+                expect_kind(TOK_COLON)
+                fidx := find_bp_field(bp, fsym)
+                if fidx < 0 { die_cur("error: unknown bitpack field") }
+                end_i := scan_bitpack_clause_end()
+                parse_bounded_expr(end_i)
+                f_w: i64  = bpf_width[fidx]
+                f_sh: i64 = bpf_shift[fidx]
+                if f_w < 64 {
+                    emit_mov_rcx_imm64(width_mask64(f_w))
+                    emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8)
+                }
+                if f_sh > 0 {
+                    emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(f_sh)
+                }
+                emit_load_local_rcx(acc_slot)
+                emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xC8)     // or rax, rcx
+                emit_store_local(acc_slot)
+                if peek_kind() != TOK_PIPE { break }
+                g[G_TOK_IDX] += 1
+            }
+            expect_kind(TOK_GT)
+            emit_load_local(acc_slot)
+            free_temp_qwords(1)
+            g[G_LAST_EXPR_TY] = TY_BP_BASE + bp
+            return
+        }
+
+        // 3. Local variable
+        li := find_local(sym)
+        if li >= 0 {
+            lty: i64   = loc_ty[li]
+            ldisp: i64 = loc_disp[li]
+            if (lty & TY_FLAG_SPAN) != 0 {
+                emit_lea_local(ldisp)
+            } else {
+                emit_load_local(ldisp)
+            }
+            g[G_LAST_EXPR_TY] = lty
+            return
+        }
+
+        // 4. `@slab` / `@arena` space
+        si := find_space(sym)
+        if si >= 0 {
+            if peek_kind() == TOK_DOT {
+                g[G_TOK_IDX] += 1
+                psym := expect_ident()
+                if psym == g[G_SYM_BASE] {
+                    emit_mov_rax_imm64(sp_vaddr[si])
+                    g[G_LAST_EXPR_TY] = TY_U64
+                    return
+                }
+                if psym == g[G_SYM_CAP] || psym == g[G_SYM_MAX] || psym == g[G_SYM_LEN] {
+                    emit_mov_rax_imm64(sp_cap[si])
+                    g[G_LAST_EXPR_TY] = TY_U64
+                    return
+                }
+                die_cur("error: unknown space property")
+            }
+            expect_kind(TOK_LBRACK)
+            parse_expr(1)
+            expect_kind(TOK_RBRACK)
+            // Unsigned bounds check `idx >= cap -> fail 2`
+            emit_mov_rcx_imm64(sp_cap[si])
+            emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+            emit_u8(0x0F)  emit_u8(0x82)                // jb .in_bounds
+            ib_p := g[G_CODE_OFF]
+            emit_u32(0)
+            emit_raise_fault_imm(2)
+            patch_rel32_here(ib_p)
+
+            esz: i64 = sp_elem_sz[si]
+            if esz == 2 { emit_u8(0x48)  emit_u8(0xD1)  emit_u8(0xE0) }
+            if esz == 4 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(2) }
+            if esz == 8 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(3) }
+            emit_mov_rcx_imm64(sp_vaddr[si])
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            ety: i64 = sp_elem_ty[si]
+            emit_load_mem_typed(ety)
+            g[G_LAST_EXPR_TY] = ety
+            return
+        }
+
+        // 5. Compile-time constant
+        ci := find_const(sym)
+        if ci >= 0 {
+            emit_mov_rax_imm64(cst_val[ci])
+            g[G_LAST_EXPR_TY] = TY_I64
+            return
+        }
+
+        die_cur("error: undefined identifier")
+    }
+
+    die_cur("error: parse fault in primary expression")
+}
+
+fn parse_postfix() {
+    parse_primary()
+    loop <max: 64 | until: 0 == 1> {
+        ty := g[G_LAST_EXPR_TY]
+        k  := peek_kind()
+
+        if k == TOK_DOT {
+            g[G_TOK_IDX] += 1
+            fsym := expect_ident()
+            if (ty & TY_FLAG_SPAN) != 0 {
+                if fsym == g[G_SYM_PTR] || fsym == g[G_SYM_BASE] {
+                    emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x00) // mov rax, [rax]
+                    g[G_LAST_EXPR_TY] = TY_U64
+                    continue
+                }
+                if fsym == g[G_SYM_LEN] {
+                    emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x40)  emit_u8(8) // mov rax, [rax+8]
+                    g[G_LAST_EXPR_TY] = TY_U64
+                    continue
+                }
+                die_cur("error: unknown span property")
+            }
+            base := ty & TY_BASE_MASK
+            if base >= TY_BP_BASE {
+                fidx := find_bp_field(base - TY_BP_BASE, fsym)
+                if fidx < 0 { die_cur("error: unknown bitpack field") }
+                emit_extract_bits(bpf_shift[fidx], bpf_width[fidx])
+                continue
+            }
+            die_cur("error: invalid member access")
+        }
+
+        if k == TOK_LBRACK {
+            if (ty & TY_FLAG_SPAN) != 0 {
+                span_ptr_t := alloc_temp_qword()
+                emit_store_local(span_ptr_t)
+                g[G_TOK_IDX] += 1
+                parse_expr(1)
+                expect_kind(TOK_RBRACK)
+                // `rcx = span_ptr`, check `rax < [rcx + 8]` (`fail 2`)
+                emit_load_local_rcx(span_ptr_t)
+                emit_u8(0x48)  emit_u8(0x3B)  emit_u8(0x41)  emit_u8(8) // cmp rax, [rcx+8]
+                emit_u8(0x0F)  emit_u8(0x82)
+                ok_b := g[G_CODE_OFF]
+                emit_u32(0)
+                emit_raise_fault_imm(2)
+                patch_rel32_here(ok_b)
+
+                ety := ty & TY_BASE_MASK
+                esz := ty_byte_size(ety)
+                if esz == 2 { emit_u8(0x48)  emit_u8(0xD1)  emit_u8(0xE0) }
+                if esz == 4 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(2) }
+                if esz == 8 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(3) }
+                emit_load_local_rcx(span_ptr_t)
+                free_temp_qwords(1)
+                emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x09)             // mov rcx, [rcx]
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)             // add rax, rcx
+                emit_load_mem_typed(ety)
+                g[G_LAST_EXPR_TY] = ety
+                continue
+            }
+
+            if (ty & TY_FLAG_VIEW1) != 0 {
+                ptr_t := alloc_temp_qword()
+                emit_store_local(ptr_t)
+                g[G_TOK_IDX] += 1
+                parse_expr(1)
+                expect_kind(TOK_RBRACK)
+                ety := ty & TY_BASE_MASK
+                esz := ty_byte_size(ety)
+                if esz == 2 { emit_u8(0x48)  emit_u8(0xD1)  emit_u8(0xE0) }
+                if esz == 4 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(2) }
+                if esz == 8 { emit_u8(0x48)  emit_u8(0xC1)  emit_u8(0xE0)  emit_u8(3) }
+                emit_load_local_rcx(ptr_t)
+                free_temp_qwords(1)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                emit_load_mem_typed(ety)
+                g[G_LAST_EXPR_TY] = ety
+                continue
+            }
+
+            // Hardware integer bit-slice `val[hi:lo]`
+            val_t := alloc_temp_qword()
+            emit_store_local(val_t)
+            g[G_TOK_IDX] += 1
+            hi := eval_const_expr(1)
+            expect_kind(TOK_COLON)
+            lo := eval_const_expr(1)
+            expect_kind(TOK_RBRACK)
+            if lo < 0 || hi > 63 || hi < lo {
+                die_cur("error: invalid [hi:lo] bit-slice bounds")
+            }
+            emit_load_local(val_t)
+            free_temp_qwords(1)
+            emit_extract_bits(lo, hi - lo + 1)
+            continue
+        }
+
+        break
+    }
+}
+
+fn parse_unary() {
+    k := peek_kind()
+    if k == TOK_MINUS {
+        g[G_TOK_IDX] += 1
+        parse_unary()
+        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD8) // neg rax
+        g[G_LAST_EXPR_TY] = TY_I64
+        return
+    }
+    if k == TOK_TILDE {
+        g[G_TOK_IDX] += 1
+        parse_unary()
+        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD0) // not rax
+        return
+    }
+    if k == TOK_BANG {
+        g[G_TOK_IDX] += 1
+        parse_unary()
+        emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0) // test rax, rax
+        emit_u8(0x0F)  emit_u8(0x94)  emit_u8(0xC0) // sete al
+        emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0xC0) // movzx eax, al
+        g[G_LAST_EXPR_TY] = TY_I64
+        return
+    }
+    parse_postfix()
+}
+
+fn emit_div_or_mod(is_mod: i64, both_uns: i64) {
+    // `rax` = dividend, `rcx` = divisor; `rcx == 0 -> fail 1`
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9)     // test rcx, rcx
+    emit_u8(0x0F)  emit_u8(0x85)                    // jnz .ok
+    nz_pos := g[G_CODE_OFF]
+    emit_u32(0)
+    emit_raise_fault_imm(1)
+    patch_rel32_here(nz_pos)
+
+    if both_uns == 1 {
+        emit_u8(0x31)  emit_u8(0xD2)                // xor edx, edx
+        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xF1) // div rcx
+        if is_mod == 1 {
+            emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xD0) // mov rax, rdx
+        }
+    } else {
+        emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xF9)  emit_u8(0xFF) // cmp rcx, -1
+        emit_u8(0x0F)  emit_u8(0x85)                               // jne .do_idiv
+        idiv_p := g[G_CODE_OFF]
+        emit_u32(0)
+        if is_mod == 1 {
+            emit_mov_rax_imm64(0)
+        } else {
+            emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD8)            // neg rax
+        }
+        done_p := emit_jmp_rel32()
+        patch_rel32_here(idiv_p)
+        emit_u8(0x48)  emit_u8(0x99)                               // cqo
+        emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xF9)                // idiv rcx
+        if is_mod == 1 {
+            emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xD0)            // mov rax, rdx
+        }
+        patch_rel32_here(done_p)
+    }
+}
+
+fn parse_expr(min_prec: i64) {
+    parse_unary()
+    loop <max: 1024 | until: 0 == 1> {
+        cur_i := g[G_TOK_IDX]
+        prec  := binop_prec(cur_i)
+        if prec < min_prec { break }
+
+        op     := tok_kind[cur_i]
+        lhs_ty := g[G_LAST_EXPR_TY]
+        g[G_TOK_IDX] = cur_i + 1
+
+        // 1. Pipeline `lhs |> fn_name[(arg1, ...)]`
+        if op == TOK_PIPE_GT {
+            d0 := alloc_temp_qword()
+            emit_store_local(d0)
+            d1: i64 = 0  d2: i64 = 0  d3: i64 = 0  d4: i64 = 0  d5: i64 = 0
+            acnt: i64 = 1
+            fsym := expect_ident()
+            fidx := find_or_add_fn(fsym)
+            if peek_kind() == TOK_LPAREN {
+                g[G_TOK_IDX] += 1
+                if peek_kind() != TOK_RPAREN {
+                    loop <max: 8 | until: 0 == 1> {
+                        if acnt >= 6 { die_cur("error: maximum 6 |> arguments") }
+                        parse_expr(2)
+                        slot := alloc_temp_qword()
+                        emit_store_local(slot)
+                        if acnt == 1 { d1 = slot }
+                        if acnt == 2 { d2 = slot }
+                        if acnt == 3 { d3 = slot }
+                        if acnt == 4 { d4 = slot }
+                        if acnt == 5 { d5 = slot }
+                        acnt += 1
+                        if peek_kind() != TOK_COMMA { break }
+                        g[G_TOK_IDX] += 1
+                    }
+                }
+                expect_kind(TOK_RPAREN)
+            }
+            emit_load_arg_regs_lo(acnt, d0, d1, d2)
+            emit_load_arg_regs_hi(acnt, d3, d4, d5)
+            free_temp_qwords(acnt)
+            emit_call_fn_idx(fidx)
+            emit_check_call_fault()
+            rty: i64 = fn_ret_ty[fidx]
+            if rty == TY_VOID { rty = TY_I64 }
+            g[G_LAST_EXPR_TY] = rty
+            continue
+        }
+
+        // 2. Short-circuit `&&`
+        if op == TOK_AND2 {
+            false_p := emit_jz_rel32()
+            parse_expr(prec + 1)
+            emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0)
+            emit_u8(0x0F)  emit_u8(0x95)  emit_u8(0xC0)
+            emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0xC0)
+            end_p := emit_jmp_rel32()
+            patch_rel32_here(false_p)
+            emit_mov_rax_imm64(0)
+            patch_rel32_here(end_p)
+            g[G_LAST_EXPR_TY] = TY_I64
+            continue
+        }
+
+        // 3. Short-circuit `||`
+        if op == TOK_OR2 {
+            true_p := emit_jnz_rel32()
+            parse_expr(prec + 1)
+            emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0)
+            emit_u8(0x0F)  emit_u8(0x95)  emit_u8(0xC0)
+            emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0xC0)
+            end_p := emit_jmp_rel32()
+            patch_rel32_here(true_p)
+            emit_mov_rax_imm64(1)
+            patch_rel32_here(end_p)
+            g[G_LAST_EXPR_TY] = TY_I64
+            continue
+        }
+
+        // 4. General binary operator: save LHS in temp slot, evaluate RHS -> `rcx`, reload LHS -> `rax`
+        lhs_slot := alloc_temp_qword()
+        emit_store_local(lhs_slot)
+        parse_expr(prec + 1)
+        rhs_ty := g[G_LAST_EXPR_TY]
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC1) // mov rcx, rax (RHS)
+        emit_load_local(lhs_slot)                   // rax = LHS
+        free_temp_qwords(1)
+
+        lhs_u  := is_ty_unsigned(lhs_ty)
+        rhs_u  := is_ty_unsigned(rhs_ty)
+        both_u := 0
+        if lhs_u == 1 && rhs_u == 1 { both_u = 1 }
+
+        out_ty := TY_I64
+        if both_u == 1 { out_ty = TY_U64 }
+
+        if op == TOK_PLUS {
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            g[G_LAST_EXPR_TY] = out_ty
+            continue
+        }
+        if op == TOK_MINUS {
+            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8) // sub rax, rcx
+            g[G_LAST_EXPR_TY] = out_ty
+            continue
+        }
+        if op == TOK_STAR {
+            emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xAF)  emit_u8(0xC1) // imul rax, rcx
+            g[G_LAST_EXPR_TY] = out_ty
+            continue
+        }
+        if op == TOK_SLASH {
+            emit_div_or_mod(0, lhs_u)
+            if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
+            continue
+        }
+        if op == TOK_PERCENT {
+            emit_div_or_mod(1, lhs_u)
+            if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
+            continue
+        }
+        if op == TOK_AMP {
+            emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8) // and rax, rcx
+            g[G_LAST_EXPR_TY] = out_ty
+            continue
+        }
+        if op == TOK_PIPE {
+            emit_u8(0x48)  emit_u8(0x09)  emit_u8(0xC8) // or rax, rcx
+            g[G_LAST_EXPR_TY] = out_ty
+            continue
+        }
+        if op == TOK_CARET {
+            emit_u8(0x48)  emit_u8(0x31)  emit_u8(0xC8) // xor rax, rcx
+            g[G_LAST_EXPR_TY] = out_ty
+            continue
+        }
+        if op == TOK_SHL {
+            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xE0) // shl rax, cl
+            if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
+            continue
+        }
+        if op == TOK_SHR {
+            if lhs_u == 1 {
+                emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xE8) // shr rax, cl
+                g[G_LAST_EXPR_TY] = TY_U64
+            } else {
+                emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xF8) // sar rax, cl
+                g[G_LAST_EXPR_TY] = TY_I64
+            }
+            continue
+        }
+        if op == TOK_ROL {
+            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xC0) // rol rax, cl
+            if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
+            continue
+        }
+        if op == TOK_ROR {
+            emit_u8(0x48)  emit_u8(0xD3)  emit_u8(0xC8) // ror rax, cl
+            if lhs_u == 1 { g[G_LAST_EXPR_TY] = TY_U64 } else { g[G_LAST_EXPR_TY] = TY_I64 }
+            continue
+        }
+
+        // Relational & Equality (`cmp rax, rcx` + `setcc al` + `movzx eax, al`)
+        emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8)
+        set_op: i64 = 0x94
+        if op == TOK_EQ { set_op = 0x94 } // sete
+        if op == TOK_NE { set_op = 0x95 } // setne
+        if op == TOK_LT {
+            if both_u == 1 { set_op = 0x92 } else { set_op = 0x9C } // setb vs setl
+        }
+        if op == TOK_LE {
+            if both_u == 1 { set_op = 0x96 } else { set_op = 0x9E } // setbe vs setle
+        }
+        if op == TOK_GT {
+            if both_u == 1 { set_op = 0x97 } else { set_op = 0x9F } // seta vs setg
+        }
+        if op == TOK_GE {
+            if both_u == 1 { set_op = 0x93 } else { set_op = 0x9D } // setae vs setge
+        }
+        emit_u8(0x0F)  emit_u8(set_op)  emit_u8(0xC0)
+        emit_u8(0x0F)  emit_u8(0xB6)    emit_u8(0xC0)
+        g[G_LAST_EXPR_TY] = TY_I64
+    }
+}
+

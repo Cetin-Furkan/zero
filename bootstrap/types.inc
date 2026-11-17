@@ -139,13 +139,15 @@ type_size_align:
     mov     edx, 8
     ret
 .chk_view:
-    test    edi, TY_FLAG_VIEW_ONE
+    test    edi, TY_FLAG_VIEW_ONE | TY_FLAG_ATOMIC
     jz      .base_kind
     mov     eax, 8
     mov     edx, 8
     ret
 .base_kind:
     and     edi, TY_BASE_MASK
+    cmp     edi, TY_CUSTOM_PTR_BASE
+    jae     .s8_ptr
     cmp     edi, TY_STRUCT_BASE
     jae     .is_struct
     cmp     edi, TY_BITPACK_BASE
@@ -162,6 +164,7 @@ type_size_align:
     je      .s4
     cmp     edi, TY_I32
     je      .s4
+.s8_ptr:
     mov     eax, 8
     mov     edx, 8
     ret
@@ -196,6 +199,8 @@ type_size_align:
 parse_resolved_type_tag:
     call    next_tok_ptr
     movzx   ecx, byte [rax]
+    cmp     cl, TOK_LBRACK
+    je      .slice_brack
     cmp     cl, TOK_KW
     je      .prim_kw
     cmp     cl, TOK_IDENT
@@ -209,12 +214,24 @@ parse_resolved_type_tag:
     mov     edx, eax
     shl     edx, 5
     mov     r8, [space_ast]
-    cmp     byte [r8 + AST_TYPE_OFF + rdx + 4], UKIND_BITPACK
+    movzx   edx, byte [r8 + AST_TYPE_OFF + rdx + 4]
+    cmp     dl, UKIND_BITPACK
     je      .ret_bp
+    cmp     dl, UKIND_PTR
+    je      .ret_ptr
     add     eax, TY_STRUCT_BASE
     ret
 .ret_bp:
     add     eax, TY_BITPACK_BASE
+    ret
+.ret_ptr:
+    add     eax, TY_CUSTOM_PTR_BASE
+    ret
+.slice_brack:
+    mov     al, TOK_RBRACK
+    call    expect_tok_kind
+    call    parse_resolved_type_tag
+    or      eax, TY_FLAG_SPAN
     ret
 .bad_ty:
     mov     rax, rcx
@@ -222,6 +239,10 @@ parse_resolved_type_tag:
 
 .prim_kw:
     movzx   edx, byte [rax + 1]
+    cmp     dl, KW_STR
+    je      .ret_u8_span
+    cmp     dl, KW_BYTES
+    je      .ret_u8_span
     cmp     dl, KW_U8
     mov     eax, TY_U8
     je      .ok
@@ -253,6 +274,8 @@ parse_resolved_type_tag:
     mov     eax, TY_I64
     je      .ok
     jmp     parse_err_at_tok
+.ret_u8_span:
+    mov     eax, TY_U8 | TY_FLAG_SPAN
 .ok:
     ret
 
@@ -394,39 +417,53 @@ skip_brace_block:
     jnz     .loop
     ret
 
-; Skips constant expression tokens until next top-level declaration
+; Skips constant or `=>` arrow expression tokens until next top-level declaration
 skip_const_rhs_tokens:
-    xor     ecx, ecx                ; paren depth
+    xor     ecx, ecx                ; () / [] / {} nesting depth
 .loop:
     call    peek_tok_ptr
     movzx   edx, byte [rax]
     test    dl, dl
     jz      .done
     cmp     dl, TOK_LPAREN
-    jne     .chk_rp
+    je      .inc_d
+    cmp     dl, TOK_LBRACK
+    je      .inc_d
+    cmp     dl, TOK_LBRACE
+    je      .inc_d
+    cmp     dl, TOK_RPAREN
+    je      .dec_d
+    cmp     dl, TOK_RBRACK
+    je      .dec_d
+    cmp     dl, TOK_RBRACE
+    je      .dec_d
+    jmp     .chk_top
+.inc_d:
     inc     ecx
     inc     dword [tok_idx]
     jmp     .loop
-.chk_rp:
-    cmp     dl, TOK_RPAREN
-    jne     .chk_top
+.dec_d:
+    test    ecx, ecx
+    jz      .chk_top
     dec     ecx
     inc     dword [tok_idx]
     jmp     .loop
 .chk_top:
     test    ecx, ecx
     jnz     .adv
-    ; Next top-level item starts with `fn`, `@` (except `@sizeof`/`@alignof`), or `IDENT ::`
+    ; Top-level `@` declarations: `@ <kind> <ident> :` OR `@ <attr> fn`
     cmp     dl, TOK_AT
     jne     .chk_kw_fn
-    cmp     byte [rax + 16], TOK_IDENT
-    jne     .done
-    mov     edx, [rax + 24]
-    cmp     edx, [sym_sizeof_id]
-    je      .adv
-    cmp     edx, [sym_alignof_id]
-    je      .adv
-    jmp     .done
+    cmp     byte [rax + 32], TOK_KW
+    jne     .chk_at_sp
+    cmp     byte [rax + 33], KW_FN
+    je      .done
+.chk_at_sp:
+    cmp     byte [rax + 32], TOK_IDENT
+    jne     .adv
+    cmp     byte [rax + 48], TOK_COLON
+    je      .done
+    jmp     .adv
 .chk_kw_fn:
     cmp     dl, TOK_KW
     jne     .chk_id_decl
@@ -596,8 +633,14 @@ prescan_module:
     jz      parse_err_at_tok
     cmp     dl, TOK_LBRACE
     je      .skip_fn_body
+    cmp     dl, TOK_FAT_ARROW
+    je      .skip_fn_arrow
     inc     dword [tok_idx]
     jmp     .skip_fn_ret
+.skip_fn_arrow:
+    inc     dword [tok_idx]
+    call    skip_const_rhs_tokens
+    jmp     .scan_loop
 .skip_fn_body:
     call    skip_brace_block
     jmp     .scan_loop
@@ -608,27 +651,62 @@ prescan_module:
     call    next_tok_ptr
     cmp     byte [rax], TOK_KW
     jne     .chk_at_ident
-    movzx   r12d, byte [rax + 1]    ; KW_SLAB or KW_ARENA
+    movzx   r12d, byte [rax + 1]    ; KW_SLAB, KW_ARENA, or KW_RING
     cmp     r12d, KW_SLAB
     je      .at_ok_kw
     cmp     r12d, KW_ARENA
-    jne     .unimpl_space
-    jmp     .at_ok_kw
+    je      .at_ok_kw
+    cmp     r12d, KW_RING
+    je      .at_ok_kw
+    jmp     .unimpl_space
 .chk_at_ident:
     cmp     byte [rax], TOK_IDENT
     jne     .unimpl_space
-    mov     edx, [sym_port_id]
-    cmp     [rax + 8], edx
+    mov     edx, [rax + 8]
+    cmp     edx, [sym_isr_id]
+    je      .at_fn_attr
+    cmp     edx, [sym_isr_ok_id]
+    je      .at_fn_attr
+    cmp     edx, [sym_dma_queue_id]
+    je      .at_is_dmaq
+    cmp     edx, [sym_capsule_id]
+    je      .at_is_capsule
+    cmp     edx, [sym_port_id]
     jne     .unimpl_space
     cmp     byte [mode_efi], 1
     je      .at_is_port
+.err_at_need_efi:
     mov     esi, r14d
     lea     rdi, [msg_need_efi]
     mov     edx, msg_need_efi_len
     jmp     err_msg_at_line
+.at_fn_attr:
+    cmp     byte [mode_efi], 1
+    jne     .err_at_need_efi
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_KW
+    jne     parse_err_at_tok
+    cmp     byte [rax + 1], KW_FN
+    jne     parse_err_at_tok
+    jmp     .scan_kw
+.at_is_capsule:
+    mov     r12d, 0xFD
+    jmp     .at_ok_kw
+.at_is_dmaq:
+    mov     r12d, 0xFE
+    jmp     .at_ok_kw
 .at_is_port:
     mov     r12d, 0xFF
 .at_ok_kw:
+    cmp     byte [mode_capsule], 1
+    jne     .at_not_in_cap
+    cmp     r12d, 0xFF              ; `@port` has no `.bss` state, allowed; mutable `.bss` spaces forbidden in `.zcap`!
+    je      .at_not_in_cap
+    mov     esi, r14d
+    lea     rdi, [msg_bad_capsule]
+    mov     edx, msg_bad_capsule_len
+    jmp     err_msg_at_line
+.at_not_in_cap:
     call    next_tok_ptr            ; space identifier
     cmp     byte [rax], TOK_IDENT
     jne     parse_err_at_tok
@@ -652,6 +730,15 @@ prescan_module:
     je      .set_sk
     mov     edx, SKIND_ARENA
     cmp     r12d, KW_ARENA
+    je      .set_sk
+    mov     edx, SKIND_RING
+    cmp     r12d, KW_RING
+    je      .set_sk
+    mov     edx, SKIND_DMA_QUEUE
+    cmp     r12d, 0xFE
+    je      .set_sk
+    mov     edx, SKIND_CAPSULE
+    cmp     r12d, 0xFD
     je      .set_sk
     mov     edx, SKIND_PORT
 .set_sk:
@@ -682,9 +769,56 @@ prescan_module:
     movzx   ecx, byte [rax]
     cmp     cl, TOK_LBRACE
     je      .record_struct_decl
+    cmp     cl, TOK_AT
+    je      .chk_ptr_decl
     cmp     cl, TOK_LT
     jne     .record_const_decl
+    jmp     .disambig_lt
 
+.chk_ptr_decl:
+    cmp     byte [rax + 16], TOK_KW
+    jne     .chk_ptr_ident
+    cmp     byte [rax + 17], KW_CELL64
+    jne     .record_const_decl
+    add     dword [tok_idx], 2      ; consume `@` and `cell64`
+    mov     r15d, [tok_idx]         ; `{` tok_idx
+    mov     eax, [type_cnt]
+    inc     dword [type_cnt]
+    shl     eax, 5
+    mov     rcx, [space_ast]
+    add     rcx, AST_TYPE_OFF
+    mov     [rcx + rax], r13d
+    mov     byte  [rcx + rax + 4],  UKIND_STRUCT
+    mov     word  [rcx + rax + 6],  64
+    mov     dword [rcx + rax + 8],  64
+    mov     dword [rcx + rax + 16], 1       ; `1` = `@cell64` hardware 64B cacheline!
+    mov     [rcx + rax + 20], r15d
+    mov     [rcx + rax + 24], r14d
+    call    skip_brace_block
+    jmp     .scan_loop
+.chk_ptr_ident:
+    cmp     byte [rax + 16], TOK_IDENT
+    jne     .record_const_decl
+    mov     edx, [sym_ptr_id]
+    cmp     [rax + 24], rdx
+    jne     .record_const_decl
+    add     dword [tok_idx], 2      ; consume `@` and `ptr`
+    mov     r15d, [tok_idx]         ; `<` tok_idx
+    call    skip_angle_block
+    mov     eax, [type_cnt]
+    inc     dword [type_cnt]
+    shl     eax, 5
+    mov     rcx, [space_ast]
+    add     rcx, AST_TYPE_OFF
+    mov     [rcx + rax], r13d
+    mov     byte [rcx + rax + 4], UKIND_PTR
+    mov     word [rcx + rax + 6], 8
+    mov     dword [rcx + rax + 8], 8
+    mov     [rcx + rax + 20], r15d
+    mov     [rcx + rax + 24], r14d
+    jmp     .scan_loop
+
+.disambig_lt:
     ; Disambiguate `Name :: <align: 64B> { ... }` (Struct) vs `Name :: <f: u32 | ...>` (Bitpack)!
     mov     r15d, [tok_idx]         ; save `<` tok_idx
     call    skip_angle_block
@@ -871,6 +1005,10 @@ prescan_module:
     mov     eax, [r14 + 20]
     mov     [tok_idx], eax
     mov     r15d, 1                 ; r15d = max alignment (starts at 1)
+    cmp     dword [r14 + 16], 1     ; `@cell64`?
+    jne     .st_chk_lt
+    mov     r15d, 64
+.st_chk_lt:
     xor     edx, edx                ; edx = 1 if `<packed>`
 
     ; Optional `<packed>` or `<align: Bytes>`
@@ -977,6 +1115,19 @@ prescan_module:
 .st_finish:
     inc     dword [tok_idx]         ; consume '}'
     pop     rdx                     ; is_packed
+    cmp     dword [r14 + 16], 1     ; `@cell64`?
+    jne     .st_norm_fin
+    cmp     r13d, 64
+    ja      .err_cell64_sz
+    mov     r13d, 64                ; auto-pad `@cell64` to exact 64B cacheline
+    mov     r15d, 64
+    jmp     .st_save
+.err_cell64_sz:
+    mov     esi, [r14 + 24]
+    lea     rdi, [msg_bad_cell64]
+    mov     edx, msg_bad_cell64_len
+    jmp     err_msg_at_line
+.st_norm_fin:
     cmp     edx, 1
     je      .st_chk_empty
     ; Round total struct size up to `r15d` (`max_align`)
@@ -1001,9 +1152,12 @@ prescan_module:
 .stage_consts_late:
     pop     rax                     ; Pass 2a pending flag
     test    eax, eax
-    jz      .space_loop_init
+    jz      .stage_ptrs
     mov     edi, 1
     call    run_const_fixpoint
+
+.stage_ptrs:
+    call    resolve_custom_ptr_types
 
     ; === Stage 5: Resolve `@slab`, `@arena`, & `@port` Declarations ===
 .space_loop_init:
@@ -1025,6 +1179,12 @@ prescan_module:
     je      .resolve_port
     cmp     dword [r14 + 4], SKIND_ARENA
     je      .resolve_arena
+    cmp     dword [r14 + 4], SKIND_CAPSULE
+    je      .resolve_capsule
+    cmp     dword [r14 + 4], SKIND_RING
+    je      .resolve_ring_or_dmaq
+    cmp     dword [r14 + 4], SKIND_DMA_QUEUE
+    je      .resolve_ring_or_dmaq
 
     ; `@slab name : <ElemType | max: const_expr>`
     call    parse_resolved_type_tag ; eax = elem_ty_tag
@@ -1054,6 +1214,63 @@ prescan_module:
     mov     al, TOK_GT
     call    expect_tok_kind
     jmp     .alloc_space_vaddr
+
+.resolve_ring_or_dmaq:
+    ; `@ring name : <Cell64 | cap: Pow2>` / `@dma_queue name : <Desc | cap: Pow2>`
+    mov     eax, [r14 + 24]
+    shl     eax, 4
+    add     rax, [space_tok]
+    mov     r15d, [rax + 4]         ; decl line number
+    call    parse_resolved_type_tag ; eax = elem_ty
+    mov     [r14 + 20], eax
+    mov     edi, eax
+    call    type_size_align         ; eax = elem_size, edx = elem_align
+    mov     [r14 + 16], eax
+    mov     r12d, eax
+
+    cmp     dword [r14 + 4], SKIND_RING
+    jne     .chk_dmaq_elem
+    cmp     eax, 64
+    jne     .err_bad_ring
+    cmp     edx, 64
+    jne     .err_bad_ring
+    jmp     .ring_pipe
+.chk_dmaq_elem:
+    cmp     eax, 16
+    je      .ring_pipe
+    cmp     eax, 32
+    je      .ring_pipe
+    cmp     eax, 64
+    jne     .err_bad_ring
+
+.ring_pipe:
+    mov     al, TOK_PIPE
+    call    expect_tok_kind
+    call    next_tok_ptr            ; expect `cap`
+    cmp     byte [rax], TOK_IDENT
+    jne     parse_err_at_tok
+    mov     edx, [sym_cap_id]
+    cmp     [rax + 8], edx
+    jne     parse_err_at_tok
+    mov     al, TOK_COLON
+    call    expect_tok_kind
+    call    parse_const_lens_expr   ; rax = cap
+    cmp     rax, 2
+    jb      .err_bad_ring
+    lea     rdx, [rax - 1]
+    test    rax, rdx                ; cap must be power of 2!
+    jnz     .err_bad_ring
+    mov     [r14 + 24], rax
+    mov     r13, rax
+    imul    r13, r12
+    mov     al, TOK_GT
+    call    expect_tok_kind
+    jmp     .alloc_space_vaddr
+.err_bad_ring:
+    mov     esi, r15d
+    lea     rdi, [msg_bad_ring]
+    mov     edx, msg_bad_ring_len
+    jmp     err_msg_at_line
 
 .resolve_port:
     ; `@port name : <u8|u16|u32 | port_const_expr>`
@@ -1088,6 +1305,38 @@ prescan_module:
     mov     esi, r15d
     lea     rdi, [msg_bad_port]
     mov     edx, msg_bad_port_len
+    jmp     err_msg_at_line
+
+.resolve_capsule:
+    ; `@capsule name : <cap: 4KiB_aligned_bytes>` -> DMA-ready page-aligned capsule slot!
+    mov     eax, [r14 + 24]
+    shl     eax, 4
+    add     rax, [space_tok]
+    mov     r15d, [rax + 4]         ; decl line
+    call    next_tok_ptr
+    cmp     byte [rax], TOK_IDENT
+    jne     parse_err_at_tok
+    mov     edx, [sym_cap_id]
+    cmp     [rax + 8], edx
+    jne     parse_err_at_tok
+    mov     al, TOK_COLON
+    call    expect_tok_kind
+    call    parse_const_lens_expr   ; rax = byte capacity
+    cmp     rax, 4096
+    jb      .err_bad_cap_sz
+    test    rax, 4095               ; must be 4KiB page-aligned for hardware W^X sealing!
+    jnz     .err_bad_cap_sz
+    mov     dword [r14 + 16], 1
+    mov     dword [r14 + 20], TY_U8
+    mov     [r14 + 24], rax
+    mov     r13, rax
+    mov     al, TOK_GT
+    call    expect_tok_kind
+    jmp     .alloc_space_vaddr
+.err_bad_cap_sz:
+    mov     esi, r15d
+    lea     rdi, [msg_bad_capsule]
+    mov     edx, msg_bad_capsule_len
     jmp     err_msg_at_line
 
 .resolve_arena:

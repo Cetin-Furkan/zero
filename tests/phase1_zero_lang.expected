@@ -8,3 +8,4 @@ guards: oob=2 null=3 null_span=3 empty_len=0
 shifts/mod: su=4611686018427387904 si=-4611686018427387904 rm=2 mod0=1
 hex=ZE c_hex=65 prec1=14 prec2=113 shadow=22
 comptime_if: kept=30 side_calls=0
+fn_addr: valid=1 distinct=1

@@ -1,0 +1,200 @@
+// =============================================================================
+// Phase-2 True-Zero Language, Programmable Pointers & Silicon Suite
+// =============================================================================
+use "lib/math_ops.zr"
+use "lib/ptr_lenses.zr"
+
+@slab buf_u64   : <u64 | max: 16>
+@slab buf_raw32 : <u32 | max: 8>
+@slab stream_q  : <u64 | max: 4>
+@slab atom_slot : <u64 | max: 2>
+@slab fn_table  : <u64 | max: 4>
+
+fn middle_slice(s: str) str => s[5..9]
+
+fn sum_bytes(b: bytes) u64 {
+    acc: u64 = 0
+    for ch in b {
+        acc += ch
+    }
+    return acc
+}
+
+fn code_probe_fn(a: i64, b: i64) i64 {
+    @emit(0x90, 0x90)
+    return a + b
+}
+
+fn code_fail_fn(code: i64) i64 {
+    fail code
+    return 0
+}
+
+fn main() i64 {
+    print("=== Phase-2 Zero Power Suite ===")
+
+    // 1. Diamond `use`, constant bit-slices, `=>` arrow fns, `|>` pipelines, & `<<<`/`>>>` rotates
+    piped := 5 |> add_bias(3) |> scale_step(4) |> bump_one
+    r: u64 = 0x8000000000000005
+    r <<<= 1
+    r_back: u64 = r >>> 1
+    rot_ok := r_back == 0x8000000000000005
+    print("pipe={piped} seed_mid={SEED_MID} rot_c={ROT_CONST} r={r} rot_ok={rot_ok}")
+
+    // 2. First-class `str`/`bytes`, `RAX:RDX` slice return, & sub-slice bounds checks (`fail 2`)
+    mid := "ZERO_CORE_OS" |> middle_slice
+    msum := sum_bytes(mid)
+    oob1 := 0
+    {
+        _bad1 := "ABCD"[2..5]
+    } recover e1 {
+        oob1 = e1
+    }
+    oob2 := 0
+    {
+        _bad2 := "ABCD"[3..1]
+    } recover e2 {
+        oob2 = e2
+    }
+    print("slice: len={mid.len} sum={msum} oob1={oob1} oob2={oob2}")
+
+    // 3. Hardware bit-slices `expr[hi:lo]` & lvalue `target[hi:lo] = val`
+    desc: u64 = 0
+    desc[15:0]  = 103
+    desc[39:16] = 0xABCDEF
+    desc[47:40] = 0x89
+    b_mid := (0xDEADBEEF)[15:8]
+    print("bitslice: lim={desc[15:0]} base={desc[39:16]} typ={desc[47:40]} b_mid={b_mid}")
+
+    // 4. `match` multi-value, `lo..hi` half-open range, & `_` wildcard dispatch
+    m_acc := 0
+    for v in 0..10 {
+        match v {
+            0       => m_acc += 1
+            1, 3, 5 => m_acc += 10
+            6..9    => m_acc += 100
+            _       => m_acc += 1000
+        }
+    }
+    print("match: acc={m_acc}")
+
+    // 5. Hardware-lens loops (`idx, elem`, `<rev>`, `<stride>`, `<unroll: 4>`, `<prefetch>`)
+    pair_sum: u64 = 0
+    for idx, ch in "ABC" {
+        pair_sum += idx * 100 + ch
+    }
+    rev_digits := 0
+    for i in 0..6 <rev> {
+        rev_digits = rev_digits * 10 + i
+    }
+    stride_sum := 0
+    for i in 0..20 <stride: 5> {
+        stride_sum += i
+    }
+    unroll_sum := 0
+    for i in 0..11 <unroll: 4> {
+        unroll_sum += i
+    }
+    for i in 0..8 {
+        buf_u64[i] = (i + 1) * 10
+    }
+    pref_sum: u64 = 0
+    for x in buf_u64[0..8] <prefetch: 64> {
+        pref_sum += x
+    }
+    rev_str_first: u64 = 0
+    for ch in "XYZ" <rev> {
+        if rev_str_first == 0 {
+            rev_str_first = ch
+        }
+    }
+    print("loops: pair={pair_sum} rev={rev_digits} stride={stride_sum} unroll={unroll_sum} pref={pref_sum} rch={rev_str_first}")
+
+    // 6. Custom `@ptr` lenses (`mask`, `wrap`, `stride`, `bswap`), `@stream` (`movnti`), & `@atomic` (`lock`)
+    tagged_raw: u64 = buf_u64.base | (0xCAFE << 48)
+    tp := @MaskedU64Ptr(tagged_raw)
+    tp[0] = 777
+    tp[1] = 888
+    tag_hi := tp.raw[63:48]
+
+    rp := @Ring4Ptr(buf_u64.base + 64)
+    rp[6] = 91
+    wrap_hit := rp[10]
+
+    bp := @BeStridePtr(buf_raw32.base)
+    bp[1] = 0x11223344
+    bp[1] += 1
+    be_dec := bp[1]
+    be_mem := buf_raw32[2]
+
+    st := @stream<u64>(stream_q.base, 4)
+    st[0] = 10
+    st[1] = 20
+    st[2] = 30
+    st[3] = 40
+    @sfence()
+    st_sum: u64 = 0
+    for q in stream_q {
+        st_sum += q
+    }
+
+    at := @atomic<u64>(atom_slot.base)
+    at.store(10)
+    at_old := at.add(25)
+    cas_ok := at.cas(35, 99)
+    cas_no := at.cas(35, 123)
+    at_now := at.load()
+    print("ptrs: tag={tag_hi} t0={tp[0]} wrap={wrap_hit} be={be_dec} raw_be={be_mem}")
+    print("hw_mem: stream={st_sum} at_old={at_old} cas1={cas_ok} cas2={cas_no} at_now={at_now}")
+
+    // 7. Inline silicon instructions & first-class code pointers (`@code_bytes`, `@call`, `@emit`)
+    pc  := @popcnt(0xF0F00F0F)
+    lz  := @lzcnt(1 << 59)
+    tz  := @tzcnt(1 << 19)
+    bs2 := @bswap16(0x1234)
+    bs4 := @bswap32(0x01020304)
+    dep := @pdep(0b1101, 0x01010101)
+    ext := @pext(dep, 0x01010101)
+    crc := @crc32c(0xFFFFFFFF, 0x123456789ABCDEF0)
+    crc_nz := crc != 0
+    @prefetch(buf_u64.base)
+    @lfence()
+    @mfence()
+
+    cb := @code_bytes(code_probe_fn)
+    has_prologue := cb.len > 8 && cb[0] == 0x55
+    fn_table[0] = @fn_addr(code_probe_fn)
+    fn_table[1] = @fn_addr(code_fail_fn)
+    ic_res := @call(fn_table[0], 20, 22)
+    ic_err := 0
+    {
+        _boom := @call(fn_table[1], 77)
+    } recover e3 {
+        ic_err = e3
+    }
+    print("silicon: pc={pc} lz={lz} tz={tz} bs2={bs2} bs4={bs4} dep={dep} ext={ext} crc={crc_nz}")
+    print("code: prolog={has_prologue} ic_res={ic_res} ic_err={ic_err}")
+
+    // 8. Audit regressions: `<unroll: 4>` with `continue`, `<stride: 2 | unroll: 4>`, signed `bswap` & `atomic<i32>`
+    unr_cont := 0
+    for i in 0..9 <unroll: 4> {
+        if (i & 1) == 1 {
+            continue
+        }
+        unr_cont += i
+    }
+    str_unr := 0
+    for i in 0..7 <stride: 2 | unroll: 4> {
+        str_unr += i
+    }
+    be_i16 := @BeI16Ptr(buf_raw32.base)
+    be_i16[0] = -300
+    sx_i16: i64 = be_i16[0]
+    at32 := @atomic<i32>(atom_slot.base)
+    at32.store(-10)
+    old32 := at32.sub(5)
+    now32 := at32.load()
+    print("audit: ucont={unr_cont} sunr={str_unr} sxi16={sx_i16} old32={old32} now32={now32}")
+
+    return 0
+}

@@ -1,0 +1,11 @@
+=== Phase-2 Zero Power Suite ===
+pipe=33 seed_mid=305419896 rot_c=48 r=11 rot_ok=1
+slice: len=4 sum=297 oob1=2 oob2=2
+bitslice: lim=103 base=11259375 typ=137 b_mid=190
+match: acc=3331
+loops: pair=498 rev=543210 stride=30 unroll=55 pref=360 rch=90
+ptrs: tag=51966 t0=777 wrap=91 be=287454021 raw_be=1160978961
+hw_mem: stream=100 at_old=10 cas1=1 cas2=0 at_now=99
+silicon: pc=16 lz=4 tz=19 bs2=13330 bs4=67305985 dep=16842753 ext=13 crc=1
+code: prolog=1 ic_res=42 ic_err=77
+audit: ucont=20 sunr=12 sxi16=-300 old32=-10 now32=-15

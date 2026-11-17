@@ -1,0 +1,14 @@
+// Programmable `@ptr` hardware lenses (`tests/lib/ptr_lenses.zr`)
+use "../lib/math_ops.zr"
+
+// 48-bit tagged pointer (`[63:48]` = tag, `[47:0]` = virtual address)
+MaskedU64Ptr :: @ptr<u64 | mask: 0x0000_FFFF_FFFF_FFFF>
+
+// 4-slot power-of-2 circular ring pointer (`idx & 3`)
+Ring4Ptr     :: @ptr<u64 | wrap: 4>
+
+// Strided big-endian u32 hardware packet pointer (`bswap` on load & store, 8B stride)
+BeStridePtr  :: @ptr<u32 | stride: 8 | bswap>
+
+// Signed 16-bit big-endian hardware sensor pointer (`bswap` + `movsx`)
+BeI16Ptr     :: @ptr<i16 | bswap>

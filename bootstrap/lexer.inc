@@ -495,8 +495,13 @@ lexer_tokenize_range:
     jmp     .char_close
 .c_esc_t:
     cmp     dl, 't'
-    jne     .c_esc_0
+    jne     .c_esc_r
     mov     edx, 9
+    jmp     .char_close
+.c_esc_r:
+    cmp     dl, 'r'
+    jne     .c_esc_0
+    mov     edx, 13
     jmp     .char_close
 .c_esc_0:
     cmp     dl, '0'
@@ -646,6 +651,9 @@ lexer_tokenize_range:
     cmp     cl, '='
     mov     ah, TOK_EQ
     je      .emit_2
+    cmp     cl, '>'
+    mov     ah, TOK_FAT_ARROW
+    je      .emit_2
     mov     ah, TOK_ASSIGN
     jmp     .emit_1
 
@@ -662,11 +670,19 @@ lexer_tokenize_range:
     je      .emit_2
     cmp     cl, '<'
     jne     .lt_one
+    cmp     byte [rbp + 2], '<'
+    je      .lt_three
     cmp     byte [rbp + 2], '='
     mov     ah, TOK_SHL_EQ
     je      .emit_3
     mov     ah, TOK_SHL
     jmp     .emit_2
+.lt_three:
+    cmp     byte [rbp + 3], '='
+    mov     ah, TOK_ROL_EQ
+    je      .emit_4
+    mov     ah, TOK_ROL
+    jmp     .emit_3
 .lt_one:
     mov     ah, TOK_LT
     jmp     .emit_1
@@ -677,11 +693,19 @@ lexer_tokenize_range:
     je      .emit_2
     cmp     cl, '>'
     jne     .gt_one
+    cmp     byte [rbp + 2], '>'
+    je      .gt_three
     cmp     byte [rbp + 2], '='
     mov     ah, TOK_SHR_EQ
     je      .emit_3
     mov     ah, TOK_SHR
     jmp     .emit_2
+.gt_three:
+    cmp     byte [rbp + 3], '='
+    mov     ah, TOK_ROR_EQ
+    je      .emit_4
+    mov     ah, TOK_ROR
+    jmp     .emit_3
 .gt_one:
     mov     ah, TOK_GT
     jmp     .emit_1
@@ -699,6 +723,9 @@ lexer_tokenize_range:
     je      .emit_2
     cmp     cl, '='
     mov     ah, TOK_PIPE_EQ
+    je      .emit_2
+    cmp     cl, '>'
+    mov     ah, TOK_PIPE_GT
     je      .emit_2
     mov     ah, TOK_PIPE
     jmp     .emit_1
@@ -719,6 +746,14 @@ lexer_tokenize_range:
     je      .emit_2
     mov     ah, TOK_CARET
     jmp     .emit_1
+
+.emit_4:
+    mov     al, ah
+    xor     ah, ah
+    mov     ecx, 4
+    add     rbp, 4
+    call    emit_tok
+    jmp     .next_token
 
 .emit_3:
     mov     al, ah

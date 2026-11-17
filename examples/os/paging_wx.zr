@@ -1,0 +1,360 @@
+// =============================================================================
+// ZeroOS Hardware W^X 4-Level Paging, GDT/TSS & IDT (`os/paging_wx.zr`)
+// =============================================================================
+use "hw_types.zr"
+
+fn align4k(addr: u64) u64 => addr & ADDR_MASK_4K
+
+fn alloc_pt_page() u64 {
+    pg_idx: u64 = pt_state[0]
+    if pg_idx >= 512 {
+        @halt()
+    }
+    pt_state[0] = pg_idx + 1
+    return pg_idx
+}
+
+fn ensure_subtable(table_pg: u64, slot: u64) u64 {
+    idx: u64 = table_pg * 512 + slot
+    cur: u64 = pt_pool[idx]
+    if cur[0:0] != 0 {
+        if cur[7:7] != 0 {
+            @halt()
+        }
+        child_phys: u64 = cur |> align4k
+        return (child_phys - pt_pool.base) / PAGE_4K
+    }
+    new_pg: u64 = alloc_pt_page()
+    new_phys: u64 = pt_pool.base + new_pg * PAGE_4K
+    pt_pool[idx] = new_phys | PTE_DIR
+    return new_pg
+}
+
+fn overlaps_span(start: u64, len: u64, s_base: u64, s_end: u64) u64 {
+    if s_base >= s_end {
+        return 0
+    }
+    if start + len <= s_base || start >= s_end {
+        return 0
+    }
+    return 1
+}
+
+fn map_4k_page(addr: u64, flags: u64, overwrite: u64) i64 {
+    pdpt_pg := ensure_subtable(0,       addr[47:39])
+    pd_pg   := ensure_subtable(pdpt_pg, addr[38:30])
+    pt_pg   := ensure_subtable(pd_pg,   addr[29:21])
+    slot_idx: u64 = pt_pg * 512 + addr[20:12]
+    if overwrite == 0 && pt_pool[slot_idx][0:0] != 0 {
+        return 0
+    }
+    pt_pool[slot_idx] = addr | flags
+    return 0
+}
+
+fn map_2m_huge(addr: u64, flags: u64) u64 {
+    pdpt_pg := ensure_subtable(0,       addr[47:39])
+    pd_pg   := ensure_subtable(pdpt_pg, addr[38:30])
+    slot_idx: u64 = pd_pg * 512 + addr[29:21]
+    if pt_pool[slot_idx][0:0] != 0 {
+        return 0
+    }
+    pt_pool[slot_idx] = addr | flags | PDE_PS
+    return 1
+}
+
+fn map_1g_huge(addr: u64, flags: u64) u64 {
+    pdpt_pg := ensure_subtable(0, addr[47:39])
+    slot_idx: u64 = pdpt_pg * 512 + addr[38:30]
+    if pt_pool[slot_idx][0:0] != 0 {
+        return 0
+    }
+    pt_pool[slot_idx] = addr | flags | PDE_PS
+    return 1
+}
+
+fn build_wx_pagetables(handoff: @BootHandoff, gop_end: u64) u64 {
+    pt_state[0] = 1
+    ranges := @view<MemRange>(handoff.map, handoff.map_count)
+    code_base:  u64 = handoff.code_base
+    code_end:   u64 = code_base + handoff.code_bytes
+    tramp_base: u64 = handoff.ap_trampoline
+    tramp_end:  u64 = 0
+    if tramp_base != 0 {
+        tramp_end = tramp_base + PAGE_4K
+    }
+    gop_base: u64 = handoff.gop_base
+    cap_base: u64 = boot_capsule.base
+    cap_end:  u64 = cap_base + boot_capsule.cap
+
+    // Pass 1: WB DRAM (`kind == 1`) with `.text` & `<1MiB` trampoline mapped `PTE_RX`
+    //         and `@capsule` kept as 4KiB pages so dynamic `W^X` `PTE_RX` sealing never splits a hugepage!
+    for r in ranges {
+        if r.kind == 1 {
+            addr: u64 = r.phys |> align4k
+            end_addr: u64 = r.phys + r.byte_len
+            loop <max: 1048576 | until: addr >= end_addr> {
+                rem: u64 = end_addr - addr
+                did_huge: u64 = 0
+
+                if addr[29:0] == 0 && rem >= PAGE_1G {
+                    if overlaps_span(addr, PAGE_1G, gop_base, gop_end) == 0 && overlaps_span(addr, PAGE_1G, code_base, code_end) == 0 && overlaps_span(addr, PAGE_1G, tramp_base, tramp_end) == 0 && overlaps_span(addr, PAGE_1G, cap_base, cap_end) == 0 {
+                        did_huge = map_1g_huge(addr, PTE_RW_NX)
+                        if did_huge == 1 {
+                            addr += PAGE_1G
+                        }
+                    }
+                }
+
+                if did_huge == 0 && addr[20:0] == 0 && rem >= PAGE_2M {
+                    if overlaps_span(addr, PAGE_2M, gop_base, gop_end) == 0 && overlaps_span(addr, PAGE_2M, code_base, code_end) == 0 && overlaps_span(addr, PAGE_2M, tramp_base, tramp_end) == 0 && overlaps_span(addr, PAGE_2M, cap_base, cap_end) == 0 {
+                        did_huge = map_2m_huge(addr, PTE_RW_NX)
+                        if did_huge == 1 {
+                            addr += PAGE_2M
+                        }
+                    }
+                }
+
+                if did_huge == 0 {
+                    if overlaps_span(addr, PAGE_4K, gop_base, gop_end) == 0 {
+                        if (addr >= code_base && addr < code_end) || (tramp_base != 0 && addr == tramp_base) {
+                            map_4k_page(addr, PTE_RX, 1)
+                        } else {
+                            map_4k_page(addr, PTE_RW_NX, 1)
+                        }
+                    }
+                    addr += PAGE_4K
+                }
+            }
+        }
+    }
+
+    // Pass 2: ACPI Read-Only (`kind == 5`) -> `PTE_RO_NX`
+    for r in ranges {
+        if r.kind == 5 {
+            addr: u64 = r.phys |> align4k
+            end_addr: u64 = r.phys + r.byte_len
+            loop <max: 262144 | until: addr >= end_addr> {
+                if overlaps_span(addr, PAGE_4K, code_base, code_end) == 0 && overlaps_span(addr, PAGE_4K, tramp_base, tramp_end) == 0 && overlaps_span(addr, PAGE_4K, gop_base, gop_end) == 0 {
+                    map_4k_page(addr, PTE_RO_NX, 0)
+                }
+                addr += PAGE_4K
+            }
+        }
+    }
+
+    // Pass 3: UC MMIO (`kind == 3`) -> `PTE_UC_NX`
+    for r in ranges {
+        if r.kind == 3 {
+            addr: u64 = r.phys |> align4k
+            end_addr: u64 = r.phys + r.byte_len
+            loop <max: 262144 | until: addr >= end_addr> {
+                rem: u64 = end_addr - addr
+                did_2m: u64 = 0
+                if addr[20:0] == 0 && rem >= PAGE_2M {
+                    if overlaps_span(addr, PAGE_2M, gop_base, gop_end) == 0 && overlaps_span(addr, PAGE_2M, code_base, code_end) == 0 && overlaps_span(addr, PAGE_2M, tramp_base, tramp_end) == 0 {
+                        did_2m = map_2m_huge(addr, PTE_UC_NX)
+                        if did_2m == 1 {
+                            addr += PAGE_2M
+                        }
+                    }
+                }
+                if did_2m == 0 {
+                    if overlaps_span(addr, PAGE_4K, gop_base, gop_end) == 0 {
+                        map_4k_page(addr, PTE_UC_NX, 0)
+                    }
+                    addr += PAGE_4K
+                }
+            }
+        }
+    }
+
+    // Pass 4: WC GOP (`kind == 2`) -> `PTE_WC_NX`
+    for r in ranges {
+        if r.kind == 2 {
+            addr: u64 = r.phys |> align4k
+            end_addr: u64 = r.phys + r.byte_len
+            loop <max: 65536 | until: addr >= end_addr> {
+                rem: u64 = end_addr - addr
+                did_2m: u64 = 0
+                if addr[20:0] == 0 && rem >= PAGE_2M {
+                    did_2m = map_2m_huge(addr, PTE_WC_NX)
+                    if did_2m == 1 {
+                        addr += PAGE_2M
+                    }
+                }
+                if did_2m == 0 {
+                    map_4k_page(addr, PTE_WC_NX, 1)
+                    addr += PAGE_4K
+                }
+            }
+        }
+    }
+
+    return pt_pool.base
+}
+
+// Walks all 4 hardware page-table levels directly via `@PtePtr` (`mask: ADDR_MASK_4K`)!
+fn verify_no_wx_pages() u64 {
+    wx_hits: u64 = 0
+    pml4 := @PtePtr(pt_pool.base)
+    for i0 in 0..512 {
+        pml4e: u64 = pml4[i0]
+        if pml4e[0:0] != 0 {
+            pdpt := @PtePtr(pml4e)
+            for i1 in 0..512 {
+                pdpte: u64 = pdpt[i1]
+                if pdpte[0:0] != 0 {
+                    if pdpte[7:7] != 0 {
+                        if pdpte[1:1] != 0 && pdpte[63:63] == 0 {
+                            wx_hits += 1
+                        }
+                    } else {
+                        pd := @PtePtr(pdpte)
+                        for i2 in 0..512 {
+                            pde: u64 = pd[i2]
+                            if pde[0:0] != 0 {
+                                if pde[7:7] != 0 {
+                                    if pde[1:1] != 0 && pde[63:63] == 0 {
+                                        wx_hits += 1
+                                    }
+                                } else {
+                                    pt := @PtePtr(pde)
+                                    for i3 in 0..512 {
+                                        pte: u64 = pt[i3]
+                                        if pte[0:0] != 0 && pte[1:1] != 0 && pte[63:63] == 0 {
+                                            wx_hits += 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if wx_hits != 0 {
+        @halt()
+    }
+    return wx_hits
+}
+
+// Installs a dedicated 64B-aligned GDT + Available 64-bit TSS (`0x89`) using bit-slice mutation!
+fn setup_core_gdt_and_tss(slot: u64) i64 {
+    tss_base: u64 = tss_slab.base + slot * 128
+    tss := @view<Tss64>(tss_base)
+    tss.rsp0 = rsp0_slab.base + (slot + 1) * 16384
+    tss.iomap_base = @sizeof(Tss64)
+
+    tss_lo: u64 = 0
+    tss_lo[15:0]  = TSS_LIMIT
+    tss_lo[39:16] = tss_base[23:0]
+    tss_lo[47:40] = 0x89
+    tss_lo[63:56] = tss_base[31:24]
+
+    g_off: u64 = slot * 8
+    gdt_slab[g_off + 0] = 0
+    gdt_slab[g_off + 1] = 0x00AF_9A00_0000_FFFF
+    gdt_slab[g_off + 2] = 0x00CF_9200_0000_FFFF
+    gdt_slab[g_off + 3] = tss_lo
+    gdt_slab[g_off + 4] = tss_base[63:32]
+
+    @lgdt(gdt_slab.base + slot * 64, 39)
+    @ltr(0x18)
+    return 0
+}
+
+fn setup_idt() i64 {
+    stubs: u64 = @isr_stub_base()
+    for v in 0..256 {
+        uv: u64 = v
+        fn_addr: u64 = stubs + uv * 16
+        lo: u64 = 0
+        lo[15:0]  = fn_addr[15:0]
+        lo[31:16] = 0x0008
+        lo[47:32] = 0x8E00
+        lo[63:48] = fn_addr[31:16]
+        idt_slab[uv * 2]     = lo
+        idt_slab[uv * 2 + 1] = fn_addr[63:32]
+    }
+    @lidt(idt_slab.base, 4095)
+    return 0
+}
+
+fn verify_acpi_post_cr3(handoff: @BootHandoff) u64 {
+    if handoff.rsdp == 0 || handoff.madt == 0 {
+        return 0
+    }
+    rsdp := @view<AcpiRsdp>(handoff.rsdp)
+    if rsdp.signature != RSDP_MAGIC {
+        return 0
+    }
+    madt := @view<AcpiSdtHeader>(handoff.madt)
+    if madt.signature != MADT_SIG {
+        return 0
+    }
+    return 1
+}
+
+// Safely maps any unmapped 4KiB MMIO aperture (`ECAM` / PCIe `BAR0`) as `PTE_UC_NX` without disturbing hugepages
+fn ensure_uc_mmio_mapped(phys_start: u64, byte_len: u64) i64 {
+    addr: u64 = phys_start |> align4k
+    end_addr: u64 = phys_start + byte_len
+    did_map: u64 = 0
+    pml4 := @PtePtr(pt_pool.base)
+
+    loop <max: 4096 | until: addr >= end_addr> {
+        already: u64 = 0
+        pml4e: u64 = pml4[addr[47:39]]
+        if pml4e[0:0] != 0 {
+            pdpt := @PtePtr(pml4e)
+            pdpte: u64 = pdpt[addr[38:30]]
+            if pdpte[0:0] != 0 {
+                if pdpte[7:7] != 0 {
+                    already = 1
+                } else {
+                    pd := @PtePtr(pdpte)
+                    pde: u64 = pd[addr[29:21]]
+                    if pde[0:0] != 0 {
+                        if pde[7:7] != 0 {
+                            already = 1
+                        } else {
+                            pt := @PtePtr(pde)
+                            if pt[addr[20:12]][0:0] != 0 {
+                                already = 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if already == 0 {
+            map_4k_page(addr, PTE_UC_NX, 0)
+            did_map = 1
+        }
+        addr += PAGE_4K
+    }
+    if did_map == 1 {
+        @cr_write(3, @cr_read(3))
+    }
+    return 0
+}
+
+// Atomically seals a verified DMA-loaded `@capsule` from `PTE_RW_NX` -> `PTE_RX` / `PTE_RO_NX` (`WX=0`!)
+fn seal_capsule_wx_rx(cap_base: u64, rx_bytes: u64, total_cap: u64) i64 {
+    rx_end:  u64 = cap_base + ((rx_bytes + 4095) & ADDR_MASK_4K)
+    cap_end: u64 = cap_base + total_cap
+    addr:    u64 = cap_base
+    loop <max: 1024 | until: addr >= cap_end> {
+        if addr < rx_end {
+            map_4k_page(addr, PTE_RX, 1)
+        } else {
+            map_4k_page(addr, PTE_RO_NX, 1)
+        }
+        addr += PAGE_4K
+    }
+    @cr_write(3, @cr_read(3))
+    _wx: u64 = verify_no_wx_pages()
+    return 0
+}

@@ -87,6 +87,7 @@ _start:
     mov     rdi, [rsp + 16]
     mov     rsi, [rsp + 24]
     mov     byte [mode_efi], 0
+    mov     byte [mode_capsule], 0
 
     cmp     dword [rdi], 0x656C2D2D ; "--le"
     jne     .normal_mode
@@ -109,12 +110,29 @@ _start:
     mov     rdi, [rsp + 16]         ; argv[1]
     mov     rax, [str_flag_efi]
     cmp     [rdi], rax
-    jne     err_usage
+    jne     .check_cap_flag
     mov     rax, [str_flag_efi + 8]
     cmp     [rdi + 8], rax
-    jne     err_usage
+    jne     .check_cap_flag
     mov     byte [mode_lex], 0
     mov     byte [mode_efi], 1
+    mov     byte [mode_capsule], 0
+    jmp     .set_flag_paths
+
+.check_cap_flag:
+    mov     rax, [str_flag_cap]
+    cmp     [rdi], rax
+    jne     err_usage
+    mov     rax, [str_flag_cap + 8]
+    cmp     [rdi + 8], rax
+    jne     err_usage
+    cmp     byte [rdi + 16], 0
+    jne     err_usage
+    mov     byte [mode_lex], 0
+    mov     byte [mode_efi], 1      ; Capsule runs inside Ring-0 Reactor ABI (`gs:0` + `r12..r15`)!
+    mov     byte [mode_capsule], 1
+
+.set_flag_paths:
     mov     rax, [rsp + 24]
     mov     [in_path], rax
     mov     rax, [rsp + 32]
@@ -373,7 +391,39 @@ _start:
     call    sym_intern
     mov     [sym_wrpkru_id], eax
 
+    lea     rdi, [str_pause]
+    mov     esi, 5
+    call    sym_intern
+    mov     [sym_pause_id], eax
+
+    lea     rdi, [str_rdtsc]
+    mov     esi, 5
+    call    sym_intern
+    mov     [sym_rdtsc_id], eax
+
+    lea     rdi, [str_fn_addr]
+    mov     esi, 7
+    call    sym_intern
+    mov     [sym_fn_addr_id], eax
+
+    ; --- Pre-Intern Phase-2 Extended Language & Hardware Symbols ---
+    lea     rbx, [ext_sym_seed_table]
+    lea     r12, [ext_sym_ids_start]
+.ext_seed_lp:
+    movzx   esi, byte [rbx]
+    test    esi, esi
+    jz      .ext_seed_dn
+    lea     rdi, [rbx + 1]
+    call    sym_intern
+    mov     [r12], eax
+    add     r12, 4
+    movzx   ecx, byte [rbx]
+    lea     rbx, [rbx + rcx + 1]
+    jmp     .ext_seed_lp
+.ext_seed_dn:
+
     call    lexer_tokenize
+    call    expand_module_imports
 
     cmp     byte [mode_lex], 1
     jne     .compile_all
@@ -389,9 +439,15 @@ _start:
 .compile_all:
     call    compile_module
 
+    cmp     byte [mode_capsule], 1
+    je      .do_fin_capsule
     cmp     byte [mode_efi], 1
     jne     .finalize_elf
     call    finalize_efi_image
+    mov     r15, [space_out]
+    jmp     .write_output_file
+.do_fin_capsule:
+    call    finalize_capsule_image
     mov     r15, [space_out]
     jmp     .write_output_file
 
@@ -477,6 +533,8 @@ _start:
     mov     eax, SYS_CLOSE
     syscall
 
+    cmp     byte [mode_capsule], 1
+    je      .print_cap_ok
     cmp     byte [mode_efi], 1
     je      .print_efi_ok
 
@@ -484,6 +542,14 @@ _start:
     mov     edi, 1
     lea     rsi, [msg_ok]
     mov     edx, msg_ok_len
+    syscall
+    jmp     .exit_zero
+
+.print_cap_ok:
+    mov     eax, SYS_WRITE
+    mov     edi, 1
+    lea     rsi, [msg_ok_cap]
+    mov     edx, msg_ok_cap_len
     syscall
     jmp     .exit_zero
 
@@ -556,12 +622,17 @@ err_msg_at_line:
 ; Include Subsystems
 ; =============================================================================
 %include "bootstrap/lexer.inc"
+%include "bootstrap/imports.inc"
 %include "bootstrap/codegen.inc"
 %include "bootstrap/efi_boot.inc"
 %include "bootstrap/efi_writer.inc"
+%include "bootstrap/capsule_writer.inc"
 %include "bootstrap/types.inc"
 %include "bootstrap/intrinsics.inc"
 %include "bootstrap/views.inc"
+%include "bootstrap/pointers.inc"
+%include "bootstrap/reactor.inc"
+%include "bootstrap/loops.inc"
 %include "bootstrap/parser.inc"
 
 ; =============================================================================
@@ -604,6 +675,7 @@ str_cap:                db "cap"
 str_base:               db "base"
 str_rsp_align:          db "rsp_align"
 str_flag_efi:           db "--target=efi-os", 0
+str_flag_cap:           db "--target=capsule", 0
 str_cli:                db "cli"
 str_sti:                db "sti"
 str_hlt:                db "hlt"
@@ -632,12 +704,77 @@ str_write:              db "write"
 str_len:                db "len"
 str_halt:               db "halt"
 str_wrpkru:             db "wrpkru"
+str_pause:              db "pause"
+str_rdtsc:              db "rdtsc"
+str_fn_addr:            db "fn_addr"
+
+ext_sym_seed_table:
+    db 3,  "use"
+    db 5,  "match"
+    db 1,  "_"
+    db 4,  "span"
+    db 3,  "ptr"
+    db 3,  "raw"
+    db 4,  "mask"
+    db 6,  "stride"
+    db 4,  "wrap"
+    db 5,  "bswap"
+    db 3,  "rev"
+    db 6,  "unroll"
+    db 8,  "prefetch"
+    db 6,  "stream"
+    db 6,  "atomic"
+    db 4,  "load"
+    db 5,  "store"
+    db 4,  "swap"
+    db 3,  "add"
+    db 3,  "sub"
+    db 3,  "cas"
+    db 6,  "popcnt"
+    db 5,  "lzcnt"
+    db 5,  "tzcnt"
+    db 7,  "bswap16"
+    db 7,  "bswap32"
+    db 7,  "bswap64"
+    db 4,  "pdep"
+    db 4,  "pext"
+    db 6,  "crc32c"
+    db 7,  "clflush"
+    db 6,  "lfence"
+    db 6,  "sfence"
+    db 6,  "mfence"
+    db 10, "code_bytes"
+    db 4,  "call"
+    db 4,  "emit"
+    db 7,  "publish"
+    db 4,  "wait"
+    db 4,  "tile"
+    db 3,  "isr"
+    db 6,  "isr_ok"
+    db 9,  "dma_queue"
+    db 9,  "slot_addr"
+    db 10, "reactor_id"
+    db 10, "inbox_base"
+    db 12, "scratch_base"
+    db 10, "local_base"
+    db 12, "reactor_bind"
+    db 8,  "wrgsbase"
+    db 8,  "rdgsbase"
+    db 3,  "eoi"
+    db 7,  "movdiri"
+    db 9,  "cpuid_ecx"
+    db 9,  "cpuid_ebx"
+    db 7,  "capsule"
+    db 0
 
 msg_ok:                 db "[zero0] phase-0 compile ok: emitted 2-segment W^X ELF64 binary", 10
 msg_ok_len              equ $ - msg_ok
 
-msg_ok_efi:             db "[zero0] gate-1a compile ok: emitted standalone PE32+ UEFI OS image", 10
+msg_ok_efi:             db "[zero0] gate-2 compile ok: emitted standalone PE32+ UEFI OS image", 10
 msg_ok_efi_len          equ $ - msg_ok_efi
+
+msg_ok_cap:             db "[zero0] gate-3 compile ok: emitted CRC32C-signed immutable @capsule (.zcap)", 10
+msg_ok_cap_len          equ $ - msg_ok_cap
 
 msg_usage:              db "usage: zero0 <in.zr> <out_elf> | zero0 --target=efi-os <in.zr> <out.efi> | zero0 --lex <in.zr>", 10
 msg_usage_len           equ $ - msg_usage
@@ -689,6 +826,21 @@ msg_no_host_in_efi_len  equ $ - msg_no_host_in_efi
 
 msg_bad_port:           db "[zero0] invalid @port width or port number at line "
 msg_bad_port_len        equ $ - msg_bad_port
+
+msg_isr_violation:      db "[zero0] @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call at line "
+msg_isr_violation_len   equ $ - msg_isr_violation
+
+msg_bad_publish:        db "[zero0] publish requires 64-byte @cell64 with 64B alignment at line "
+msg_bad_publish_len     equ $ - msg_bad_publish
+
+msg_bad_ring:           db "[zero0] @ring/@dma_queue requires valid aligned element size and power-of-2 cap at line "
+msg_bad_ring_len        equ $ - msg_bad_ring
+
+msg_bad_cell64:         db "[zero0] @cell64 layout exceeds 64-byte hardware cacheline at line "
+msg_bad_cell64_len      equ $ - msg_bad_cell64
+
+msg_bad_capsule:        db "[zero0] @capsule requires 4KiB-aligned cap (and --target=capsule forbids mutable @slab/@ring) at line "
+msg_bad_capsule_len     equ $ - msg_bad_capsule
 
 align 8, db 0
 file_end:
@@ -751,6 +903,78 @@ sym_write_id:           resd 1
 sym_len_id:             resd 1
 sym_halt_id:            resd 1
 sym_wrpkru_id:          resd 1
+sym_pause_id:           resd 1
+sym_rdtsc_id:           resd 1
+sym_fn_addr_id:         resd 1
+
+ext_sym_ids_start:
+sym_use_id:             resd 1
+sym_match_id:           resd 1
+sym_wild_id:            resd 1
+sym_span_id:            resd 1
+sym_ptr_id:             resd 1
+sym_raw_id:             resd 1
+sym_mask_id:            resd 1
+sym_stride_id:          resd 1
+sym_wrap_id:            resd 1
+sym_bswap_id:           resd 1
+sym_rev_id:             resd 1
+sym_unroll_id:          resd 1
+sym_prefetch_id:        resd 1
+sym_stream_id:          resd 1
+sym_atomic_id:          resd 1
+sym_load_id:            resd 1
+sym_store_id:           resd 1
+sym_swap_id:            resd 1
+sym_add_id:             resd 1
+sym_sub_id:             resd 1
+sym_cas_id:             resd 1
+sym_popcnt_id:          resd 1
+sym_lzcnt_id:           resd 1
+sym_tzcnt_id:           resd 1
+sym_bswap16_id:         resd 1
+sym_bswap32_id:         resd 1
+sym_bswap64_id:         resd 1
+sym_pdep_id:            resd 1
+sym_pext_id:            resd 1
+sym_crc32c_id:          resd 1
+sym_clflush_id:         resd 1
+sym_lfence_id:          resd 1
+sym_sfence_id:          resd 1
+sym_mfence_id:          resd 1
+sym_code_bytes_id:      resd 1
+sym_call_id:            resd 1
+sym_emit_id:            resd 1
+sym_publish_id:         resd 1
+sym_wait_id:            resd 1
+sym_tile_id:            resd 1
+sym_isr_id:             resd 1
+sym_isr_ok_id:          resd 1
+sym_dma_queue_id:       resd 1
+sym_slot_addr_id:       resd 1
+sym_reactor_id:         resd 1
+sym_inbox_base_id:      resd 1
+sym_scratch_base_id:    resd 1
+sym_local_base_id:      resd 1
+sym_reactor_bind_id:    resd 1
+sym_wrgsbase_id:        resd 1
+sym_rdgsbase_id:        resd 1
+sym_eoi_id:             resd 1
+sym_movdiri_id:         resd 1
+sym_cpuid_ecx_id:       resd 1
+sym_cpuid_ebx_id:       resd 1
+sym_capsule_id:         resd 1
+
+tile_lex_depth:         resd 1
+cur_fn_attr:            resd 1
+
+fnlen_fix_cnt:          resd 1
+cur_fn_ret_ty:          resd 1
+import_mod_cnt:         resd 1
+import_final_cnt:       resd 1
+import_scratch_off:     resq 1
+import_src_off:         resq 1
+bit_slice_desc:         resd 4
 efi_isr_stubs_off:      resd 1
 efi_code_span_patch_off: resd 1
 
@@ -781,7 +1005,9 @@ last_expr_ty:           resd 1
 
 mode_lex:               resb 1
 mode_efi:               resb 1
+mode_capsule:           resb 1
 const_trial_mode:       resb 1
 const_unresolved_hit:   resb 1
 in_fn_body:             resb 1
+in_isr_mode:            resb 1
 bss_end:

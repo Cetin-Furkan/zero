@@ -68,6 +68,12 @@
 %define TOK_PERCENT_EQ  59      ; %=
 %define TOK_SHL_EQ      60      ; <<=
 %define TOK_SHR_EQ      61      ; >>=
+%define TOK_FAT_ARROW   62      ; =>  (expression fn / match arm)
+%define TOK_PIPE_GT     63      ; |>  (dataflow pipeline)
+%define TOK_ROL         64      ; <<< (64-bit hardware rotate left)
+%define TOK_ROR         65      ; >>> (64-bit hardware rotate right)
+%define TOK_ROL_EQ      66      ; <<<=
+%define TOK_ROR_EQ      67      ; >>>=
 
 ; --- Pre-Interned Canonical Keyword IDs (`sym_id` 1 .. KW_COUNT) ---
 %define KW_FN           1
@@ -122,22 +128,29 @@
 %define TY_I32          6
 %define TY_U64          7       ; 64-bit unsigned integer (`u64`, `mask64`, `bool`, `bit`)
 %define TY_INT_LIT      8       ; non-negated integer literal (signed default; coerces with u*)
-%define TY_BITPACK_BASE 0x100   ; 0x100 + type_idx -> bit-partitioned `<...|...>` (unsigned)
-%define TY_STRUCT_BASE  0x200   ; 0x200 + type_idx -> record struct `{ ... }`
+%define TY_BITPACK_BASE    0x100   ; 0x100 + type_idx -> bit-partitioned `<...|...>` (unsigned)
+%define TY_STRUCT_BASE     0x200   ; 0x200 + type_idx -> record struct `{ ... }`
+%define TY_CUSTOM_PTR_BASE 0x300   ; 0x300 + type_idx -> custom programmable `@ptr<...>`
 
 %define TY_BASE_MASK     0x0FFF
 %define TY_FLAG_VIEW_ONE 0x1000 ; 8-byte single-instance typed overlay pointer (`@Type`, `@view<T>(addr)`)
-%define TY_FLAG_SPAN     0x2000 ; 16-byte `{ base: u64, len: u64 }` bounded span (`@view<T>(addr, len)`)
+%define TY_FLAG_SPAN     0x2000 ; 16-byte `{ base: u64, len: u64 }` bounded span (`str`, `bytes`, `[]T`)
 %define TY_FLAG_MMIO     0x4000 ; marks `@mmio<T>` volatile aperture
+%define TY_FLAG_STREAM   0x8000 ; marks `@stream<T>` non-temporal `movnti` span
+%define TY_FLAG_ATOMIC   0x10000 ; marks `@atomic<T>` hardware `lock` pointer
 
 ; --- User Type Kind Constants ---
 %define UKIND_BITPACK   1
 %define UKIND_STRUCT    2
+%define UKIND_PTR       3
 
 ; --- Topological Space Kind Constants ---
 %define SKIND_SLAB      1
 %define SKIND_ARENA     2
 %define SKIND_PORT      3
+%define SKIND_RING      4
+%define SKIND_DMA_QUEUE 5
+%define SKIND_CAPSULE   6
 
 ; --- Target Virtual Memory Constants ---
 %define TARGET_BASE     0x00400000
@@ -163,4 +176,13 @@
 %define AST_CNT_CNT_OFF     0x0B6000
 %define AST_REC_PATCH_OFF   0x0B8000
 %define AST_REC_CNT_OFF     0x0BA000
+%define AST_LOOP_TILE_OFF   0x0BC000    ; 32 x u32 `tile_lex_depth` at each loop scope
+%define AST_REC_TILE_OFF    0x0BD000    ; 32 x u32 `tile_lex_depth` at each `recover` scope
 %define AST_INTERP_BUF_OFF  0x0C0000
+%define AST_FNLEN_OFF       0x0D0000    ; 4096 x u32 compiled function byte lengths (`@code_bytes`)
+%define AST_PTRMETA_OFF     0x0D8000    ; 512 x 32B custom `@ptr` descriptors (`mask`, `wrap`, `stride`, `flags`)
+%define AST_FNLEN_FIX_OFF   0x0DC000    ; 2048 x 8B `[patch_off:u32, fn_idx:u32]` fixups for `@code_bytes`
+%define AST_IMPORT_META_OFF 0x0E0000    ; 256 x u32 deduplicated module `sym_id`s
+%define AST_FN_ATTR_OFF     0x0E1000    ; 4096 x u8 function attr (`0`=normal, `1`=`@isr`, `2`=`@isr_ok`)
+%define AST_IMPORT_FINAL    0x100000    ; 16 MiB expanded token stream staging arena
+%define AST_IMPORT_SCRATCH  0x1100000   ; 16 MiB recursive per-module token scratch arena

@@ -1,0 +1,394 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — Core Tables & Host I/O (`compiler/defs.zr`)
+// =============================================================================
+// Pure `.zr`, zero C, zero LLVM, zero libc, zero heap/malloc: all compiler tables
+// live in disjoint static `@slab` spaces inside `Phdr[1]` (`PF_R | PF_W` `.bss`).
+// =============================================================================
+
+// --- Linux x86-64 Syscall Numbers & Flags ---
+SYS_READ        :: 0
+SYS_WRITE       :: 1
+SYS_CLOSE       :: 3
+SYS_LSEEK       :: 8
+SYS_EXIT        :: 60
+SYS_FCHMOD      :: 91
+SYS_OPENAT      :: 257
+
+AT_FDCWD        :: -100
+O_WR_TRUNC_CR   :: 577      // O_WRONLY(1) | O_CREAT(64) | O_TRUNC(512)
+MODE_0755       :: 493      // 0o755
+SEEK_END        :: 2
+
+// --- Target Layout Constants ---
+ELF_HDR_LEN     :: 176      // 64B Ehdr + 2 * 56B Phdr
+ELF_TEXT_BASE   :: 0x400000
+ELF_DATA_BASE   :: 0x10000000
+ZCAP_HDR_LEN    :: 64
+
+// --- Token Kinds ---
+TOK_EOF         :: 0
+TOK_IDENT       :: 1
+TOK_KW          :: 2
+TOK_INT         :: 3
+TOK_STR         :: 4
+TOK_CHAR        :: 5
+
+TOK_LPAREN      :: 10
+TOK_RPAREN      :: 11
+TOK_LBRACE      :: 12
+TOK_RBRACE      :: 13
+TOK_LBRACK      :: 14
+TOK_RBRACK      :: 15
+TOK_COLON       :: 16
+TOK_COLON2      :: 17       // ::
+TOK_WALRUS      :: 18       // :=
+TOK_ASSIGN      :: 19       // =
+TOK_COMMA       :: 20
+TOK_DOT         :: 21
+TOK_DOT2        :: 22       // ..
+TOK_AT          :: 23       // @
+TOK_PIPE        :: 24       // |
+TOK_AMP         :: 25       // &
+TOK_CARET       :: 26       // ^
+TOK_TILDE       :: 27       // ~
+TOK_BANG        :: 28       // !
+TOK_QMARK       :: 29       // ?
+TOK_SEMI        :: 30       // ;
+
+TOK_PLUS        :: 32
+TOK_MINUS       :: 33
+TOK_STAR        :: 34
+TOK_SLASH       :: 35
+TOK_PERCENT     :: 36
+TOK_SHL         :: 37       // <<
+TOK_SHR         :: 38       // >>
+TOK_ROL         :: 39       // <<<
+TOK_ROR         :: 40       // >>>
+
+TOK_EQ          :: 42       // ==
+TOK_NE          :: 43       // !=
+TOK_LT          :: 44       // <
+TOK_LE          :: 45       // <=
+TOK_GT          :: 46       // >
+TOK_GE          :: 47       // >=
+TOK_AND2        :: 48       // &&
+TOK_OR2         :: 49       // ||
+
+TOK_PLUS_EQ     :: 52       // +=
+TOK_MINUS_EQ    :: 53       // -=
+TOK_STAR_EQ     :: 54       // *=
+TOK_SLASH_EQ    :: 55       // /=
+TOK_PERCENT_EQ  :: 56       // %=
+TOK_PIPE_EQ     :: 57       // |=
+TOK_AMP_EQ      :: 58       // &=
+TOK_CARET_EQ    :: 59       // ^=
+TOK_SHL_EQ      :: 60       // <<=
+TOK_SHR_EQ      :: 61       // >>=
+TOK_ROL_EQ      :: 62       // <<<=
+TOK_ROR_EQ      :: 63       // >>>=
+
+TOK_ARROW       :: 66       // ->
+TOK_FAT_ARROW   :: 67       // =>
+TOK_PIPE_GT     :: 68       // |>
+
+// --- Keyword IDs ---
+KW_FN           :: 1
+KW_RETURN       :: 2
+KW_IF           :: 3
+KW_ELSE         :: 4
+KW_FOR          :: 5
+KW_IN           :: 6
+KW_LOOP         :: 7
+KW_BREAK        :: 8
+KW_CONTINUE     :: 9
+KW_FAIL         :: 10
+KW_RECOVER      :: 11
+KW_SYSCALL      :: 12
+KW_PRINT        :: 13
+KW_TRUE         :: 14
+KW_FALSE        :: 15
+KW_SLAB         :: 16
+KW_ARENA        :: 17
+KW_CAPSULE      :: 18
+
+// --- Type Tags & Modifiers ---
+TY_VOID         :: 0
+TY_I64          :: 1
+TY_U64          :: 2
+TY_I32          :: 3
+TY_U32          :: 4
+TY_I16          :: 5
+TY_U16          :: 6
+TY_I8           :: 7
+TY_U8           :: 8
+TY_BP_BASE      :: 64       // 64 + bp_idx
+
+TY_BASE_MASK    :: 0x0FFF
+TY_FLAG_VIEW1   :: 0x1000   // @view<T>(addr) single pointer overlay
+TY_FLAG_SPAN    :: 0x2000   // 16B `{ ptr: u64, len: u64 }` (`str`, `bytes`, `[]T`)
+
+// --- Global Compiler State Indices (`g[G_*]`) ---
+G_MODE_CAPSULE  :: 0
+G_MODE_LEX      :: 1
+G_SRC_OFF       :: 2
+G_IMP_CNT       :: 3
+G_STR_OFF       :: 4
+G_SYM_CNT       :: 5
+G_TOK_CNT       :: 6
+G_TOK_IDX       :: 7
+G_CST_CNT       :: 8
+G_CST_TRIAL     :: 9
+G_CST_UNRES     :: 10
+G_BP_CNT        :: 11
+G_BPF_CNT       :: 12
+G_SP_CNT        :: 13
+G_BSS_OFF       :: 14
+G_FN_CNT        :: 15
+G_FNP_CNT       :: 16
+G_CODE_OFF      :: 17
+G_TGT_RO_OFF    :: 18
+G_RO_FIX_CNT    :: 19
+G_CALL_FIX_CNT  :: 20
+G_RT_WRITE_OFF  :: 21
+G_TOTAL_OUT     :: 22
+G_LOC_CNT       :: 23
+G_SCOPE_DEPTH   :: 24
+G_FRAME_QW      :: 25
+G_TEMP_DEPTH    :: 26
+G_MAX_FRAME_QW  :: 27
+G_CUR_RET_TY    :: 28
+G_LAST_EXPR_TY  :: 29
+G_LP_DEPTH      :: 30
+G_REC_DEPTH     :: 31
+G_TILE_DEPTH    :: 32
+G_PATCH_CNT     :: 33
+
+// Pre-interned contextual symbol IDs
+G_SYM_MAIN      :: 40
+G_SYM_USE       :: 41
+G_SYM_MAX       :: 42
+G_SYM_CAP       :: 43
+G_SYM_UNTIL     :: 44
+G_SYM_BITS      :: 45
+G_SYM_BASE      :: 46
+G_SYM_PTR       :: 47
+G_SYM_LEN       :: 48
+G_SYM_VIEW      :: 49
+G_SYM_RSP_ALIGN :: 50
+G_SYM_CRC32C    :: 51
+G_SYM_POPCNT    :: 52
+G_SYM_LZCNT     :: 53
+G_SYM_TZCNT     :: 54
+G_SYM_RID       :: 55
+G_SYM_CALL      :: 56
+G_SYM_FN_ADDR   :: 57
+G_SYM_SIZEOF    :: 58
+G_SYM_ALIGNOF   :: 59
+G_SYM_TILE      :: 60
+
+// --- Static `@slab` Arenas (Zero-Initialized in `Phdr[1]` `.bss`) ---
+@slab g            : <i64 | max: 64>
+
+@slab src_buf      : <u8  | max: 524288>
+@slab imp_syms     : <u32 | max: 128>
+@slab path_scratch : <u8  | max: 4096>
+@slab canon_buf    : <u8  | max: 4096>
+
+@slab str_pool     : <u8  | max: 262144>
+@slab sym_off      : <u32 | max: 8192>
+@slab sym_len      : <u32 | max: 8192>
+@slab sym_kw       : <u8  | max: 8192>
+@slab sym_ht       : <u32 | max: 16384>     // power-of-2 open-addressing table
+
+@slab tok_kind     : <u8  | max: 131072>
+@slab tok_kw       : <u8  | max: 131072>
+@slab tok_line     : <u32 | max: 131072>
+@slab tok_val      : <i64 | max: 131072>
+@slab tok_aux      : <u32 | max: 131072>
+
+@slab cst_sym      : <u32 | max: 2048>
+@slab cst_tok      : <u32 | max: 2048>
+@slab cst_done     : <u8  | max: 2048>
+@slab cst_val      : <i64 | max: 2048>
+
+@slab bp_sym       : <u32 | max: 128>
+@slab bp_bytes     : <u32 | max: 128>
+@slab bp_fstart    : <u32 | max: 128>
+@slab bp_fcnt      : <u32 | max: 128>
+@slab bpf_sym      : <u32 | max: 1024>
+@slab bpf_shift    : <u32 | max: 1024>
+@slab bpf_width    : <u32 | max: 1024>
+
+@slab sp_sym       : <u32 | max: 512>
+@slab sp_elem_ty   : <u32 | max: 512>
+@slab sp_elem_sz   : <u32 | max: 512>
+@slab sp_cap       : <u64 | max: 512>
+@slab sp_vaddr     : <u64 | max: 512>
+
+@slab fn_sym       : <u32 | max: 1024>
+@slab fn_defined   : <u8  | max: 1024>
+@slab fn_ret_ty    : <u32 | max: 1024>
+@slab fn_arity     : <u32 | max: 1024>
+@slab fn_pstart    : <u32 | max: 1024>
+@slab fn_code_off  : <u32 | max: 1024>
+@slab fn_param_ty  : <u32 | max: 8192>
+
+@slab loc_sym      : <u32 | max: 2048>
+@slab loc_ty       : <u32 | max: 2048>
+@slab loc_disp     : <i64 | max: 2048>
+@slab loc_depth    : <u32 | max: 2048>
+
+@slab lp_cont_tgt  : <i64 | max: 64>
+@slab lp_brk_head  : <i64 | max: 64>
+@slab lp_cont_head : <i64 | max: 64>
+@slab lp_tile_base : <i64 | max: 64>
+
+@slab rec_jmp_head : <i64 | max: 64>
+@slab rec_tile_base: <i64 | max: 64>
+
+@slab patch_loc    : <u32 | max: 8192>
+@slab patch_next   : <i64 | max: 8192>
+
+@slab out_buf      : <u8  | max: 1048576>
+@slab tgt_ro_buf   : <u8  | max: 262144>
+@slab ro_fix_code  : <u32 | max: 16384>
+@slab ro_fix_off   : <u32 | max: 16384>
+@slab call_fix_off : <u32 | max: 32768>
+@slab call_fix_fn  : <u32 | max: 32768>
+
+// --- Fatal Diagnostics & Host Syscall Helpers ---
+
+fn write_stderr_str(s: str) {
+    @syscall(SYS_WRITE, 2, s.base, s.len)
+}
+
+fn write_stderr_u64(val: u64) {
+    if val == 0 {
+        write_stderr_str("0")
+        return
+    }
+    n: u64 = val
+    pos: i64 = 31
+    loop <max: 32 | until: n == 0> {
+        path_scratch[pos] = (n % 10) + '0'
+        n /= 10
+        pos -= 1
+    }
+    start: i64 = pos + 1
+    cnt: i64 = 32 - start
+    @syscall(SYS_WRITE, 2, path_scratch.base + start, cnt)
+}
+
+fn die_msg(msg: str) {
+    write_stderr_str(msg)
+    write_stderr_str("\n")
+    @syscall(SYS_EXIT, 1)
+}
+
+fn die_line(msg: str, line: i64) {
+    write_stderr_str(msg)
+    if line > 0 {
+        write_stderr_str(" at line ")
+        write_stderr_u64(line)
+    }
+    write_stderr_str("\n")
+    @syscall(SYS_EXIT, 1)
+}
+
+fn die_cur(msg: str) {
+    idx := g[G_TOK_IDX]
+    die_line(msg, tok_line[idx])
+}
+
+fn cstr_len(ptr: u64) u64 {
+    v := @view<u8>(ptr, 4096)
+    for i in 0..4096 {
+        if v[i] == 0 {
+            return i
+        }
+    }
+    return 4096
+}
+
+fn cstr_eq_str(ptr: u64, s: str) i64 {
+    n: u64 = cstr_len(ptr)
+    if n != s.len {
+        return 0
+    }
+    v := @view<u8>(ptr, n)
+    for i in 0..n {
+        if v[i] != s[i] {
+            return 0
+        }
+    }
+    return 1
+}
+
+// --- Hardware SSE4.2 `@crc32c` String / Symbol Interner ---
+
+fn hash_bytes_pool(off: i64, len: i64) u64 {
+    acc: u64 = 0xFFFF_FFFF
+    for i in 0..len {
+        b: u64 = str_pool[off + i]
+        acc = @crc32c(acc, b)
+    }
+    if acc == 0 {
+        return 1
+    }
+    return acc
+}
+
+fn pool_append_bytes(ptr: u64, len: u64) i64 {
+    start := g[G_STR_OFF]
+    if len > 0 {
+        v := @view<u8>(ptr, len)
+        for i in 0..len {
+            str_pool[start + i] = v[i]
+        }
+        g[G_STR_OFF] = start + len
+    }
+    return start
+}
+
+fn sym_intern_pool(off: i64, len: i64) i64 {
+    h: u64 = hash_bytes_pool(off, len)
+    slot: u64 = h & 16383
+    for probe in 0..16384 {
+        id: u64 = sym_ht[slot]
+        if id == 0 {
+            new_id := g[G_SYM_CNT] + 1
+            g[G_SYM_CNT] = new_id
+            sym_off[new_id] = off
+            sym_len[new_id] = len
+            sym_ht[slot] = new_id
+            return new_id
+        }
+        s_len: i64 = sym_len[id]
+        if s_len == len {
+            s_off: i64 = sym_off[id]
+            same := 1
+            for k in 0..len {
+                if str_pool[s_off + k] != str_pool[off + k] {
+                    same = 0
+                    break
+                }
+            }
+            if same == 1 {
+                return id
+            }
+        }
+        slot = (slot + 1) & 16383
+    }
+    die_msg("error: symbol table full")
+    return 0
+}
+
+fn sym_intern_str(s: str) i64 {
+    off := pool_append_bytes(s.base, s.len)
+    return sym_intern_pool(off, s.len)
+}
+
+fn reg_kw(s: str, kw_id: i64) {
+    id := sym_intern_str(s)
+    sym_kw[id] = kw_id
+}

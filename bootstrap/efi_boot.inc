@@ -16,8 +16,10 @@
 %define EFI_SYS_NR_CFG_TABLES       0x68
 %define EFI_SYS_CFG_TABLES          0x70
 
+%define EFI_BS_ALLOCATE_PAGES       0x28
 %define EFI_BS_GET_MEMORY_MAP       0x38
 %define EFI_BS_EXIT_BOOT_SERVICES   0xE8
+%define EFI_BS_STALL                0xF8
 %define EFI_BS_LOCATE_PROTOCOL      0x140
 
 %define EFI_BSS_HANDOFF_OFF         0x00040
@@ -26,6 +28,7 @@
 %define EFI_BSS_RAW_MMAP_CAP        0x08000
 %define EFI_BSS_STACK_TOP_OFF       0x1C000
 %define EFI_BSS_ISR_LINE_OFF        0x1C040
+%define EFI_BSS_REACTOR_OFF         0x1E000
 %define EFI_BSS_USER_START          0x20000
 
 %define PE_HDR_FILE_SIZE            0x00200
@@ -155,7 +158,7 @@ efi_save_nonvol_end:
 efi_harvest_stub:
     mov     rbp, rsp
     and     rsp, -16
-    sub     rsp, 96                 ; 32B MS shadow space + local scratch slots
+    sub     rsp, 112                ; 32B MS shadow space + aligned local scratch slots
 
     mov     r12, rcx                ; r12 = ImageHandle
     mov     r13, rdx                ; r13 = SystemTable
@@ -328,6 +331,96 @@ efi_harvest_stub:
     jmp     .rsdt_loop
 .acpi_done:
 
+    ; --- 2b. Calibrate `tsc_per_ms` via `Stall(1000)` & Reserve Gate-1b AP Memory ---
+    mov     qword [rdi + 64],  0    ; BootHandoff.ap_release = 0
+    mov     qword [rdi + 72],  0    ; BootHandoff.ap_stack_base = 0
+    mov     qword [rdi + 112], 0    ; BootHandoff.ap_trampoline = 0
+
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     rbx, rax                ; rbx = t0 (MS x64 non-volatile)
+
+    mov     ecx, 1000               ; 1000 us = 1 ms
+    mov     rax, [r14 + EFI_BS_STALL]
+    call    rax
+
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    sub     rax, rbx
+    cmp     rax, 100000
+    jae     .save_tsc_ms
+    mov     eax, 2000000            ; 2.0 GHz floor if Stall stubbed
+.save_tsc_ms:
+    mov     [rdi + 120], rax        ; BootHandoff.tsc_per_ms
+
+    cmp     qword [rdi + 48], 0     ; skip AP reservation if no MADT
+    je      .mp_alloc_done
+
+    ; Allocate 4 pages (16 KiB) < 0xA0000 (`AllocateMaxAddress = 1`, `EfiLoaderData = 2`)
+    mov     qword [rsp + 80], 0x9FFFF
+    mov     ecx, 1
+    mov     edx, 2
+    mov     r8d, 4
+    lea     r9,  [rsp + 80]
+    mov     rax, [r14 + EFI_BS_ALLOCATE_PAGES]
+    call    rax
+    test    rax, rax
+    jnz     .mp_alloc_done
+
+    mov     rbx, [rsp + 80]         ; rbx = tramp_phys
+    cmp     rbx, 0x1000
+    jb      .mp_alloc_done
+    cmp     rbx, 0x9C000
+    ja      .mp_alloc_done
+    test    ebx, 0xFFF
+    jnz     .mp_alloc_done
+
+    ; Allocate 64 pages (256 KiB = 16 x 16 KiB stacks) (`AllocateAnyPages = 0`, `EfiLoaderData = 2`)
+    mov     qword [rsp + 88], 0
+    xor     ecx, ecx
+    mov     edx, 2
+    mov     r8d, 64
+    lea     r9,  [rsp + 88]
+    mov     rax, [r14 + EFI_BS_ALLOCATE_PAGES]
+    call    rax
+    test    rax, rax
+    jnz     .mp_alloc_done
+    cmp     qword [rsp + 88], 0
+    je      .mp_alloc_done
+
+    ; Zero 16 KiB (`[tramp_phys .. tramp_phys + 0x4000)`) and install `ap_trampoline_blob`
+    mov     rdi, rbx
+    xor     eax, eax
+    mov     ecx, 2048
+    rep     stosq
+
+    mov     rdi, rbx
+    lea     rsi, [rel .ap_trampoline_blob]
+    mov     ecx, AP_TRAMP_BLOB_LEN
+    rep     movsb
+
+    lea     eax, [rbx + AP_TRAMP_GDT_OFF]
+    mov     [rbx + AP_TRAMP_GDTR_OFF + 2], eax
+    lea     eax, [rbx + AP_TRAMP_PM32_REL]
+    mov     [rbx + AP_TRAMP_LJMP32_OFF], eax
+    lea     eax, [rbx + AP_TRAMP_LM64_REL]
+    mov     [rbx + AP_TRAMP_LJMP64_OFF], eax
+
+    ; Transitional 0..2 MiB identity page tables (`+0x1000..+0x3000`) for >4 GiB `new_cr3` switch
+    lea     rax, [rbx + 0x2003]
+    mov     [rbx + 0x1000], rax
+    lea     rax, [rbx + 0x3003]
+    mov     [rbx + 0x2000], rax
+    mov     qword [rbx + 0x3000], 0x83
+
+    lea     rdi, [r15 + EFI_BSS_HANDOFF_OFF]
+    mov     rax, [rsp + 88]
+    mov     [rdi + 72],  rax        ; BootHandoff.ap_stack_base
+    mov     [rdi + 112], rbx        ; BootHandoff.ap_trampoline
+
+.mp_alloc_done:
     ; --- 3. Query UEFI Memory Map & ExitBootServices (with retry on key change) ---
 .mmap_retry:
     mov     qword [rsp + 48], EFI_BSS_RAW_MMAP_CAP ; MemoryMapSize
@@ -449,11 +542,40 @@ efi_harvest_stub:
     test    rax, rax
     jnz     .mmap_retry             ; If key changed, re-fetch map & retry!
 
-    ; --- 5. Firmware Is Gone: Switch to 64 KiB Loader Stack & Enter `.zr` ---
+    ; --- 5. Firmware Is Gone: Switch to 64 KiB Loader Stack, Init BSP Reactor ABI (`gs:0` + `r12..r15`) & Enter `.zr` ---
     cli
     mov     dword [r15 + EFI_BSS_ISR_LINE_OFF], 0xFFFFFFFF ; sentinel: no exception
     lea     rsp, [r15 + EFI_BSS_STACK_TOP_OFF] ; 0 mod 16 aligned!
+
+    ; Initialize BSP (`slot 0`) `ReactorLocal[0]` at `.bss + 0x1E000` (64B cacheline aligned)
+    lea     r13, [r15 + EFI_BSS_REACTOR_OFF]
+    mov     eax, 1
+    xor     ecx, ecx
+    cpuid
+    shr     ecx, 3
+    and     ecx, 1
+    mov     [r13 + 32], rcx                    ; ReactorLocal.mwait_capable (`CPUID.01H:ECX[3]`)
+
+    mov     eax, 7
+    xor     ecx, ecx
+    cpuid
+    shr     ecx, 28
+    and     ecx, 1
+    mov     [r13 + 40], rcx                    ; ReactorLocal.movdir64b_capable (`CPUID.07H:ECX[28]`)
+
+    ; Bind `IA32_GS_BASE` (`MSR 0xC0000101`) = `&ReactorLocal[0]` so `[gs:0]` is live at instruction 0!
+    mov     rax, r13
+    mov     rdx, r13
+    shr     rdx, 32
+    mov     ecx, 0xC0000101
+    wrmsr
+
     lea     rdi, [r15 + EFI_BSS_HANDOFF_OFF]   ; arg0 = &BootHandoff
+    mov     r15, r13                           ; r15 = &ReactorLocal[0]
+    xor     r12d, r12d                         ; r12 = 0 (BSP Reactor ID)
+    xor     r13d, r13d                         ; r13 = 0 (inbox_base until bound)
+    xor     r14d, r14d                         ; r14 = 0 (scratch_base until bound)
+    xor     ebx, ebx
     jmp     .enter_zr_main
 
 .fail_return_firmware:
@@ -482,6 +604,9 @@ align 8, db 0
     dd 0xEB9D2D30
     dw 0x2D88, 0x11D3
     db 0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D
+
+align 16, db 0x90
+%include "bootstrap/ap_trampoline.inc"
 
 .enter_zr_main:
 efi_harvest_stub_end:

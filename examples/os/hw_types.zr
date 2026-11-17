@@ -1,0 +1,231 @@
+// =============================================================================
+// ZeroOS Hardware Layouts, Custom PTE Pointers & Ring-0 Slabs (`os/hw_types.zr`)
+// =============================================================================
+
+HANDOFF_MAGIC       :: 0x5A45_524F_4841_4E44
+RSDP_MAGIC          :: 0x2052_5450_2044_5352
+MADT_SIG            :: 0x4349_5041
+MCFG_SIG            :: 0x4746_434D
+ZEXT_MAGIC          :: 0x3154_4E45_5458_455A
+ZCAP_MAGIC          :: 0x5041_435A_4F52_455A
+MAX_CORES           :: 16
+
+IA32_APIC_BASE_MSR  :: 0x1B
+IA32_EFER_MSR       :: 0xC000_0080
+IA32_PAT_MSR        :: 0x277
+PAT_PA1_WC_VALUE    :: 0x0007_0406_0007_0106
+
+X2APIC_ID_MSR       :: 0x802
+X2APIC_SIVR_MSR     :: 0x80F
+X2APIC_ESR_MSR      :: 0x828
+X2APIC_ICR_MSR      :: 0x830
+
+PTE_NX              :: 1 << 63
+PTE_DIR             :: 0x03
+PTE_RX              :: 0x01
+PTE_RW_NX           :: 0x03 | PTE_NX
+PTE_RO_NX           :: 0x01 | PTE_NX
+PTE_WC_NX           :: 0x0B | PTE_NX
+PTE_UC_NX           :: 0x1B | PTE_NX
+PDE_PS              :: 0x80
+ADDR_MASK_4K        :: 0x000F_FFFF_FFFF_F000
+
+PAGE_4K             :: 0x1000
+PAGE_2M             :: 0x20_0000
+PAGE_1G             :: 0x4000_0000
+
+// Programmable hardware Page-Table Entry pointer: masks `[51:12]` inline on `pt[i]`!
+PtePtr :: @ptr<u64 | mask: ADDR_MASK_4K>
+
+// Typed hardware I/O port channels (`0xE9` debugcon, `i8042` PS/2 keyboard)
+@port debug_con     : <u8 | 0xE9>
+@port kbd_data      : <u8 | 0x60>
+@port kbd_status    : <u8 | 0x64>
+
+Tss64 :: <packed> {
+    res0:       u32
+    rsp0:       u64
+    rsp1:       u64
+    rsp2:       u64
+    res1:       u64
+    ist1:       u64
+    ist2:       u64
+    ist3:       u64
+    ist4:       u64
+    ist5:       u64
+    ist6:       u64
+    ist7:       u64
+    res2:       u64
+    res3:       u16
+    iomap_base: u16
+}
+
+TSS_LIMIT :: @sizeof(Tss64) - 1
+
+AcpiRsdp :: <packed> {
+    signature:  u64
+    checksum:   u8
+    oemid_lo:   u32
+    oemid_hi:   u16
+    revision:   u8
+    rsdt_addr:  u32
+    length:     u32
+    xsdt_addr:  u64
+}
+
+AcpiSdtHeader :: <packed> {
+    signature:    u32
+    length:       u32
+    revision:     u8
+    checksum:     u8
+    oemid_lo:     u32
+    oemid_hi:     u16
+    oem_table_id: u64
+    oem_rev:      u32
+    creator_id:   u32
+    creator_rev:  u32
+}
+
+MemRange :: {
+    kind:     u32
+    pad:      u32
+    phys:     u64
+    byte_len: u64
+}
+
+BootHandoff :: <align: 64B> {
+    magic:         u64
+    version:       u32
+    core_count:    u32
+    gop_base:      u64
+    gop_width:     u32
+    gop_height:    u32
+    gop_stride:    u32
+    gop_format:    u32
+    rsdp:          u64
+    madt:          u64
+    mcfg:          u64
+    ap_release:    u64
+    ap_stack_base: u64
+    map_count:     u32
+    map:           u64
+    code_base:     u64
+    code_bytes:    u64
+    ap_trampoline: u64
+    tsc_per_ms:    u64
+}
+
+// Per-core Ring-0 descriptor tables, page-table pool & MP coordination slabs in `.bss`
+@slab gdt_slab           : <u64 | max: 128>
+@slab tss_slab           : <u64 | max: 256>
+@slab rsp0_slab          : <u64 | max: 32768>
+@slab idt_slab           : <u64 | max: 512>
+@slab pt_pool            : <u64 | max: 262144>
+@slab pt_state           : <u64 | max: 4>
+@slab ap_mbox            : <u64 | max: 8>
+@slab core_apic_expected : <u32 | max: 16>
+@slab core_apic_hw       : <u32 | max: 16>
+@slab core_release_ack   : <u64 | max: 16>
+
+// =============================================================================
+// Gate-2 / Phase-3 Pinned Reactor ABI & Direct-Silicon `MOVDIR64B` Ring Fabric
+// =============================================================================
+CMD_COMPUTE :: 1
+CMD_PARK    :: 2
+
+ReactorLocal :: <align: 64B> {
+    fault:             u64
+    tile_depth:        u64
+    if_before_tile:    u64
+    inbox_seq:         u64
+    mwait_capable:     u64
+    movdir64b_capable: u64
+    wake_count:        u64
+    last_latency_tsc:  u64
+}
+
+TaskCell :: @cell64 {
+    seq:   u64
+    cmd:   u32
+    src:   u32
+    seed0: u64
+    seed1: u64
+}
+
+ResultCell :: @cell64 {
+    seq:       u64
+    worker_id: u32
+    gs_fault:  u32
+    digest:    u64
+    tile_dep:  u64
+}
+
+@ring worker_inbox    : <TaskCell   | cap: 16>
+@ring bsp_completions : <ResultCell | cap: 16>
+@slab reactor_scratch : <u64        | max: 1024>
+@slab irq_telemetry   : <u64        | max: 8>
+
+// =============================================================================
+// Gate-3 PCIe `MCFG`/`ECAM` + Lock-Free NVMe `@dma_queue` + `@capsule` Storage
+// =============================================================================
+AcpiMcfgEntry :: <packed> {
+    ecam_base: u64
+    seg_group: u16
+    start_bus: u8
+    end_bus:   u8
+    reserved:  u32
+}
+
+NvmeCmd :: <align: 64B> {
+    cdw0:  u32
+    nsid:  u32
+    rsv0:  u64
+    mptr:  u64
+    prp1:  u64
+    prp2:  u64
+    cdw10: u32
+    cdw11: u32
+    cdw12: u32
+    cdw13: u32
+    cdw14: u32
+    cdw15: u32
+}
+
+NvmeCqe :: <packed> {
+    dw0:     u32
+    rsv:     u32
+    sq_head: u16
+    sq_id:   u16
+    cid:     u16
+    status:  u16
+}
+
+MasterExtentSuper :: <packed> {
+    magic:        u64
+    version:      u32
+    extent_count: u32
+    generation:   u64
+}
+
+MasterExtentEntry :: <packed> {
+    id_hash:     u64
+    start_byte:  u64
+    byte_len:    u64
+    crc32c:      u32
+    flags:       u32
+}
+
+ZeroCapsuleHeader :: <packed> {
+    magic:      u64
+    version:    u32
+    entry_off:  u32
+    code_bytes: u32
+    crc32c:     u32
+}
+
+@dma_queue nvme_admin_sq  : <NvmeCmd | cap: 16>
+@dma_queue nvme_admin_cq  : <NvmeCqe | cap: 16>
+@dma_queue nvme_io_sq1    : <NvmeCmd | cap: 16>
+@dma_queue nvme_io_cq1    : <NvmeCqe | cap: 16>
+@slab      nvme_meta_page : <u8      | max: 4096>
+@capsule   boot_capsule   : <cap: 65536>

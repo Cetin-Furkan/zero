@@ -1,0 +1,260 @@
+// =============================================================================
+// ZeroOS Gate-2 Pinned Reactor Fabric (`examples/os/reactor_fabric.zr`)
+// =============================================================================
+// Exercises & measures real modern direct-silicon primitives across cores:
+//   1. Pinned Reactor ABI (`r12`=id, `r13`=inbox, `r14`=scratch, `r15`/`gs:0`=local)
+//   2. Per-core isolated `gs:0` scalar fault unwinding (`fail` / `recover` in parallel)
+//   3. Zero-XSAVE `@isr` + `@isr_ok` hardware interrupt gate (`iretq`)
+//   4. Cross-core `publish` (`movdir64b`) + `wait` (`monitor`/`mwait`) + `<tile>`
+//      cooperative compute pipeline measured in live `@rdtsc()` hardware cycles!
+// =============================================================================
+use "hw_types.zr"
+
+// Compiler-verified leaf helper (`@isr_ok`: zero `r12..r15`, zero `fail`/`publish`/`wait`/`tile`)
+@isr_ok fn isr_bump_spurious(counter_addr: u64) u64 {
+    cnt := @mmio<u64>(counter_addr)
+    prev: u64 = cnt.read()
+    cnt.write(prev + 1)
+    @eoi()
+    return prev
+}
+
+// Compiler-verified hardware interrupt handler (`@isr`: GPR-only save + `iretq`, 0 XSAVE!)
+@isr fn reactor_spurious_isr() {
+    isr_bump_spurious(irq_telemetry.base)
+}
+
+fn install_reactor_isr_gate(vec: u64) i64 {
+    fn_addr: u64 = @fn_addr(reactor_spurious_isr)
+    lo: u64 = 0
+    lo[15:0]  = fn_addr[15:0]
+    lo[31:16] = 0x0008
+    lo[47:32] = 0x8E00
+    lo[63:48] = fn_addr[31:16]
+    idt_slab[vec * 2]     = lo
+    idt_slab[vec * 2 + 1] = fn_addr[63:32]
+    return 0
+}
+
+// Deterministic `<tile>` compute kernel (`CRC32C` + `PEXT` + `POPCNT` + 64b rotate)
+fn execute_tile_kernel(seed0: u64, seed1: u64, rid: u64) u64 {
+    acc: u64 = seed0 ^ (rid * 0x9E37_79B9_7F4A_7C15)
+    mix: u64 = seed1 + rid
+    for step in 0..8 <tile | unroll: 2> {
+        ustep: u64 = step
+        acc = @crc32c(acc, mix ^ ustep)
+        extracted: u64 = @pext(mix ^ acc, 0x5555_5555_5555_5555)
+        bits: u64 = @popcnt(extracted)
+        mix = (mix <<< 7) ^ (acc + bits + ustep)
+    }
+    return acc ^ mix
+}
+
+// Executed by each awakened Application Processor (`slot = 1..15`) after MADT bring-up!
+fn reactor_worker_entry(slot: u64) i64 {
+    my_inbox:   u64 = worker_inbox.slot_addr(slot)
+    my_scratch: u64 = reactor_scratch.base + slot * 64
+    @reactor_bind(slot, my_inbox, my_scratch)
+
+    if @reactor_id() != slot {
+        @halt()
+    }
+
+    // 1. Concurrent Per-Core `gs:0` Fault Isolation Proof (`PEER_MASTER_PLAN.md` §9):
+    //    Each core raises a distinct fault (`200 + slot`) on its private `gs:0` word!
+    my_fault: u64 = 0
+    {
+        fail 200 + @reactor_id()
+    } recover err {
+        my_fault = err
+    }
+    scratch_cell := @mmio<u64>(@scratch_base())
+    scratch_cell.write(my_fault)
+
+    // 2. Pinned `MOVDIR64B` + `MONITOR`/`MWAIT` + `<tile>` Worker Loop
+    loc := @view<ReactorLocal>(@local_base())
+    seq_mmio := @mmio<u64>(my_inbox)
+    expect_seq: u64 = 1
+
+    loop <max: 1000000000 | until: expect_seq > 1000> {
+        cur_seq: u64 = seq_mmio.read()
+        if cur_seq < expect_seq {
+            // Race-free Intel SDM §9.10.4 `MONITOR` + recheck + `MWAIT` cacheline sleep!
+            wait(my_inbox, 0, expect_seq - 1)
+        } else {
+            task := worker_inbox[@reactor_id()]
+            if task.cmd == CMD_PARK {
+                @halt()
+            }
+            if task.cmd == CMD_COMPUTE {
+                obs_depth: u64 = 0
+                digest:    u64 = 0
+                tile {
+                    obs_depth = loc.tile_depth
+                    digest = execute_tile_kernel(task.seed0, task.seed1, @reactor_id())
+                }
+                loc.wake_count += 1
+                loc.inbox_seq = expect_seq
+
+                res := ResultCell{
+                    seq:       expect_seq,
+                    worker_id: @reactor_id(),
+                    gs_fault:  my_fault,
+                    digest:    digest,
+                    tile_dep:  obs_depth
+                }
+                publish(bsp_completions.slot_addr(@reactor_id()), res)
+            }
+            expect_seq += 1
+        }
+    }
+    @halt()
+    return 0
+}
+
+// Executed on BSP (`Reactor 0`): verifies `gs:0`, nested `<tile>`, `@isr`, & cross-core `MOVDIR64B` + `MWAIT`!
+fn run_reactor_fabric(online_cores: u64) u64 {
+    @reactor_bind(0, bsp_completions.slot_addr(0), reactor_scratch.base)
+    if @reactor_id() != 0 {
+        @halt()
+    }
+
+    // 1. Install compiler-verified `@isr` gate at vector `0xFF`
+    install_reactor_isr_gate(0xFF)
+
+    // 2. Verify BSP `gs:0` scalar fault isolation (`200`) & nested `tile` depth (`gs:8 == 2 -> 0`)
+    bsp_fault: u64 = 0
+    {
+        fail 200
+    } recover e0 {
+        bsp_fault = e0
+    }
+    if bsp_fault != 200 {
+        @halt()
+    }
+
+    bsp_loc := @view<ReactorLocal>(@local_base())
+    nested_seen: u64 = 0
+    rsp_mod64:   u64 = 1
+    tile {
+        tile {
+            nested_seen = bsp_loc.tile_depth
+            rsp_mod64   = @rsp_align() & 63
+        }
+    }
+    if nested_seen != 2 || bsp_loc.tile_depth != 0 || rsp_mod64 != 0 {
+        @halt()
+    }
+
+    // Verify `<tile>` unwind across `recover`, `break`, `continue`, & `loop <tile | max: 3>`!
+    rec_tile_err: u64 = 0
+    {
+        tile {
+            fail 222
+        }
+    } recover et {
+        rec_tile_err = et
+    }
+    for k in 0..4 {
+        tile {
+            if k == 1 {
+                continue
+            }
+            if k == 2 {
+                break
+            }
+        }
+    }
+    lp_tile_iters: u64 = 0
+    loop <tile | max: 3 | until: lp_tile_iters == 3> {
+        lp_tile_iters += 1
+    }
+    if rec_tile_err != 222 || bsp_loc.tile_depth != 0 || lp_tile_iters != 3 {
+        @halt()
+    }
+
+    // 3. Single-core (`C=1`) loopback `MOVDIR64B` + `<tile>` self-test (always verified!)
+    t_self0: u64 = @rdtsc()
+    self_dig: u64 = execute_tile_kernel(0xCAFE_BABE_1234_5678, 0x0102_0304_0506_0708, 0)
+    self_res := ResultCell{
+        seq:       1,
+        worker_id: 0,
+        gs_fault:  bsp_fault,
+        digest:    self_dig,
+        tile_dep:  nested_seen
+    }
+    publish(bsp_completions.slot_addr(0), self_res)
+    t_self1: u64 = @rdtsc()
+    if bsp_completions[0].seq != 1 || bsp_completions[0].digest != self_dig {
+        @halt()
+    }
+
+    if online_cores <= 1 {
+        cyc1: u64 = t_self1 - t_self0
+        if cyc1 == 0 {
+            cyc1 = 1
+        }
+        bsp_loc.last_latency_tsc = cyc1
+        return cyc1
+    }
+
+    // 4. Multi-core (`C=4` / `C=8`) `MOVDIR64B` -> `MWAIT` -> `<tile>` -> `MOVDIR64B` Round-Trip!
+    //    Round 1 warms I-cache/TLB; Round 2..4 measure steady-state hardware round-trip cycles!
+    measured_cycles: u64 = 0
+    for round in 1..5 {
+        uround: u64 = round
+        s0: u64 = 0xA5A5_5A5A_0000_0000 + uround * 17
+        s1: u64 = 0x1122_3344_5566_7788 ^ uround
+
+        t0: u64 = @rdtsc()
+        for w in 1..online_cores {
+            uw: u64 = w
+            pkt := TaskCell{
+                seq:   uround,
+                cmd:   CMD_COMPUTE,
+                src:   0,
+                seed0: s0,
+                seed1: s1
+            }
+            publish(worker_inbox.slot_addr(uw), pkt)
+        }
+
+        for w in 1..online_cores {
+            uw: u64 = w
+            comp_addr: u64 = bsp_completions.slot_addr(uw)
+            comp_seq := @mmio<u64>(comp_addr)
+            loop <max: 500000000 | until: comp_seq.read() >= uround> {
+                wait(comp_addr, 0, uround - 1)
+            }
+            got := bsp_completions[uw]
+            want_dig: u64 = execute_tile_kernel(s0, s1, uw)
+            // Verify worker ID, isolated per-core `gs:0` fault (`200 + uw`), `<tile>` depth (`1`), & digest!
+            if got.worker_id != uw || got.gs_fault != (200 + uw) || got.tile_dep != 1 || got.digest != want_dig {
+                @halt()
+            }
+        }
+        t1: u64 = @rdtsc()
+        if uround == 4 {
+            measured_cycles = (t1 - t0) / (online_cores - 1)
+        }
+    }
+
+    // 5. Cleanly park all worker reactors via `CMD_PARK` `@cell64` direct store
+    for w in 1..online_cores {
+        uw: u64 = w
+        park_pkt := TaskCell{
+            seq:   5,
+            cmd:   CMD_PARK,
+            src:   0,
+            seed0: 0,
+            seed1: 0
+        }
+        publish(worker_inbox.slot_addr(uw), park_pkt)
+    }
+
+    if measured_cycles == 0 {
+        measured_cycles = 1
+    }
+    bsp_loc.last_latency_tsc = measured_cycles
+    return measured_cycles
+}

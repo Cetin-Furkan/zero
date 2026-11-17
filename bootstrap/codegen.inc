@@ -81,37 +81,116 @@ emit_mov_rcx_imm64:
     jmp     emit_u64
 
 ; -----------------------------------------------------------------------------
-; Target-Aware `.bss` Address Emitters (`ELF64` fixed vaddr vs `EFI` RIP-rel)
+; Target-Aware Fault Word & Reactor ABI Arg3 Emitters
+;   - Host `ELF64`: `qword [0x10000000]`, Arg3 = `rcx` (`abi-host`)
+;   - Bare-Metal `EFI`: per-core `qword [gs:0]` (`ReactorLocal.fault`), Arg3 = `r10`
 ; -----------------------------------------------------------------------------
-emit_load_fault_addr_rdx:
+emit_fault_store_imm32:             ; edi = fault_code (1, 2, 3, ...)
+    cmp     byte [in_isr_mode], 0
+    jne     err_isr_ban_cur
+    push    rdi
     cmp     byte [mode_efi], 1
     je      .efi
     mov     al, 0xBA                ; mov edx, FAULT_WORD_VADDR
     call    emit_u8
     mov     eax, FAULT_WORD_VADDR
-    jmp     emit_u32
-.efi:
+    call    emit_u32
     mov     al, 0x48
     call    emit_u8
-    mov     ax, 0x158D              ; 48 8D 15 <disp32> = lea rdx, [rip + disp32]
+    mov     ax, 0x02C7              ; mov qword [rdx], imm32
     call    emit_u16
-    xor     edi, edi                ; bss_off = 0
-    jmp     emit_efi_bss_disp32
+    pop     rax
+    jmp     emit_u32
+.efi:
+    lea     rsi, [seq_gs0_store_imm_pre]
+    mov     ecx, seq_gs0_store_imm_pre_end - seq_gs0_store_imm_pre
+    call    emit_bytes
+    pop     rax
+    jmp     emit_u32
 
-emit_load_fault_addr_rcx:
+emit_fault_store_rax:               ; guest `rax` = non-zero fault_code
+    cmp     byte [in_isr_mode], 0
+    jne     err_isr_ban_cur
     cmp     byte [mode_efi], 1
     je      .efi
     mov     al, 0xB9                ; mov ecx, FAULT_WORD_VADDR
     call    emit_u8
     mov     eax, FAULT_WORD_VADDR
-    jmp     emit_u32
-.efi:
+    call    emit_u32
     mov     al, 0x48
     call    emit_u8
-    mov     ax, 0x0D8D              ; 48 8D 0D <disp32> = lea rcx, [rip + disp32]
+    mov     ax, 0x0189              ; mov [rcx], rax
+    jmp     emit_u16
+.efi:
+    lea     rsi, [seq_gs0_store_rax]
+    mov     ecx, seq_gs0_store_rax_end - seq_gs0_store_rax
+    jmp     emit_bytes
+
+emit_fault_cmp_zero:
+    cmp     byte [mode_efi], 1
+    je      .efi
+    mov     al, 0xB9                ; mov ecx, FAULT_WORD_VADDR
+    call    emit_u8
+    mov     eax, FAULT_WORD_VADDR
+    call    emit_u32
+    mov     eax, 0x00398348         ; cmp qword [rcx], 0
+    jmp     emit_u32
+.efi:
+    lea     rsi, [seq_gs0_cmp_zero]
+    mov     ecx, seq_gs0_cmp_zero_end - seq_gs0_cmp_zero
+    jmp     emit_bytes
+
+emit_fault_take_rax:                ; loads fault word into `rax` and clears it to `0`
+    cmp     byte [mode_efi], 1
+    je      .efi
+    mov     al, 0xB9                ; mov ecx, FAULT_WORD_VADDR
+    call    emit_u8
+    mov     eax, FAULT_WORD_VADDR
+    call    emit_u32
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0x018B              ; mov rax, [rcx]
     call    emit_u16
-    xor     edi, edi
-    jmp     emit_efi_bss_disp32
+    mov     ax, 0xD231              ; xor edx, edx
+    call    emit_u16
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0x1189              ; mov [rcx], rdx
+    jmp     emit_u16
+.efi:
+    lea     rsi, [seq_gs0_take_rax]
+    mov     ecx, seq_gs0_take_rax_end - seq_gs0_take_rax
+    jmp     emit_bytes
+
+emit_move_rax_to_arg3:
+    cmp     byte [mode_efi], 1
+    je      .efi
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC189              ; 48 89 C1 = mov rcx, rax (`abi-host`)
+    jmp     emit_u16
+.efi:
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xC289              ; 49 89 C2 = mov r10, rax (`Reactor ABI` §6.1)
+    jmp     emit_u16
+
+seq_gs0_store_imm_pre:
+    db 0x65, 0x48, 0xC7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00 ; mov qword [gs:0], <imm32>
+seq_gs0_store_imm_pre_end:
+
+seq_gs0_store_rax:
+    mov     [gs:0], rax
+seq_gs0_store_rax_end:
+
+seq_gs0_cmp_zero:
+    cmp     qword [gs:0], 0
+seq_gs0_cmp_zero_end:
+
+seq_gs0_take_rax:
+    mov     rax, [gs:0]
+    mov     qword [gs:0], 0
+seq_gs0_take_rax_end:
 
 ; Host `rax` = `SpaceEntry.vaddr_base`; emits load into guest `rcx` (guest `rax` preserved!)
 emit_load_space_base_rcx:
@@ -275,9 +354,11 @@ free_temp_qwords:                   ; edi = count to release
 ; edi = TY_* type tag
 ; -----------------------------------------------------------------------------
 emit_load_mem_typed:
-    test    edi, TY_FLAG_VIEW_ONE
+    test    edi, TY_FLAG_VIEW_ONE | TY_FLAG_ATOMIC
     jnz     .u64
     and     edi, TY_BASE_MASK
+    cmp     edi, TY_CUSTOM_PTR_BASE
+    jae     .u64
     cmp     edi, TY_BITPACK_BASE
     jae     .check_bp
     cmp     edi, TY_U8
@@ -340,9 +421,13 @@ emit_load_mem_typed:
 
 ; Target `rcx` = dst addr, `rax` = value (or src struct ptr), `edi` = TY_* tag
 emit_store_mem_typed:
-    test    edi, TY_FLAG_VIEW_ONE
+    test    edi, TY_FLAG_VIEW_ONE | TY_FLAG_ATOMIC
     jnz     .b8
+    test    edi, TY_FLAG_STREAM
+    jnz     .stream_nt
     and     edi, TY_BASE_MASK
+    cmp     edi, TY_CUSTOM_PTR_BASE
+    jae     .b8
     cmp     edi, TY_STRUCT_BASE
     jae     .struct_copy
     cmp     edi, TY_BITPACK_BASE
@@ -364,6 +449,19 @@ emit_store_mem_typed:
     call    emit_u8
     mov     ax, 0x0189              ; 48 89 01 = mov [rcx], rax
     jmp     emit_u16
+.stream_nt:
+    and     edi, TY_BASE_MASK
+    cmp     edi, TY_U32
+    je      .nt4
+    cmp     edi, TY_I32
+    je      .nt4
+    mov     al, 0x48
+    call    emit_u8
+.nt4:
+    mov     ax, 0xC30F              ; [48] 0F C3 01 = movnti [rcx], eax/rax
+    call    emit_u16
+    mov     al, 0x01
+    jmp     emit_u8
 .b1:
     mov     ax, 0x0188              ; 88 01 = mov [rcx], al
     jmp     emit_u16
@@ -834,9 +932,10 @@ emit_write_rodata_slice:
 ; Target Binary `_start` Trampoline + `__zr_write_i64`
 ; -----------------------------------------------------------------------------
 emit_target_runtime:
-    ; Ensure 16-byte RSP alignment at `_start` (`and rsp, -16` = 48 83 E4 F0)
-    mov     eax, 0xF0E48348
-    call    emit_u32
+    ; Pass Linux `_start` `(argc, argv)` in `(rdi, rsi)` before aligning `rsp`!
+    lea     rsi, [seq_elf_entry_args]
+    mov     ecx, seq_elf_entry_args_end - seq_elf_entry_args
+    call    emit_bytes
 
     ; `call main`
     mov     edi, [sym_main_id]
@@ -856,6 +955,12 @@ emit_target_runtime:
     mov     ecx, target_rt_write_i64_end - target_rt_write_i64
     call    emit_bytes
     ret
+
+seq_elf_entry_args:
+    mov     rdi, [rsp]              ; arg0 = argc
+    lea     rsi, [rsp + 8]          ; arg1 = &argv[0]
+    and     rsp, -16
+seq_elf_entry_args_end:
 
 target_exit_tail:
     mov     ecx, FAULT_WORD_VADDR

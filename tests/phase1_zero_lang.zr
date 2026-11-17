@@ -146,5 +146,19 @@ fn main() i64 {
     }
     print("comptime_if: kept={kept} side_calls={calls[0]}")
 
+    // 8. Forward `@fn_addr(ident)` RIP-relative code address resolution
+    fa_later: u64 = @fn_addr(later_target)
+    fa_main:  u64 = @fn_addr(main)
+    fa_valid := 0
+    if fa_later >= 0x400000 && fa_later < 0x500000 {
+        fa_valid = 1
+    }
+    fa_distinct := fa_later != fa_main
+    print("fn_addr: valid={fa_valid} distinct={fa_distinct}")
+
     return 0
+}
+
+fn later_target(v: i64) i64 {
+    return v + 7
 }

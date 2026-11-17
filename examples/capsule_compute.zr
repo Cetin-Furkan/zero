@@ -1,0 +1,27 @@
+// =============================================================================
+// ZeroOS Immutable Ring-0 `@capsule` Workload (`examples/capsule_compute.zr`)
+// =============================================================================
+// Compiled via `--target=capsule` (or self-hosted `zero1 --target=capsule`) into
+// a position-independent, CRC32C-signed `.zcap` image streamed via NVMe DMA,
+// sealed `PTE_RX` (`WX=0`), and executed directly inside `ZeroOS` Reactor ABI!
+// =============================================================================
+
+fn mix_step(acc: u64, v: u64) u64 => @crc32c(acc, v) ^ (v <<< 11)
+
+fn main(x: u64, y: u64) u64 {
+    // Demonstrate per-core `gs:0` scalar fault unwind from inside a dynamic `@capsule`!
+    if x == 0 && y == 0 {
+        fail 88
+    }
+
+    rid: u64 = @reactor_id()
+    digest: u64 = (x + y) |> mix_step(0x5A45_524F)
+    tag: u64 = 0
+    tile {
+        tag = @popcnt(digest ^ rid)
+    }
+    if tag <= 64 {
+        return (x + y) * 18 + 21 + rid
+    }
+    return 0
+}

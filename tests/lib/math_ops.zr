@@ -1,0 +1,9 @@
+// Diamond-imported shared hardware math & bit combinators (`tests/lib/math_ops.zr`)
+
+MAGIC_SEED  :: 0xABCD_1234_5678_9EF0
+SEED_MID    :: MAGIC_SEED[47:16]
+ROT_CONST   :: (1 <<< 5) | (0x80 >>> 3)
+
+fn add_bias(x: i64, b: i64) i64 => x + b
+fn scale_step(x: i64, k: i64) i64 => x * k
+fn bump_one(x: i64) i64 => x + 1

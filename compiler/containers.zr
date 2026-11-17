@@ -1,0 +1,197 @@
+// =============================================================================
+// Zero Stage-1 Self-Hosted Compiler — `ELF64` & `.zcap` Containers (`compiler/containers.zr`)
+// =============================================================================
+// Emits:
+//   1. Strict 2-segment `W^X` Linux `ELF64` binaries (`PF_R|PF_X` @ `0x400000`,
+//      `PF_R|PF_W` `.bss` @ `0x10000000`, zero `RWE` segments)
+//   2. Position-independent, SSE4.2 `CRC32C`-signed `--target=capsule` `.zcap`
+//      capsules (`ZEROZCAP` 64B header + Reactor ABI entry at `+64`)
+// =============================================================================
+
+fn emit_target_entry_runtime(main_fn_idx: i64) {
+    if g[G_MODE_CAPSULE] == 1 {
+        g[G_CODE_OFF] = ZCAP_HDR_LEN
+        // At +64: `jmp rel32 -> main`
+        emit_u8(0xE9)
+        fx := g[G_CALL_FIX_CNT]
+        call_fix_off[fx] = g[G_CODE_OFF]
+        call_fix_fn[fx]  = main_fn_idx
+        g[G_CALL_FIX_CNT] = fx + 1
+        emit_u32(0)
+        return
+    }
+
+    g[G_CODE_OFF] = ELF_HDR_LEN
+
+    // `_start`: pass `(argc, argv)` in `(rdi, rsi)` and align `rsp` to 16 bytes
+    emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x3C)  emit_u8(0x24)         // mov rdi, [rsp]
+    emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x74)  emit_u8(0x24)  emit_u8(0x08) // lea rsi, [rsp+8]
+    emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xE4)  emit_u8(0xF0)         // and rsp, -16
+
+    emit_call_fn_idx(main_fn_idx)
+
+    // Exit with `1` if unhandled scalar fault word at `[0x10000000]` != 0, else `rax`
+    emit_u8(0xB9)  emit_u32(ELF_DATA_BASE)                             // mov ecx, 0x10000000
+    emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x09)                        // mov rcx, [rcx]
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC9)                        // test rcx, rcx
+    emit_u8(0x74)  emit_u8(0x07)                                       // je +7
+    emit_u8(0xBF)  emit_u32(1)                                         // mov edi, 1
+    emit_u8(0xEB)  emit_u8(0x03)                                       // jmp +3
+    emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC7)                        // mov rdi, rax
+    emit_u8(0xB8)  emit_u32(SYS_EXIT)                                  // mov eax, 60
+    emit_u8(0x0F)  emit_u8(0x05)                                       // syscall
+
+    // `__zr_write_i64(val: i64)`
+    g[G_RT_WRITE_OFF] = g[G_CODE_OFF]
+    emit_u8(0x55)                                                      // push rbp
+    emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xE5)                        // mov rbp, rsp
+    emit_u8(0x48)  emit_u8(0x83)  emit_u8(0xEC)  emit_u8(0x20)         // sub rsp, 32
+    emit_u8(0x48)  emit_u8(0x8D)  emit_u8(0x75)  emit_u8(0xFF)         // lea rsi, [rbp - 1]
+    emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xF8)                        // mov rax, rdi
+    emit_u8(0x45)  emit_u8(0x31)  emit_u8(0xC0)                        // xor r8d, r8d
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0)                        // test rax, rax
+    emit_u8(0x79)  emit_u8(0x09)                                       // jns +9
+    emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xD8)                        // neg rax
+    emit_u8(0x41)  emit_u8(0xB8)  emit_u32(1)                          // mov r8d, 1
+    emit_u8(0xB9)  emit_u32(10)                                        // mov ecx, 10
+    // .digits:
+    emit_u8(0x31)  emit_u8(0xD2)                                       // xor edx, edx
+    emit_u8(0x48)  emit_u8(0xF7)  emit_u8(0xF1)                        // div rcx
+    emit_u8(0x80)  emit_u8(0xC2)  emit_u8(0x30)                        // add dl, '0'
+    emit_u8(0x88)  emit_u8(0x16)                                       // mov [rsi], dl
+    emit_u8(0x48)  emit_u8(0xFF)  emit_u8(0xCE)                        // dec rsi
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0)                        // test rax, rax
+    emit_u8(0x75)  emit_u8(0xEE)                                       // jne .digits (-18)
+    emit_u8(0x45)  emit_u8(0x85)  emit_u8(0xC0)                        // test r8d, r8d
+    emit_u8(0x74)  emit_u8(0x06)                                       // je +6
+    emit_u8(0xC6)  emit_u8(0x06)  emit_u8(0x2D)                        // mov byte [rsi], '-'
+    emit_u8(0x48)  emit_u8(0xFF)  emit_u8(0xCE)                        // dec rsi
+    // .out:
+    emit_u8(0x48)  emit_u8(0xFF)  emit_u8(0xC6)                        // inc rsi
+    emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xEA)                        // mov rdx, rbp
+    emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xF2)                        // sub rdx, rsi
+    emit_u8(0xBF)  emit_u32(1)                                         // mov edi, 1
+    emit_u8(0xB8)  emit_u32(SYS_WRITE)                                 // mov eax, 1
+    emit_u8(0x0F)  emit_u8(0x05)                                       // syscall
+    emit_u8(0xC9)                                                      // leave
+    emit_u8(0xC3)                                                      // ret
+}
+
+fn finalize_call_fixups() {
+    cnt := g[G_CALL_FIX_CNT]
+    for i in 0..cnt {
+        f_idx := call_fix_fn[i]
+        if fn_defined[f_idx] == 0 {
+            die_msg("error: undefined function referenced")
+        }
+        patch_pos: i64 = call_fix_off[i]
+        tgt_off: i64   = fn_code_off[f_idx]
+        patch_u32_at(patch_pos, tgt_off - (patch_pos + 4))
+    }
+}
+
+fn finalize_elf64_container() {
+    code_end := g[G_CODE_OFF]
+    ro_len   := g[G_TGT_RO_OFF]
+
+    // Append `.rodata` slice immediately after `.text` inside `Phdr[0]` (`PF_R | PF_X`)
+    for i in 0..ro_len {
+        out_buf[code_end + i] = tgt_ro_buf[i]
+    }
+    total := code_end + ro_len
+    g[G_TOTAL_OUT] = total
+
+    // Patch `.rodata` virtual addresses (`ELF_TEXT_BASE + code_end + ro_off`)
+    rf_cnt := g[G_RO_FIX_CNT]
+    for i in 0..rf_cnt {
+        c_pos: i64 = ro_fix_code[i]
+        r_off: i64 = ro_fix_off[i]
+        patch_u32_at(c_pos, ELF_TEXT_BASE + code_end + r_off)
+    }
+
+    // Zero 176-byte `Ehdr + 2*Phdr`
+    for i in 0..ELF_HDR_LEN {
+        out_buf[i] = 0
+    }
+
+    // 64-byte `Elf64_Ehdr`
+    out_buf[0] = 0x7F
+    out_buf[1] = 'E'
+    out_buf[2] = 'L'
+    out_buf[3] = 'F'
+    out_buf[4] = 2      // ELFCLASS64
+    out_buf[5] = 1      // ELFDATA2LSB
+    out_buf[6] = 1      // EV_CURRENT
+    patch_u32_at(16, (0x3E << 16) | 2)          // e_type = ET_EXEC(2), e_machine = EM_X86_64(62)
+    patch_u32_at(20, 1)                         // e_version = 1
+    patch_u64_at(24, ELF_TEXT_BASE + ELF_HDR_LEN) // e_entry = 0x4000B0
+    patch_u64_at(32, 64)                        // e_phoff = 64
+    patch_u32_at(52, (56 << 16) | 64)           // e_ehsize = 64, e_phentsize = 56
+    patch_u32_at(56, 2)                         // e_phnum = 2
+
+    // `Phdr[0]` (+64): `PT_LOAD` (`PF_R | PF_X` = 5) at `0x400000`
+    patch_u32_at(64 + 0,  1)                    // PT_LOAD
+    patch_u32_at(64 + 4,  5)                    // PF_R | PF_X (strict W^X!)
+    patch_u64_at(64 + 8,  0)
+    patch_u64_at(64 + 16, ELF_TEXT_BASE)
+    patch_u64_at(64 + 24, ELF_TEXT_BASE)
+    patch_u64_at(64 + 32, total)
+    patch_u64_at(64 + 40, total)
+    patch_u64_at(64 + 48, 0x1000)
+
+    // `Phdr[1]` (+120): `PT_LOAD` (`PF_R | PF_W` = 6) `.bss` at `0x10000000`
+    bss_sz := g[G_BSS_OFF]
+    if bss_sz < 64 { bss_sz = 64 }
+    patch_u32_at(120 + 0,  1)                   // PT_LOAD
+    patch_u32_at(120 + 4,  6)                   // PF_R | PF_W (strict W^X!)
+    patch_u64_at(120 + 8,  0)
+    patch_u64_at(120 + 16, ELF_DATA_BASE)
+    patch_u64_at(120 + 24, ELF_DATA_BASE)
+    patch_u64_at(120 + 32, 0)                   // 0 file bytes (pure demand-zero .bss)
+    patch_u64_at(120 + 40, bss_sz)
+    patch_u64_at(120 + 48, 0x1000)
+}
+
+fn finalize_zcap_container() {
+    raw_end := g[G_CODE_OFF]
+    aligned_end := (raw_end + 7) & (~7)
+    for i in raw_end..aligned_end {
+        out_buf[i] = 0
+    }
+    g[G_TOTAL_OUT] = aligned_end
+    payload_bytes := aligned_end - ZCAP_HDR_LEN
+
+    // Compute hardware SSE4.2 `@crc32c` over 8-byte payload qwords `[64 .. aligned_end)`
+    qwords := payload_bytes >> 3
+    qview  := @view<u64>(out_buf.base + ZCAP_HDR_LEN, qwords)
+    acc: u64 = 0xFFFF_FFFF
+    for i in 0..qwords {
+        acc = @crc32c(acc, qview[i])
+    }
+    digest: u64 = (~acc) & 0xFFFF_FFFF
+
+    // Stamp 64-byte `ZeroCapsuleHeader` (`ZEROZCAP`)
+    for i in 0..ZCAP_HDR_LEN {
+        out_buf[i] = 0
+    }
+    patch_u32_at(0,  0x4F52_455A)               // "ZERO"
+    patch_u32_at(4,  0x5041_435A)               // "ZCAP"
+    patch_u32_at(8,  1)                         // version = 1
+    patch_u32_at(12, ZCAP_HDR_LEN)              // entry_off = 64
+    patch_u32_at(16, payload_bytes)             // code_bytes
+    patch_u32_at(20, digest)                    // crc32c
+}
+
+fn write_output_binary(out_cstr_ptr: u64) {
+    fd := @syscall(SYS_OPENAT, AT_FDCWD, out_cstr_ptr, O_WR_TRUNC_CR, MODE_0755)
+    if fd < 0 {
+        die_msg("error: failed to open output binary path")
+    }
+    total := g[G_TOTAL_OUT]
+    wrote := @syscall(SYS_WRITE, fd, out_buf.base, total)
+    if wrote != total {
+        die_msg("error: short write to output binary")
+    }
+    @syscall(SYS_FCHMOD, fd, MODE_0755)
+    @syscall(SYS_CLOSE, fd)
+}

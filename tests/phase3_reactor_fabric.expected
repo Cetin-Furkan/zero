@@ -1,0 +1,5 @@
+=== Phase-3 Direct-Silicon Fabric Suite ===
+geom: cell_sz=64 cell_al=64 nvme_sz=64 md64=1 mdi=1
+ring: s0=104 s1=105 s2=102 s3=103 dig_ok=1
+guard: misalign=3 null=3
+dma: nsid=1 lba=4096 doorbell=9

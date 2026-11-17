@@ -1,0 +1,105 @@
+// =============================================================================
+// Phase-3 Direct-Silicon Fabric Suite (`tests/phase3_reactor_fabric.zr`)
+// =============================================================================
+// Verifies `@cell64` (64B auto-padded hardware cacheline), `@ring` (power-of-2
+// wrapped lock-free ring + `.slot_addr`), `@dma_queue` (NVMe 64B SQ ring),
+// `publish(dst, cell)` (`movdir64b`), `@movdiri` (8B zero-RFO doorbell),
+// and `@cpuid_ecx` silicon capability discovery.
+// =============================================================================
+
+ComputeCell :: @cell64 {
+    seq:      u64
+    opcode:   u32
+    src_core: u32
+    arg0:     u64
+    arg1:     u64
+    digest:   u64
+}
+
+NvmeSqe :: <align: 64B> {
+    cdw0: u32
+    nsid: u32
+    rsv0: u64
+    mptr: u64
+    prp1: u64
+    prp2: u64
+    cdw10: u32
+    cdw11: u32
+    cdw12: u32
+    cdw13: u32
+    cdw14: u32
+    cdw15: u32
+}
+
+@ring      task_ring : <ComputeCell | cap: 4>
+@dma_queue nvme_sq0  : <NvmeSqe     | cap: 8>
+@slab      doorbell  : <u64         | max: 4>
+
+fn make_digest(a: u64, b: u64) u64 => @crc32c(0xFFFFFFFF, a ^ (b <<< 13))
+
+fn main() i64 {
+    print("=== Phase-3 Direct-Silicon Fabric Suite ===")
+
+    // 1. `@cell64` compile-time geometry (`sizeof == 64`, `alignof == 64`) & CPUID check
+    sz_cell := @sizeof(ComputeCell)
+    al_cell := @alignof(ComputeCell)
+    sz_nvme := @sizeof(NvmeSqe)
+    ecx7    := @cpuid_ecx(7, 0)
+    has_md64 := ecx7[28:28]
+    has_mdi  := ecx7[27:27]
+    print("geom: cell_sz={sz_cell} cell_al={al_cell} nvme_sz={sz_nvme} md64={has_md64} mdi={has_mdi}")
+
+    // 2. `publish(ring.slot_addr(seq), cell)` (`movdir64b` 64B atomic direct store!) + power-of-2 wrap
+    for seq in 0..6 {
+        useq: u64 = seq
+        pkt := ComputeCell{
+            seq:      useq + 100,
+            opcode:   7,
+            src_core: 0,
+            arg0:     useq * 10,
+            arg1:     useq * 3 + 1,
+            digest:   make_digest(useq * 10, useq * 3 + 1)
+        }
+        publish(task_ring.slot_addr(useq), pkt)
+    }
+    @sfence()
+
+    // Monotonic sequence `5` wraps cleanly onto slot `5 & 3 == 1`; sequence `4` wraps onto `0`!
+    s0_seq := task_ring[4].seq
+    s1_seq := task_ring[5].seq
+    s2_seq := task_ring[2].seq
+    s3_seq := task_ring[3].seq
+    dig_ok := task_ring[5].digest == make_digest(50, 16)
+    print("ring: s0={s0_seq} s1={s1_seq} s2={s2_seq} s3={s3_seq} dig_ok={dig_ok}")
+
+    // 3. Misaligned or null `publish` destination raises `fail 3` before `movdir64b` (`#GP` prevented!)
+    misalign_err := 0
+    {
+        bad_pkt := ComputeCell{ seq: 1, opcode: 1, src_core: 0, arg0: 0, arg1: 0, digest: 0 }
+        publish(task_ring.base + 8, bad_pkt)
+    } recover e1 {
+        misalign_err = e1
+    }
+    null_err := 0
+    {
+        bad_pkt2 := ComputeCell{ seq: 1, opcode: 1, src_core: 0, arg0: 0, arg1: 0, digest: 0 }
+        publish(0, bad_pkt2)
+    } recover e2 {
+        null_err = e2
+    }
+    print("guard: misalign={misalign_err} null={null_err}")
+
+    // 4. `@dma_queue` NVMe Submission Queue wrapping + `@movdiri` zero-RFO doorbell write
+    nvme_sq0[9].cdw0  = 0x0001_0002
+    nvme_sq0[9].nsid  = 1
+    nvme_sq0[9].prp1  = 0x2000_0000
+    nvme_sq0[9].cdw10 = 4096
+    @movdiri(doorbell.base, 9)
+    @sfence()
+    sq_wrap_nsid := nvme_sq0[1].nsid
+    sq_wrap_lba  := nvme_sq0[1].cdw10
+    db_val       := doorbell[0]
+    print("dma: nsid={sq_wrap_nsid} lba={sq_wrap_lba} doorbell={db_val}")
+
+    return 0
+}

@@ -38,23 +38,16 @@ is_ty_unsigned:                     ; edi = ty_tag
 
 ; Emits immediate scalar fault (`edi = fault_code`, e.g. `1` div0, `2` bounds)
 emit_raise_fault_imm:
-    push    rdi
-    call    emit_load_fault_addr_rdx
-    mov     al, 0x48
-    call    emit_u8
-    mov     ax, 0x02C7              ; 48 C7 02 <imm32> = mov qword [rdx], code
-    call    emit_u16
-    pop     rax
-    call    emit_u32
+    call    emit_fault_store_imm32
 
     cmp     dword [rec_depth], 0
     jg      .jmp_rec
+    mov     ecx, [tile_lex_depth]
+    call    emit_tile_unwind_count
     mov     eax, 0xC3C9C031         ; xor eax, eax; leave; ret
     jmp     emit_u32
 .jmp_rec:
-    call    emit_jmp_rel32
-    mov     edi, eax
-    jmp     rec_add_patch
+    jmp     emit_unwind_to_recover
 
 ; Emits unsigned bounds check on target `rax` (`idx`) against host `rax` (`cap`)
 ; Raises `fail 2` if `idx >= cap` (catches negative i64 indices via unsigned `jb`!)
@@ -124,6 +117,16 @@ emit_call_fn_idx:
     push    rbx
     mov     ebx, edi
 
+    ; Enforce Phase-3 `@isr` / `@isr_ok` call-graph safety (`PEER_MASTER_PLAN.md` §6.2)
+    cmp     byte [in_isr_mode], 0
+    je      .isr_call_ok
+    cmp     byte [in_isr_mode], 2   ; `@isr_ok` must be a pure leaf!
+    je      err_isr_ban_cur
+    mov     rcx, [space_ast]
+    cmp     byte [rcx + AST_FN_ATTR_OFF + rbx], 2 ; `@isr` may ONLY call `@isr_ok`!
+    jne     err_isr_ban_cur
+.isr_call_ok:
+
     mov     al, 0xE8
     call    emit_u8
     mov     edx, [code_off]
@@ -145,29 +148,71 @@ emit_call_fn_idx:
 
     cmp     byte [in_fn_body], 0
     je      .done
+    cmp     byte [in_isr_mode], 0   ; `@isr_ok` callees never fault!
+    jne     .chk_span_ret
 
-    call    emit_load_fault_addr_rcx
-    mov     eax, 0x00398348
-    call    emit_u32
+    call    emit_fault_cmp_zero
 
     cmp     dword [rec_depth], 0
     jg      .unwind_to_recover
+
+    cmp     dword [tile_lex_depth], 0
+    jg      .unwind_with_tile
 
     mov     ax, 0x0474
     call    emit_u16
     mov     eax, 0xC3C9C031
     call    emit_u32
-    jmp     .done
+    jmp     .chk_span_ret
 
-.unwind_to_recover:
-    mov     ax, 0x850F
+.unwind_with_tile:
+    mov     ax, 0x840F              ; jz .chk_span_ret
     call    emit_u16
     mov     eax, [code_off]
     push    rax
     xor     eax, eax
     call    emit_u32
+    mov     ecx, [tile_lex_depth]
+    call    emit_tile_unwind_count
+    mov     eax, 0xC3C9C031
+    call    emit_u32
     pop     rdi
-    call    rec_add_patch
+    call    patch_rel32_here
+    jmp     .chk_span_ret
+
+.unwind_to_recover:
+    mov     ax, 0x840F              ; jz .chk_span_ret
+    call    emit_u16
+    mov     eax, [code_off]
+    push    rax
+    xor     eax, eax
+    call    emit_u32
+    call    emit_unwind_to_recover
+    pop     rdi
+    call    patch_rel32_here
+
+.chk_span_ret:
+    test    dword [last_expr_ty], TY_FLAG_SPAN
+    jz      .done
+    ; Unpack 2-register `RAX:RDX` (`{ base, len }`) slice return into caller span slot!
+    push    r12
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xD089              ; 49 89 D0 = mov r8, rdx (`len`)
+    call    emit_u16
+    call    alloc_anon_span_slot
+    mov     r12d, eax
+    mov     edi, r12d
+    call    emit_store_local        ; `[rbp + slot] = base`
+    mov     al, 0x4C
+    call    emit_u8
+    mov     ax, 0xC089              ; 4C 89 C0 = mov rax, r8
+    call    emit_u16
+    lea     edi, [r12d + 8]
+    call    emit_store_local        ; `[rbp + slot + 8] = len`
+    mov     edi, r12d
+    call    emit_lea_local
+    pop     r12
 
 .done:
     pop     rbx
@@ -282,8 +327,25 @@ rec_push_scope:
     mov     eax, [rec_depth]
     mov     rcx, [space_ast]
     mov     dword [rcx + AST_REC_CNT_OFF + rax * 4], 0
+    mov     edx, [tile_lex_depth]
+    mov     [rcx + AST_REC_TILE_OFF + rax * 4], edx
     inc     dword [rec_depth]
     ret
+
+; Unwinds any `<tile>` levels entered inside the active `{ ... } recover` scope, then jumps to `recover`!
+emit_unwind_to_recover:
+    mov     edx, [rec_depth]
+    dec     edx
+    mov     rcx, [space_ast]
+    mov     eax, [tile_lex_depth]
+    sub     eax, [rcx + AST_REC_TILE_OFF + rdx * 4]
+    jle     .do_jmp
+    mov     ecx, eax
+    call    emit_tile_unwind_count
+.do_jmp:
+    call    emit_jmp_rel32
+    mov     edi, eax
+    jmp     rec_add_patch
 
 rec_add_patch:
     mov     edx, [rec_depth]
@@ -397,8 +459,39 @@ parse_fn_type_annot:
     cmp     byte [rax], TOK_AT
     jne     .normal_ty
     inc     dword [tok_idx]
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_IDENT
+    jne     .at_overlay
+    mov     ecx, [rax + 8]
+    cmp     ecx, [sym_span_id]
+    je      .at_span_ty
+    cmp     ecx, [sym_atomic_id]
+    je      .at_atomic_ty
+.at_overlay:
     call    parse_resolved_type_tag
     or      eax, TY_FLAG_VIEW_ONE
+    ret
+.at_span_ty:
+    inc     dword [tok_idx]
+    mov     al, TOK_LT
+    call    expect_tok_kind
+    call    parse_resolved_type_tag
+    push    rax
+    mov     al, TOK_GT
+    call    expect_tok_kind
+    pop     rax
+    or      eax, TY_FLAG_SPAN
+    ret
+.at_atomic_ty:
+    inc     dword [tok_idx]
+    mov     al, TOK_LT
+    call    expect_tok_kind
+    call    parse_resolved_type_tag
+    push    rax
+    mov     al, TOK_GT
+    call    expect_tok_kind
+    pop     rax
+    or      eax, TY_FLAG_ATOMIC
     ret
 .normal_ty:
     jmp     parse_resolved_type_tag
@@ -472,8 +565,18 @@ eval_const_prec:
     jmp     .next
 .c_shr:
     cmp     r12d, TOK_SHR
-    jne     .c_and
+    jne     .c_rol
     sar     rax, cl
+    jmp     .next
+.c_rol:
+    cmp     r12d, TOK_ROL
+    jne     .c_ror
+    rol     rax, cl
+    jmp     .next
+.c_ror:
+    cmp     r12d, TOK_ROR
+    jne     .c_and
+    ror     rax, cl
     jmp     .next
 .c_and:
     cmp     r12d, TOK_AMP
@@ -562,6 +665,28 @@ eval_const_prec:
     ret
 
 eval_const_unary:
+    call    .primary
+.bs_lp:
+    push    rax
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_LBRACK
+    jne     .bs_dn
+    call    parse_bitslice_bounds   ; eax = lo, edx = width
+    mov     ecx, eax
+    pop     rax
+    shr     rax, cl
+    mov     ecx, edx
+    cmp     ecx, 64
+    jae     .bs_lp
+    mov     rdx, 1
+    shl     rdx, cl
+    dec     rdx
+    and     rax, rdx
+    jmp     .bs_lp
+.bs_dn:
+    pop     rax
+    ret
+.primary:
     call    peek_tok_ptr
     movzx   ecx, byte [rax]
     cmp     cl, TOK_MINUS
@@ -726,47 +851,54 @@ emit_extract_bitfield:
 ; -----------------------------------------------------------------------------
 binop_precedence:
     movzx   eax, al
-    cmp     al, TOK_OR2
+    cmp     al, TOK_PIPE_GT
     mov     ecx, 1
     je      .ok
-    cmp     al, TOK_AND2
+    cmp     al, TOK_OR2
     mov     ecx, 2
     je      .ok
-    cmp     al, TOK_PIPE
+    cmp     al, TOK_AND2
     mov     ecx, 3
     je      .ok
-    cmp     al, TOK_CARET
+    cmp     al, TOK_PIPE
     mov     ecx, 4
     je      .ok
-    cmp     al, TOK_AMP
+    cmp     al, TOK_CARET
     mov     ecx, 5
     je      .ok
-    cmp     al, TOK_EQ
+    cmp     al, TOK_AMP
     mov     ecx, 6
+    je      .ok
+    cmp     al, TOK_EQ
+    mov     ecx, 7
     je      .ok
     cmp     al, TOK_NE
     je      .ok
     cmp     al, TOK_LT
     je      .chk_lt_desc
     cmp     al, TOK_LE
-    mov     ecx, 7
+    mov     ecx, 8
     je      .ok
     cmp     al, TOK_GT
     je      .ok
     cmp     al, TOK_GE
     je      .ok
     cmp     al, TOK_SHL
-    mov     ecx, 8
+    mov     ecx, 9
     je      .ok
     cmp     al, TOK_SHR
     je      .ok
+    cmp     al, TOK_ROL
+    je      .ok
+    cmp     al, TOK_ROR
+    je      .ok
     cmp     al, TOK_PLUS
-    mov     ecx, 9
+    mov     ecx, 10
     je      .ok
     cmp     al, TOK_MINUS
     je      .ok
     cmp     al, TOK_STAR
-    mov     ecx, 10
+    mov     ecx, 11
     je      .ok
     cmp     al, TOK_SLASH
     je      .ok
@@ -780,7 +912,7 @@ binop_precedence:
     test    eax, eax
     jnz     .not_binop
     mov     eax, TOK_LT
-    mov     ecx, 7
+    mov     ecx, 8
     ret
 .not_binop:
     xor     ecx, ecx
@@ -807,6 +939,8 @@ parse_expr:
     mov     r14d, [last_expr_ty]    ; r14d = LHS type tag!
     inc     dword [tok_idx]
 
+    cmp     r12d, TOK_PIPE_GT
+    je      .op_pipe_gt
     cmp     r12d, TOK_AND2
     je      .sc_and
     cmp     r12d, TOK_OR2
@@ -881,6 +1015,10 @@ parse_expr:
     je      .op_shl
     cmp     r12d, TOK_SHR
     je      .op_shr
+    cmp     r12d, TOK_ROL
+    je      .op_rol
+    cmp     r12d, TOK_ROR
+    je      .op_ror
     cmp     r12d, TOK_EQ
     mov     dl, 0x94                ; sete
     je      .op_cmp_common
@@ -1089,6 +1227,119 @@ parse_expr:
     call    emit_u16
     jmp     .bin_loop
 
+.op_rol:
+    mov     dword [last_expr_ty], TY_U64
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC0D3              ; 48 D3 C0 = rol rax, cl
+    call    emit_u16
+    jmp     .bin_loop
+
+.op_ror:
+    mov     dword [last_expr_ty], TY_U64
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC8D3              ; 48 D3 C8 = ror rax, cl
+    call    emit_u16
+    jmp     .bin_loop
+
+.op_pipe_gt:
+    ; Pipeline `lhs |> fn_name[(arg1, ...)]`: passes `lhs` as `arg0` (`rdi`)!
+    sub     rsp, 32
+    call    alloc_temp_qword
+    mov     [rsp + 0], eax          ; arg0 = lhs
+    mov     edi, eax
+    call    emit_store_local
+    mov     r15d, 1                 ; arg_cnt = 1
+
+    call    next_tok_ptr
+    cmp     byte [rax], TOK_IDENT
+    jne     parse_err_at_tok
+    mov     r13d, [rax + 8]         ; target fn sym_id
+
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_LPAREN
+    jne     .pg_load_args
+    inc     dword [tok_idx]         ; consume `(`
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_RPAREN
+    je      .pg_close_p
+
+.pg_arg_lp:
+    cmp     r15d, 6
+    jae     parse_err_cur_tok
+    mov     edi, 2                  ; prec > `|>`
+    call    parse_expr
+    call    alloc_temp_qword
+    mov     [rsp + r15 * 4], eax
+    mov     edi, eax
+    call    emit_store_local
+    inc     r15d
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_COMMA
+    jne     .pg_close_p
+    inc     dword [tok_idx]
+    jmp     .pg_arg_lp
+
+.pg_close_p:
+    mov     al, TOK_RPAREN
+    call    expect_tok_kind
+
+.pg_load_args:
+    mov     edi, [rsp + 0]
+    call    emit_load_local
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC789              ; mov rdi, rax
+    call    emit_u16
+    cmp     r15d, 2
+    jb      .pg_call
+    mov     edi, [rsp + 4]
+    call    emit_load_local
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC689              ; mov rsi, rax
+    call    emit_u16
+    cmp     r15d, 3
+    jb      .pg_call
+    mov     edi, [rsp + 8]
+    call    emit_load_local
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC289              ; mov rdx, rax
+    call    emit_u16
+    cmp     r15d, 4
+    jb      .pg_call
+    mov     edi, [rsp + 12]
+    call    emit_load_local
+    call    emit_move_rax_to_arg3
+    cmp     r15d, 5
+    jb      .pg_call
+    mov     edi, [rsp + 16]
+    call    emit_load_local
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xC089              ; mov r8, rax
+    call    emit_u16
+    cmp     r15d, 6
+    jb      .pg_call
+    mov     edi, [rsp + 20]
+    call    emit_load_local
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xC189              ; mov r9, rax
+    call    emit_u16
+
+.pg_call:
+    mov     edi, r15d
+    call    free_temp_qwords
+    add     rsp, 32
+    mov     edi, r13d
+    call    find_or_add_fn
+    mov     edi, eax
+    call    emit_call_fn_idx
+    jmp     .bin_loop
+
 .op_cmp_common:
     mov     dword [last_expr_ty], TY_I64 ; comparisons always yield i64 0 or 1
     push    rdx
@@ -1128,12 +1379,17 @@ seq_bool_norm_end:
 parse_unary:
     call    parse_primary_or_prefix
 .postfix_loop:
+    call    try_parse_postfix_bitslice
     mov     eax, [last_expr_ty]
     test    eax, TY_FLAG_SPAN
-    jnz     .done
+    jnz     .chk_span_post
+    test    eax, TY_FLAG_ATOMIC
+    jnz     .chk_atomic_post
     test    eax, TY_FLAG_VIEW_ONE
     jnz     .chk_view1_dot
     and     eax, TY_BASE_MASK
+    cmp     eax, TY_CUSTOM_PTR_BASE
+    jae     .chk_cptr_post
     cmp     eax, TY_STRUCT_BASE
     jae     .chk_struct_dot
     cmp     eax, TY_BITPACK_BASE
@@ -1155,6 +1411,76 @@ parse_unary:
     mov     edi, [rax + 4]
     mov     esi, [rax + 8]
     call    emit_extract_bitfield
+    jmp     .postfix_loop
+
+.chk_span_post:
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_DOT
+    je      .do_span_post
+    cmp     byte [rax], TOK_LBRACK
+    jne     .done
+.do_span_post:
+    push    r12
+    push    r13
+    push    r14
+    mov     r13d, [last_expr_ty]
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xC089              ; mov r8, rax
+    call    emit_u16
+    call    alloc_anon_span_slot
+    mov     r12d, eax
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0x008B              ; mov rax, [r8]
+    call    emit_u16
+    mov     edi, r12d
+    call    emit_store_local
+    mov     eax, 0x08408B49         ; mov rax, [r8 + 8]
+    call    emit_u32
+    lea     edi, [r12d + 8]
+    call    emit_store_local
+    call    parse_span_local_rval
+    pop     r14
+    pop     r13
+    pop     r12
+    jmp     .postfix_loop
+
+.chk_atomic_post:
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_DOT
+    jne     .done
+    push    r12
+    push    r13
+    mov     r13d, [last_expr_ty]
+    mov     edi, 1
+    call    alloc_anon_frame_qwords
+    mov     r12d, eax
+    mov     edi, r12d
+    call    emit_store_local
+    call    parse_atomic_rval_or_stmt
+    pop     r13
+    pop     r12
+    jmp     .postfix_loop
+
+.chk_cptr_post:
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_DOT
+    je      .do_cptr_post
+    cmp     byte [rax], TOK_LBRACK
+    jne     .done
+.do_cptr_post:
+    push    r12
+    push    r13
+    mov     r13d, [last_expr_ty]
+    mov     edi, 1
+    call    alloc_anon_frame_qwords
+    mov     r12d, eax
+    mov     edi, r12d
+    call    emit_store_local
+    call    parse_custom_ptr_rval
+    pop     r13
+    pop     r12
     jmp     .postfix_loop
 .chk_view1_dot:
     call    peek_tok_ptr
@@ -1199,6 +1525,8 @@ parse_primary_or_prefix:
     je      .u_int
     cmp     cl, TOK_CHAR
     je      .u_int
+    cmp     cl, TOK_STR
+    je      emit_str_literal_span
     cmp     cl, TOK_KW
     je      .u_kw
     cmp     cl, TOK_AT
@@ -1464,13 +1792,25 @@ parse_ident_rvalue:
     mov     r12d, eax               ; rbp_disp
     mov     r13d, edx               ; ty_tag
     test    r13d, TY_FLAG_SPAN
-    jz      .chk_local_view1
+    jz      .chk_local_atomic
     call    parse_span_local_rval
+    jmp     .done
+.chk_local_atomic:
+    test    r13d, TY_FLAG_ATOMIC
+    jz      .chk_local_view1
+    call    parse_atomic_rval_or_stmt
     jmp     .done
 .chk_local_view1:
     test    r13d, TY_FLAG_VIEW_ONE
-    jz      .chk_local_struct
+    jz      .chk_local_cptr
     call    parse_view1_local_rval
+    jmp     .done
+.chk_local_cptr:
+    mov     eax, r13d
+    and     eax, TY_BASE_MASK
+    cmp     eax, TY_CUSTOM_PTR_BASE
+    jb      .chk_local_struct
+    call    parse_custom_ptr_rval
     jmp     .done
 .chk_local_struct:
     cmp     r13d, TY_STRUCT_BASE
@@ -1504,14 +1844,29 @@ parse_ident_rvalue:
     mov     al, TOK_LBRACK
     call    expect_tok_kind
     mov     edi, 1
-    call    parse_expr              ; `rax` = index
+    call    parse_expr              ; `rax` = index or `lo`
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_DOT2
+    je      .sp_subslice
     mov     al, TOK_RBRACK
     call    expect_tok_kind
 
-    ; Unsigned bounds check: `if (u64)idx >= capacity -> fail 2` (§5.3)
+    ; `@ring` / `@dma_queue` wrap power-of-2 (`idx & (cap - 1)`); `@slab` / `@arena` check `idx < cap` (`fail 2`)
     mov     rax, [r14 + 24]
+    cmp     dword [r14 + 4], SKIND_RING
+    je      .sp_wrap_pow2
+    cmp     dword [r14 + 4], SKIND_DMA_QUEUE
+    je      .sp_wrap_pow2
     call    emit_bounds_check_rax
-
+    jmp     .sp_mul_esize
+.sp_wrap_pow2:
+    dec     rax
+    call    emit_mov_rcx_imm64
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC821              ; 48 21 C8 = and rax, rcx
+    call    emit_u16
+.sp_mul_esize:
     mov     eax, [r14 + 16]
     cmp     eax, 1
     jbe     .sp_add_base
@@ -1548,7 +1903,159 @@ parse_ident_rvalue:
     je      .ret_sp_cap
     cmp     ecx, [sym_cap_id]
     je      .ret_sp_cap
+    cmp     ecx, [sym_len_id]
+    je      .ret_sp_cap
+    cmp     ecx, [sym_span_id]
+    je      .ret_sp_span
+    cmp     ecx, [sym_slot_addr_id]
+    je      .ret_sp_slot_addr
     jmp     parse_err_cur_tok
+.ret_sp_slot_addr:
+    ; `ring.slot_addr(seq)` -> `ring.base + ((seq & (cap - 1)) * esize)`!
+    cmp     dword [r14 + 4], SKIND_RING
+    je      .sa_go
+    cmp     dword [r14 + 4], SKIND_DMA_QUEUE
+    jne     parse_err_cur_tok
+.sa_go:
+    mov     al, TOK_LPAREN
+    call    expect_tok_kind
+    mov     edi, 1
+    call    parse_expr              ; seq -> `rax`
+    mov     al, TOK_RPAREN
+    call    expect_tok_kind
+    mov     rax, [r14 + 24]
+    dec     rax
+    call    emit_mov_rcx_imm64
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC821              ; and rax, rcx (`seq & (cap - 1)`)
+    call    emit_u16
+    mov     eax, [r14 + 16]
+    call    emit_mov_rcx_imm64
+    mov     eax, 0xC1AF0F48         ; imul rax, rcx
+    call    emit_u32
+    mov     rax, [r14 + 8]
+    call    emit_load_space_base_rcx
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC801              ; add rax, rcx
+    call    emit_u16
+    mov     dword [last_expr_ty], TY_U64
+    jmp     .done
+.ret_sp_span:
+    call    alloc_anon_span_slot
+    mov     r12d, eax
+    mov     rax, [r14 + 8]
+    call    emit_load_space_base_rax
+    mov     edi, r12d
+    call    emit_store_local
+    mov     rax, [r14 + 24]
+    call    emit_mov_rax_imm64
+    lea     edi, [r12d + 8]
+    call    emit_store_local
+    mov     edi, r12d
+    call    emit_lea_local
+    mov     eax, [r14 + 20]
+    or      eax, TY_FLAG_SPAN
+    mov     [last_expr_ty], eax
+    jmp     .done
+.sp_subslice:
+    ; `slab[lo..hi]` -> construct full span & subslice!
+    inc     dword [tok_idx]         ; consume `..`
+    call    alloc_temp_qword
+    mov     r12d, eax               ; temp `lo`
+    mov     edi, r12d
+    call    emit_store_local
+    mov     edi, 1
+    call    parse_expr              ; `hi` -> `rax`
+    mov     al, TOK_RBRACK
+    call    expect_tok_kind
+    call    alloc_temp_qword
+    mov     r13d, eax               ; temp `hi`
+    mov     edi, r13d
+    call    emit_store_local
+
+    ; Bounds check `(u64)lo <= (u64)hi && (u64)hi <= slab.cap` -> `fail 2`
+    mov     edi, r12d
+    call    emit_load_local
+    mov     edi, r13d
+    call    emit_load_local_rcx
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC839              ; cmp rax, rcx (lo vs hi)
+    call    emit_u16
+    mov     ax, 0x870F              ; ja .sp_ss_oob
+    call    emit_u16
+    mov     eax, [code_off]
+    push    rax
+    xor     eax, eax
+    call    emit_u32
+
+    mov     rax, [r14 + 24]
+    call    emit_mov_rax_imm64      ; rax = cap
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC139              ; cmp rcx, rax (hi vs cap)
+    call    emit_u16
+    mov     ax, 0x860F              ; jbe .sp_ss_ok
+    call    emit_u16
+    mov     eax, [code_off]
+    push    rax
+    xor     eax, eax
+    call    emit_u32
+
+    mov     rdx, [rsp + 8]
+    mov     edi, edx
+    call    patch_rel32_here
+    mov     edi, 2
+    call    emit_raise_fault_imm
+
+    pop     rdi
+    call    patch_rel32_here
+    add     rsp, 8
+
+    call    alloc_anon_span_slot
+    mov     ebx, eax                ; new span slot
+    mov     edi, r13d
+    call    emit_load_local
+    mov     edi, r12d
+    call    emit_load_local_rcx
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC829              ; hi - lo
+    call    emit_u16
+    lea     edi, [ebx + 8]
+    call    emit_store_local
+
+    mov     edi, r12d
+    call    emit_load_local
+    mov     ecx, [r14 + 16]         ; elem_size
+    cmp     ecx, 1
+    jbe     .sp_ss_b
+    push    rax
+    mov     eax, ecx
+    call    emit_mov_rcx_imm64
+    pop     rax
+    mov     eax, 0xC1AF0F48
+    call    emit_u32
+.sp_ss_b:
+    mov     rax, [r14 + 8]
+    call    emit_load_space_base_rcx
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC801
+    call    emit_u16
+    mov     edi, ebx
+    call    emit_store_local
+
+    mov     edi, 2
+    call    free_temp_qwords
+    mov     edi, ebx
+    call    emit_lea_local
+    mov     eax, [r14 + 20]
+    or      eax, TY_FLAG_SPAN
+    mov     [last_expr_ty], eax
+    jmp     .done
 .ret_sp_base:
     mov     rax, [r14 + 8]
     call    emit_load_space_base_rax
@@ -1561,10 +2068,23 @@ parse_ident_rvalue:
     jmp     .done
 
 .do_fn_call:
+    cmp     ebx, [sym_publish_id]
+    je      .rval_publish
+    cmp     ebx, [sym_wait_id]
+    je      .rval_wait
     sub     rsp, 32
     inc     dword [tok_idx]
     xor     r12d, r12d
-
+    jmp     .fc_chk_empty
+.rval_publish:
+    dec     dword [tok_idx]
+    call    parse_stmt_or_expr_publish
+    jmp     .done
+.rval_wait:
+    dec     dword [tok_idx]
+    call    parse_stmt_or_expr_wait
+    jmp     .done
+.fc_chk_empty:
     call    peek_tok_ptr
     cmp     byte [rax], TOK_RPAREN
     je      .fc_args_done
@@ -1618,10 +2138,7 @@ parse_ident_rvalue:
     jb      .fc_emit
     mov     edi, [rsp + 12]
     call    emit_load_local
-    mov     al, 0x48
-    call    emit_u8
-    mov     ax, 0xC189
-    call    emit_u16
+    call    emit_move_rax_to_arg3
     cmp     r12d, 5
     jb      .fc_emit
     mov     edi, [rsp + 16]
@@ -1857,17 +2374,9 @@ parse_trailing_recover_body:
 
     call    rec_pop_and_patch_here
 
-    call    emit_load_fault_addr_rcx
-    mov     al, 0x48
-    call    emit_u8
-    mov     ax, 0x018B              ; mov rax, [rcx]
-    call    emit_u16
-    mov     ax, 0xD231              ; xor edx, edx
-    call    emit_u16
-    mov     al, 0x48
-    call    emit_u8
-    mov     ax, 0x1189              ; mov [rcx], rdx
-    call    emit_u16
+    cmp     byte [in_isr_mode], 0
+    jne     err_isr_ban_cur
+    call    emit_fault_take_rax
     mov     edi, ebx
     call    emit_store_local
 
@@ -1893,8 +2402,26 @@ parse_stmt:
     cmp     cl, TOK_KW
     je      .kw_stmt
     cmp     cl, TOK_IDENT
-    je      parse_ident_stmt
+    je      .chk_ident_or_match
     jmp     parse_err_at_tok
+
+.chk_ident_or_match:
+    mov     edx, [rax + 8]
+    cmp     edx, [sym_tile_id]
+    je      .chk_tile_blk
+    cmp     edx, [sym_match_id]
+    jne     parse_ident_stmt
+    cmp     byte [rax + 16], TOK_WALRUS
+    je      parse_ident_stmt
+    cmp     byte [rax + 16], TOK_COLON
+    je      parse_ident_stmt
+    cmp     byte [rax + 16], TOK_ASSIGN
+    je      parse_ident_stmt
+    jmp     parse_stmt_match
+.chk_tile_blk:
+    cmp     byte [rax + 16], TOK_LBRACE
+    je      parse_stmt_tile
+    jmp     parse_ident_stmt
 
 .kw_stmt:
     movzx   edx, byte [rax + 1]
@@ -1932,20 +2459,16 @@ parse_stmt_fail:
     mov     eax, 1
     call    emit_u32
 
-    call    emit_load_fault_addr_rcx
-    mov     al, 0x48
-    call    emit_u8
-    mov     ax, 0x0189
-    call    emit_u16
+    call    emit_fault_store_rax
 
     cmp     dword [rec_depth], 0
     jg      .jump_rec
+    mov     ecx, [tile_lex_depth]
+    call    emit_tile_unwind_count
     mov     eax, 0xC3C9C031
     jmp     emit_u32
 .jump_rec:
-    call    emit_jmp_rel32
-    mov     edi, eax
-    jmp     rec_add_patch
+    jmp     emit_unwind_to_recover
 
 ; -----------------------------------------------------------------------------
 ; Variable Declarations & Lvalues (Bounds-Checked, Truncated & Scoped)
@@ -1988,9 +2511,29 @@ parse_ident_stmt:
 
     test    r13d, TY_FLAG_SPAN
     jnz     .lv_span
+    test    r13d, TY_FLAG_ATOMIC
+    jnz     .lv_atomic
     test    r13d, TY_FLAG_VIEW_ONE
     jnz     .lv_view1
 
+    mov     eax, r13d
+    and     eax, TY_BASE_MASK
+    cmp     eax, TY_CUSTOM_PTR_BASE
+    jb      .lv_plain_local
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_LBRACK
+    jne     .lv_plain_local
+    call    parse_custom_ptr_index_stmt
+    jmp     .done
+
+.lv_atomic:
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_DOT
+    jne     .lv_plain_local
+    call    parse_atomic_rval_or_stmt
+    jmp     .done
+
+.lv_plain_local:
     mov     edi, r12d
     call    emit_lea_local
     jmp     .lv_walk_fields
@@ -2008,7 +2551,7 @@ parse_ident_stmt:
 
     mov     edi, r13d
     and     edi, TY_BASE_MASK
-    mov     r13d, edi               ; element base type
+    and     r13d, TY_BASE_MASK | TY_FLAG_STREAM ; preserve `movnti` streaming flag!
     call    type_size_align
     cmp     eax, 1
     jbe     .lv_span_base
@@ -2040,7 +2583,36 @@ parse_ident_stmt:
     call    emit_null_view_check_rax
 .lv_v1_mask:
     and     r13d, TY_BASE_MASK
-    jmp     .lv_walk_fields
+    cmp     r13d, TY_STRUCT_BASE
+    jae     .lv_walk_fields
+
+    ; 1-arg scalar/bitpack `@mmio<T>(addr).write(val)` / `@view<T>(addr).write(val)`!
+    call    alloc_temp_qword
+    mov     r14d, eax               ; save target address
+    mov     edi, r14d
+    call    emit_store_local
+
+    inc     dword [tok_idx]         ; consume `.`
+    call    next_tok_ptr
+    cmp     byte [rax], TOK_IDENT
+    jne     parse_err_at_tok
+    mov     ecx, [rax + 8]
+    cmp     ecx, [sym_write_id]
+    jne     parse_err_cur_tok
+    mov     al, TOK_LPAREN
+    call    expect_tok_kind
+    mov     edi, 1
+    call    parse_expr              ; val -> `rax`
+    mov     al, TOK_RPAREN
+    call    expect_tok_kind
+
+    mov     edi, r14d
+    call    emit_load_local_rcx     ; rcx = target addr
+    mov     edi, r13d
+    call    emit_store_mem_typed
+    mov     edi, 1
+    call    free_temp_qwords
+    jmp     .done
 
 .lv_space:
     mov     r15, rax                ; &SpaceEntry
@@ -2056,10 +2628,22 @@ parse_ident_stmt:
     mov     al, TOK_RBRACK
     call    expect_tok_kind
 
-    ; Unsigned bounds check: `if (u64)idx >= capacity -> fail 2` (§5.3)
+    ; `@ring` / `@dma_queue` wrap power-of-2 (`idx & (cap - 1)`); `@slab` / `@arena` check `idx < cap` (`fail 2`)
     mov     rax, [r15 + 24]
+    cmp     dword [r15 + 4], SKIND_RING
+    je      .lv_sp_wrap
+    cmp     dword [r15 + 4], SKIND_DMA_QUEUE
+    je      .lv_sp_wrap
     call    emit_bounds_check_rax
-
+    jmp     .lv_sp_mul
+.lv_sp_wrap:
+    dec     rax
+    call    emit_mov_rcx_imm64
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC821              ; and rax, rcx
+    call    emit_u16
+.lv_sp_mul:
     mov     eax, [r15 + 16]
     cmp     eax, 1
     jbe     .lv_sp_base
@@ -2078,7 +2662,25 @@ parse_ident_stmt:
 .lv_walk_fields:
     call    peek_tok_ptr
     cmp     byte [rax], TOK_DOT
+    je      .lv_do_dot
+    cmp     byte [rax], TOK_LBRACK
     jne     .lv_have_addr
+
+    ; Lvalue hardware bit-slice `target[hi:lo] = val`!
+    mov     edx, r13d
+    and     edx, TY_BASE_MASK
+    cmp     edx, TY_STRUCT_BASE
+    jae     parse_err_at_tok
+    call    parse_bitslice_bounds   ; eax = lo, edx = width
+    lea     r15, [bit_slice_desc]
+    mov     dword [r15 + 0], 0
+    mov     [r15 + 4], eax          ; shift = lo
+    mov     [r15 + 8], edx          ; width = hi - lo + 1
+    mov     dword [r15 + 12], TY_U64
+    mov     r14d, 1                 ; bitfield RMW flag
+    jmp     .lv_have_addr
+
+.lv_do_dot:
     inc     dword [tok_idx]
     call    next_tok_ptr
     cmp     byte [rax], TOK_IDENT
@@ -2253,9 +2855,17 @@ parse_ident_stmt:
     mov     r13d, eax
     jmp     .dt_scalar
 .dt_norm:
-    call    parse_resolved_type_tag
+    call    parse_fn_type_annot
     mov     r13d, eax
-    cmp     r13d, TY_STRUCT_BASE
+    test    r13d, TY_FLAG_SPAN
+    jnz     .decl_span_typed
+    test    r13d, TY_FLAG_VIEW_ONE | TY_FLAG_ATOMIC
+    jnz     .dt_scalar
+    mov     edx, r13d
+    and     edx, TY_BASE_MASK
+    cmp     edx, TY_CUSTOM_PTR_BASE
+    jae     .dt_scalar
+    cmp     edx, TY_STRUCT_BASE
     jae     .decl_struct_var
 .dt_scalar:
     mov     al, TOK_ASSIGN
@@ -2275,6 +2885,14 @@ parse_ident_stmt:
     mov     edi, r13d
     call    emit_store_mem_typed
     jmp     .done
+
+.decl_span_typed:
+    mov     al, TOK_ASSIGN
+    call    expect_tok_kind
+    mov     edi, 1
+    call    parse_expr
+    mov     esi, r13d
+    jmp     .decl_span_walrus
 
 .decl_struct_var:
     mov     edi, ebx
@@ -2386,6 +3004,10 @@ emit_compound_alu:
     je      .shl
     cmp     edi, TOK_SHR_EQ
     je      .shr
+    cmp     edi, TOK_ROL_EQ
+    je      .rol
+    cmp     edi, TOK_ROR_EQ
+    je      .ror
     jmp     parse_err_cur_tok
 .add:
     pop     rsi
@@ -2485,22 +3107,65 @@ emit_compound_alu:
     call    emit_u8
     mov     ax, 0xE8D3              ; shr rax, cl
     jmp     emit_u16
+.rol:
+    pop     rsi
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC0D3              ; rol rax, cl
+    jmp     emit_u16
+.ror:
+    pop     rsi
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0xC8D3              ; ror rax, cl
+    jmp     emit_u16
 
 ; -----------------------------------------------------------------------------
 ; Control Flow (`return`, `if`, Scoped `for` & `loop`)
 ; -----------------------------------------------------------------------------
 parse_stmt_return:
     inc     dword [tok_idx]
+    cmp     dword [cur_fn_attr], 1  ; `@isr` returns via `iretq` (no return value)!
+    jne     .ret_norm
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_RBRACE
+    je      emit_isr_epilogue
+    jmp     err_isr_ban_cur
+.ret_norm:
     call    peek_tok_ptr
     cmp     byte [rax], TOK_RBRACE
     je      .ret_void
     mov     edi, 1
     call    parse_expr
+    test    dword [cur_fn_ret_ty], TY_FLAG_SPAN
+    jz      .epi
+    ; Return 16-byte `{ base, len }` slice in `RAX:RDX`!
+    mov     eax, 0x08508B48         ; 48 8B 50 08 = mov rdx, [rax + 8]
+    call    emit_u32
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0x008B              ; 48 8B 00 = mov rax, [rax]
+    call    emit_u16
     jmp     .epi
 .ret_void:
     mov     ax, 0xC031
     call    emit_u16
 .epi:
+    cmp     dword [tile_lex_depth], 0
+    jle     .epi_leave
+    push    rax
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xC089              ; mov r8, rax (preserve return value across tile unwind!)
+    call    emit_u16
+    mov     ecx, [tile_lex_depth]
+    call    emit_tile_unwind_count
+    mov     al, 0x4C
+    call    emit_u8
+    mov     ax, 0xC089              ; mov rax, r8
+    call    emit_u16
+    pop     rax
+.epi_leave:
     mov     ax, 0xC3C9
     jmp     emit_u16
 
@@ -2589,13 +3254,28 @@ loop_push_scope:
     mov     rcx, [space_ast]
     mov     dword [rcx + AST_BRK_CNT_OFF + rax * 4], 0
     mov     dword [rcx + AST_CNT_CNT_OFF + rax * 4], 0
+    mov     edx, [tile_lex_depth]
+    mov     [rcx + AST_LOOP_TILE_OFF + rax * 4], edx
     inc     dword [loop_depth]
+    ret
+
+emit_unwind_loop_tiles:
+    mov     edx, [loop_depth]
+    dec     edx
+    mov     rcx, [space_ast]
+    mov     eax, [tile_lex_depth]
+    sub     eax, [rcx + AST_LOOP_TILE_OFF + rdx * 4]
+    jle     .ok
+    mov     ecx, eax
+    jmp     emit_tile_unwind_count
+.ok:
     ret
 
 parse_stmt_break:
     cmp     dword [loop_depth], 0
     je      parse_err_cur_tok
     inc     dword [tok_idx]
+    call    emit_unwind_loop_tiles
     call    emit_jmp_rel32
     mov     edx, [loop_depth]
     dec     edx
@@ -2611,6 +3291,7 @@ parse_stmt_continue:
     cmp     dword [loop_depth], 0
     je      parse_err_cur_tok
     inc     dword [tok_idx]
+    call    emit_unwind_loop_tiles
     call    emit_jmp_rel32
     mov     edx, [loop_depth]
     dec     edx
@@ -2628,6 +3309,7 @@ loop_patch_continues_here:
     dec     ebx
     mov     rcx, [space_ast]
     mov     r8d, [rcx + AST_CNT_CNT_OFF + rbx * 4]
+    mov     dword [rcx + AST_CNT_CNT_OFF + rbx * 4], 0 ; reset count for `<unroll: K>` steps!
     shl     ebx, 8
 .c_loop:
     test    r8d, r8d
@@ -2667,194 +3349,7 @@ loop_pop_and_patch_breaks_here:
     ret
 
 parse_stmt_for:
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    sub     rsp, 16                 ; [rsp+0] = has_rec, [rsp+4] = saved_local_cnt
-
-    ; Save outer `local_cnt` so `for` header var & hidden locals die after loop (§5.2)
-    mov     eax, [local_cnt]
-    mov     [rsp + 4], eax
-    inc     dword [scope_depth]
-
-    inc     dword [tok_idx]         ; consume `for`
-    call    next_tok_ptr
-    cmp     byte [rax], TOK_IDENT
-    jne     parse_err_at_tok
-    mov     ebx, [rax + 8]          ; loop var sym_id
-    mov     r14d, [rax + 4]         ; loop var line
-
-    mov     al, TOK_KW
-    mov     ah, KW_IN
-    call    expect_tok_kw
-
-    ; Evaluate `start` / `mask` BEFORE binding `loop_var` so `for x in x..10` sees outer `x`!
-    mov     edi, 1
-    call    parse_expr
-    mov     r15d, [last_expr_ty]
-
-    ; Bind `loop_var` inside `for` header scope
-    mov     edi, ebx
-    mov     esi, TY_I64
-    mov     edx, r14d
-    call    alloc_local_scoped
-    mov     r12d, eax
-
-    call    peek_tok_ptr
-    cmp     byte [rax], TOK_DOT2
-    je      .range_for
-
-    ; --- `<bits>` Loop (`loop_var` is unsigned bit index 0..63) ---
-    call    alloc_anon_local
-    mov     r13d, eax
-    mov     edi, r13d
-    call    emit_store_local
-
-    call    peek_tok_ptr
-    mov     esi, [rax + 4]
-    cmp     byte [rax], TOK_LT
-    jne     .reject_lens
-    inc     dword [tok_idx]
-
-    call    next_tok_ptr
-    mov     esi, [rax + 4]
-    cmp     byte [rax], TOK_IDENT
-    jne     .reject_lens
-    mov     edx, [sym_bits_id]
-    cmp     [rax + 8], edx
-    jne     .reject_lens
-
-    call    peek_tok_ptr
-    mov     esi, [rax + 4]
-    cmp     byte [rax], TOK_GT
-    jne     .reject_lens
-    inc     dword [tok_idx]
-
-    call    block_has_trailing_recover
-    mov     [rsp], eax
-    test    eax, eax
-    jz      .bits_start
-    call    rec_push_scope
-
-.bits_start:
-    call    loop_push_scope
-    mov     r14d, [code_off]
-
-    mov     edi, r13d
-    call    emit_load_local
-    call    emit_jz_rel32
-    mov     r15d, eax
-
-    mov     al, 0xF3
-    call    emit_u8
-    mov     eax, 0xC0BC0F48         ; tzcnt rax, rax
-    call    emit_u32
-    mov     edi, r12d
-    call    emit_store_local
-
-    call    parse_block_no_scope_push
-
-    call    loop_patch_continues_here
-    mov     edi, r13d
-    call    emit_load_local
-    mov     al, 0xC4
-    call    emit_u8
-    mov     eax, 0xC8F3F8E2         ; blsr rax, rax
-    call    emit_u32
-    mov     edi, r13d
-    call    emit_store_local
-
-    mov     edi, r14d
-    call    emit_jmp_to
-    mov     edi, r15d
-    call    patch_rel32_here
-    call    loop_pop_and_patch_breaks_here
-    jmp     .rewind_for_scope
-
-.range_for:
-    inc     dword [tok_idx]         ; consume `..`
-    mov     edi, r12d
-    call    emit_store_local
-
-    mov     edi, 1
-    call    parse_expr
-    call    alloc_anon_local
-    mov     r13d, eax
-    mov     edi, r13d
-    call    emit_store_local
-
-    call    peek_tok_ptr
-    cmp     byte [rax], TOK_LT
-    jne     .range_check_rec
-    mov     esi, [rax + 4]
-    jmp     .reject_lens
-
-.range_check_rec:
-    call    block_has_trailing_recover
-    mov     [rsp], eax
-    test    eax, eax
-    jz      .range_start
-    call    rec_push_scope
-
-.range_start:
-    call    loop_push_scope
-    mov     r14d, [code_off]
-
-    mov     edi, r12d
-    call    emit_load_local
-    mov     al, 0x48
-    call    emit_u8
-    mov     ax, 0x853B
-    call    emit_u16
-    mov     eax, r13d
-    call    emit_u32
-    mov     ax, 0x8D0F
-    call    emit_u16
-    mov     r15d, [code_off]
-    xor     eax, eax
-    call    emit_u32
-
-    call    parse_block_no_scope_push
-
-    call    loop_patch_continues_here
-    mov     al, 0x48
-    call    emit_u8
-    mov     ax, 0x85FF
-    call    emit_u16
-    mov     eax, r12d
-    call    emit_u32
-
-    mov     edi, r14d
-    call    emit_jmp_to
-    mov     edi, r15d
-    call    patch_rel32_here
-    call    loop_pop_and_patch_breaks_here
-
-.rewind_for_scope:
-    ; Rewind `for` header + body variables BEFORE `recover` (§5.2)
-    dec     dword [scope_depth]
-    mov     eax, [rsp + 4]
-    mov     [local_cnt], eax
-
-    cmp     dword [rsp], 0
-    je      .done
-    call    parse_trailing_recover_body
-
-.done:
-    add     rsp, 16
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    ret
-
-.reject_lens:
-    lea     rdi, [msg_unimpl_lens]
-    mov     edx, msg_unimpl_lens_len
-    jmp     err_msg_at_line
+    jmp     parse_stmt_for_ext
 
 parse_stmt_loop:
     push    rbx
@@ -2862,10 +3357,11 @@ parse_stmt_loop:
     push    r13
     push    r14
     push    r15
-    sub     rsp, 16                 ; [rsp+0] = has_rec, [rsp+4] = saved_local_cnt
+    sub     rsp, 16                 ; [rsp+0] = has_rec, [rsp+4] = saved_local_cnt, [rsp+8] = has_tile, [rsp+12] = tile_line
 
     mov     eax, [local_cnt]
     mov     [rsp + 4], eax
+    mov     dword [rsp + 8], 0
 
     inc     dword [tok_idx]         ; consume `loop`
     xor     r12d, r12d
@@ -2884,6 +3380,9 @@ parse_stmt_loop:
     mov     ecx, [rax + 8]
     mov     esi, [rax + 4]
 
+    cmp     ecx, [sym_tile_id]
+    je      .parse_tile_clause
+
     mov     al, TOK_COLON
     call    expect_tok_kind
 
@@ -2891,9 +3390,18 @@ parse_stmt_loop:
     je      .parse_max_clause
     cmp     ecx, [sym_until_id]
     je      .parse_until_clause
+.bad_loop_lens:
     lea     rdi, [msg_unimpl_lens]
     mov     edx, msg_unimpl_lens_len
     jmp     err_msg_at_line
+
+.parse_tile_clause:
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_COLON
+    je      .bad_loop_lens          ; `<tile: 32KB>` stays rejected until Phase 4
+    mov     dword [rsp + 8], 1
+    mov     [rsp + 12], esi
+    jmp     .next_lens
 
 .parse_max_clause:
     xor     eax, eax
@@ -2933,6 +3441,11 @@ parse_stmt_loop:
     call    rec_push_scope
 
 .start_loop:
+    cmp     dword [rsp + 8], 0
+    je      .lp_no_tile_in
+    mov     esi, [rsp + 12]
+    call    emit_tile_enter
+.lp_no_tile_in:
     call    loop_push_scope
     mov     r14d, [code_off]
     xor     r15d, r15d
@@ -2996,6 +3509,10 @@ parse_stmt_loop:
     call    patch_rel32_here
 .patch_brks:
     call    loop_pop_and_patch_breaks_here
+    cmp     dword [rsp + 8], 0
+    je      .lp_no_tile_out
+    call    emit_tile_exit
+.lp_no_tile_out:
 
     ; Rewind hidden loop locals before `recover` (§5.2)
     mov     eax, [rsp + 4]
@@ -3163,21 +3680,52 @@ parse_stmt_print:
 ; Function Signatures, Definitions & Module Driver
 ; -----------------------------------------------------------------------------
 prescan_fn_signatures:
+    ; Zero `AST_FN_ATTR_OFF` (`4096` bytes = `512` qwords)
+    mov     rdi, [space_ast]
+    add     rdi, AST_FN_ATTR_OFF
+    xor     eax, eax
+    mov     ecx, 512
+    rep     stosq
+
     mov     dword [tok_idx], 0
 .loop:
     call    peek_tok_ptr
     movzx   ecx, byte [rax]
     test    cl, cl
     jz      .done
+    xor     r8d, r8d                ; `r8b = 0` (normal), `1` (`@isr`), `2` (`@isr_ok`)
+    cmp     cl, TOK_AT
+    jne     .chk_kw_fn
+    cmp     byte [rax + 16], TOK_IDENT
+    jne     .adv_non_fn
+    mov     edx, [rax + 24]
+    cmp     edx, [sym_isr_id]
+    je      .ps_is_isr
+    cmp     edx, [sym_isr_ok_id]
+    jne     .adv_non_fn
+    mov     r8b, 2
+    add     dword [tok_idx], 2
+    jmp     .got_attr
+.ps_is_isr:
+    mov     r8b, 1
+    add     dword [tok_idx], 2
+.got_attr:
+    call    peek_tok_ptr
+    movzx   ecx, byte [rax]
+.chk_kw_fn:
     cmp     cl, TOK_KW
     jne     .adv_non_fn
     cmp     byte [rax + 1], KW_FN
     jne     .adv_non_fn
 
     inc     dword [tok_idx]
+    push    r8
     call    next_tok_ptr
     mov     edi, [rax + 8]
     call    find_or_add_fn
+    pop     r8
+    mov     rcx, [space_ast]
+    mov     [rcx + AST_FN_ATTR_OFF + rax], r8b
     push    rax
 
     mov     al, TOK_LPAREN
@@ -3200,6 +3748,8 @@ prescan_fn_signatures:
     call    peek_tok_ptr
     cmp     byte [rax], TOK_LBRACE
     je      .save_ret
+    cmp     byte [rax], TOK_FAT_ARROW
+    je      .save_ret
     cmp     byte [rax], TOK_ARROW
     jne     .parse_rt
     inc     dword [tok_idx]
@@ -3211,7 +3761,14 @@ prescan_fn_signatures:
     shl     eax, 4
     mov     rcx, [space_ast]
     mov     [rcx + AST_FN_OFF + rax + 12], esi
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_FAT_ARROW
+    je      .sk_arrow_sig
     call    skip_brace_block
+    jmp     .loop
+.sk_arrow_sig:
+    inc     dword [tok_idx]
+    call    skip_const_rhs_tokens
     jmp     .loop
 
 .adv_non_fn:
@@ -3253,7 +3810,13 @@ parse_fn_decl:
     mov     dword [max_frame_qwords], 0
     mov     dword [loop_depth], 0
     mov     dword [rec_depth], 0
+    mov     dword [tile_lex_depth], 0
     mov     byte  [in_fn_body], 1
+    mov     eax, [cur_fn_attr]
+    mov     [in_isr_mode], al
+
+    cmp     eax, 1                  ; `@isr`?
+    je      .prolog_isr
 
     mov     al, 0x55
     call    emit_u8
@@ -3268,7 +3831,13 @@ parse_fn_decl:
     mov     r12d, [code_off]
     xor     eax, eax
     call    emit_u32
+    jmp     .parse_params
 
+.prolog_isr:
+    call    emit_isr_prologue
+    mov     r12d, eax
+
+.parse_params:
     mov     al, TOK_LPAREN
     call    expect_tok_kind
     xor     r13d, r13d
@@ -3276,6 +3845,8 @@ parse_fn_decl:
     call    peek_tok_ptr
     cmp     byte [rax], TOK_RPAREN
     je      .params_done
+    cmp     dword [cur_fn_attr], 1  ; `@isr` takes 0 software arguments!
+    je      err_isr_ban_cur
 
 .param_loop:
     cmp     r13d, 6
@@ -3289,11 +3860,16 @@ parse_fn_decl:
     mov     al, TOK_COLON
     call    expect_tok_kind
     call    parse_fn_type_annot
+    push    rax                     ; [rsp] = param_ty
     mov     edi, r14d
     mov     esi, eax
     mov     edx, r15d
     call    alloc_local_scoped
     mov     edi, eax
+    pop     rcx                     ; ecx = param_ty
+
+    test    ecx, TY_FLAG_SPAN
+    jnz     .sp_span
 
     cmp     r13d, 0
     je      .sp0
@@ -3313,6 +3889,74 @@ parse_fn_decl:
     pop     rax
     call    emit_u32
     jmp     .sp_done
+.sp_span:
+    ; Copy 16B `{ base, len }` pointed to by `arg_reg` into `[rbp + edi]` using `r11` & `rax` (preserves `r10`!)
+    push    rdi
+    cmp     r13d, 0
+    je      .sps0
+    cmp     r13d, 1
+    je      .sps1
+    cmp     r13d, 2
+    je      .sps2
+    cmp     r13d, 3
+    je      .sps3
+    cmp     r13d, 4
+    je      .sps4
+    mov     al, 0x4D
+    call    emit_u8
+    mov     ax, 0xCB89              ; 4D 89 CB = mov r11, r9
+    call    emit_u16
+    jmp     .sps_cp
+.sps4:
+    mov     al, 0x4D
+    call    emit_u8
+    mov     ax, 0xC389              ; 4D 89 C3 = mov r11, r8
+    call    emit_u16
+    jmp     .sps_cp
+.sps3:
+    cmp     byte [mode_efi], 1
+    je      .sps3_efi
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xCB89              ; 49 89 CB = mov r11, rcx (`abi-host`)
+    call    emit_u16
+    jmp     .sps_cp
+.sps3_efi:
+    mov     al, 0x4D
+    call    emit_u8
+    mov     ax, 0xD389              ; 4D 89 D3 = mov r11, r10 (`Reactor ABI`)
+    call    emit_u16
+    jmp     .sps_cp
+.sps2:
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xD389              ; 49 89 D3 = mov r11, rdx
+    call    emit_u16
+    jmp     .sps_cp
+.sps1:
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xF389              ; 49 89 F3 = mov r11, rsi
+    call    emit_u16
+    jmp     .sps_cp
+.sps0:
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0xFB89              ; 49 89 FB = mov r11, rdi
+    call    emit_u16
+.sps_cp:
+    mov     al, 0x49
+    call    emit_u8
+    mov     ax, 0x038B              ; 49 8B 03 = mov rax, [r11]
+    call    emit_u16
+    mov     rdi, [rsp]
+    call    emit_store_local
+    mov     eax, 0x08438B49         ; 49 8B 43 08 = mov rax, [r11 + 8]
+    call    emit_u32
+    pop     rdi
+    add     edi, 8
+    call    emit_store_local
+    jmp     .sp_done
 .sp4:
     push    rdi
     mov     al, 0x4C
@@ -3324,9 +3968,19 @@ parse_fn_decl:
     jmp     .sp_done
 .sp3:
     push    rdi
+    cmp     byte [mode_efi], 1
+    je      .sp3_efi
     mov     al, 0x48
     call    emit_u8
-    mov     ax, 0x8D89
+    mov     ax, 0x8D89              ; 48 89 8D <disp32> = mov [rbp + disp32], rcx (`abi-host`)
+    call    emit_u16
+    pop     rax
+    call    emit_u32
+    jmp     .sp_done
+.sp3_efi:
+    mov     al, 0x4C
+    call    emit_u8
+    mov     ax, 0x9589              ; 4C 89 95 <disp32> = mov [rbp + disp32], r10 (`Reactor ABI` §6.1)
     call    emit_u16
     pop     rax
     call    emit_u32
@@ -3370,28 +4024,83 @@ parse_fn_decl:
     mov     al, TOK_RPAREN
     call    expect_tok_kind
 
+    mov     dword [cur_fn_ret_ty], TY_I64
     call    peek_tok_ptr
     cmp     byte [rax], TOK_LBRACE
     je      .fn_body
+    cmp     byte [rax], TOK_FAT_ARROW
+    je      .fn_arrow_body
     cmp     byte [rax], TOK_ARROW
     jne     .rt
     inc     dword [tok_idx]
 .rt:
     call    parse_fn_type_annot
+    mov     [cur_fn_ret_ty], eax
+    call    peek_tok_ptr
+    cmp     byte [rax], TOK_FAT_ARROW
+    je      .fn_arrow_body
 
 .fn_body:
     call    parse_block_no_scope_push
+    cmp     dword [cur_fn_attr], 1  ; `@isr`?
+    jne     .fn_norm_epi
+    call    emit_isr_epilogue
+    jmp     .fn_finalize
+.fn_norm_epi:
+    mov     eax, 0xC3C9C031
+    call    emit_u32
+    jmp     .fn_finalize
+
+.fn_arrow_body:
+    cmp     dword [cur_fn_attr], 1  ; `@isr` cannot be value-returning `=>`
+    je      err_isr_ban_cur
+    inc     dword [tok_idx]         ; consume `=>`
+    mov     edi, 1
+    call    parse_expr
+    test    dword [cur_fn_ret_ty], TY_FLAG_SPAN
+    jz      .fn_arrow_epi
+    mov     eax, 0x08508B48         ; mov rdx, [rax + 8]
+    call    emit_u32
+    mov     al, 0x48
+    call    emit_u8
+    mov     ax, 0x008B              ; mov rax, [rax]
+    call    emit_u16
+.fn_arrow_epi:
+    mov     ax, 0xC3C9              ; leave; ret (`rax` holds expression result!)
+    call    emit_u16
+
+.fn_finalize:
     mov     dword [local_cnt], 0
     mov     dword [scope_depth], 0
     mov     byte  [in_fn_body], 0
+    mov     byte  [in_isr_mode], 0
+    mov     r8d,  [cur_fn_attr]
+    mov     dword [cur_fn_attr], 0
 
-    mov     eax, 0xC3C9C031
-    call    emit_u32
+    ; Record exact machine-code byte length of `ebx` in `AST_FNLEN_OFF` (`@code_bytes`)!
+    mov     rcx, [space_ast]
+    mov     edx, ebx
+    shl     edx, 4
+    mov     eax, [code_off]
+    sub     eax, [rcx + AST_FN_OFF + rdx + 4]
+    mov     [rcx + AST_FNLEN_OFF + rbx * 4], eax
 
     mov     eax, [max_frame_qwords]
     shl     eax, 3
+    cmp     byte [mode_efi], 1
+    jne     .align16_frame
+    cmp     r8d, 1                  ; `@isr` aligns via `and rsp, -16`
+    je      .align16_frame
+    ; Inductive 64B `RSP` alignment for Reactor ABI & `<tile>` checkpoints (§6.1):
+    ; `call` (-8) + `push rbp` (-8) + `sub rsp, (64k + 48)` => `RSP ≡ 0 (mod 64)`!
+    add     eax, 79
+    and     eax, ~63
+    sub     eax, 16
+    jmp     .write_frame
+.align16_frame:
     add     eax, 15
     and     eax, ~15
+.write_frame:
     mov     rdx, [space_out]
     mov     [rdx + r12], eax
 
@@ -3405,10 +4114,16 @@ parse_fn_decl:
 compile_module:
     mov     dword [fn_cnt], 0
     mov     dword [call_fix_cnt], 0
+    mov     dword [fnlen_fix_cnt], 0
     mov     dword [code_off], TARGET_HDR_LEN
+    cmp     byte [mode_capsule], 1
+    je      .hdr_cap
     cmp     byte [mode_efi], 1
     jne     .hdr_set
     mov     dword [code_off], PE_HDR_FILE_SIZE
+    jmp     .hdr_set
+.hdr_cap:
+    mov     dword [code_off], ZCAP_HDR_SIZE
 .hdr_set:
     mov     dword [tgt_ro_off], 0
     mov     dword [fixup_cnt], 0
@@ -3416,9 +4131,14 @@ compile_module:
 
     call    prescan_module
     call    prescan_fn_signatures
+    cmp     byte [mode_capsule], 1
+    je      .emit_cap_rt
     cmp     byte [mode_efi], 1
     je      .emit_efi_rt
     call    emit_target_runtime
+    jmp     .start_fns
+.emit_cap_rt:
+    call    emit_capsule_target_runtime
     jmp     .start_fns
 .emit_efi_rt:
     call    emit_efi_target_runtime
@@ -3435,6 +4155,7 @@ compile_module:
     jne     .skip_non_fn
     cmp     byte [rax + 1], KW_FN
     jne     .skip_non_fn
+    mov     dword [cur_fn_attr], 0
     call    parse_fn_decl
     jmp     .top_loop
 
@@ -3445,12 +4166,30 @@ compile_module:
     call    peek_tok_ptr
     cmp     byte [rax], TOK_LBRACE
     je      .sk_br
+    cmp     byte [rax], TOK_AT
+    je      .sk_ptr_decl
     cmp     byte [rax], TOK_LT
     jne     .sk_const
     call    skip_angle_block
     call    peek_tok_ptr
     cmp     byte [rax], TOK_LBRACE
     je      .sk_br
+    jmp     .top_loop
+.sk_ptr_decl:
+    cmp     byte [rax + 16], TOK_KW
+    jne     .sk_ptr_ident
+    cmp     byte [rax + 17], KW_CELL64
+    jne     .sk_const
+    add     dword [tok_idx], 2
+    jmp     .sk_br
+.sk_ptr_ident:
+    cmp     byte [rax + 16], TOK_IDENT
+    jne     .sk_const
+    mov     edx, [sym_ptr_id]
+    cmp     [rax + 24], rdx
+    jne     .sk_const
+    add     dword [tok_idx], 2
+    call    skip_angle_block
     jmp     .top_loop
 .sk_br:
     call    skip_brace_block
@@ -3459,8 +4198,26 @@ compile_module:
     call    skip_const_rhs_tokens
     jmp     .top_loop
 .skip_at_decl:
+    cmp     byte [rax + 16], TOK_IDENT
+    jne     .sk_at_space
+    mov     edx, [rax + 24]
+    cmp     edx, [sym_isr_id]
+    je      .top_isr_fn
+    cmp     edx, [sym_isr_ok_id]
+    je      .top_isr_ok_fn
+.sk_at_space:
     add     dword [tok_idx], 4
     call    skip_angle_block
+    jmp     .top_loop
+.top_isr_fn:
+    add     dword [tok_idx], 2
+    mov     dword [cur_fn_attr], 1
+    call    parse_fn_decl
+    jmp     .top_loop
+.top_isr_ok_fn:
+    add     dword [tok_idx], 2
+    mov     dword [cur_fn_attr], 2
+    call    parse_fn_decl
     jmp     .top_loop
 
 .resolve_calls:
@@ -3472,7 +4229,7 @@ compile_module:
     mov     edx, [call_fix_cnt]
 .patch_calls:
     cmp     ecx, edx
-    jae     .done
+    jae     .resolve_fnlens
     mov     edi, [r9 + rcx * 8]
     mov     esi, [r9 + rcx * 8 + 4]
     shl     esi, 4
@@ -3484,6 +4241,26 @@ compile_module:
     mov     [r11 + rdi], eax
     inc     ecx
     jmp     .patch_calls
+
+.resolve_fnlens:
+    mov     r8,  [space_ast]
+    lea     r9,  [r8 + AST_FNLEN_FIX_OFF]
+    lea     r10, [r8 + AST_FN_OFF]
+    xor     ecx, ecx
+    mov     edx, [fnlen_fix_cnt]
+.patch_fnlens:
+    cmp     ecx, edx
+    jae     .done
+    mov     edi, [r9 + rcx * 8]
+    mov     esi, [r9 + rcx * 8 + 4]
+    mov     eax, esi
+    shl     eax, 4
+    cmp     dword [r10 + rax + 8], 1
+    jne     err_undef_fn
+    mov     eax, [r8 + AST_FNLEN_OFF + rsi * 4]
+    mov     [r11 + rdi], eax
+    inc     ecx
+    jmp     .patch_fnlens
 .done:
     ret
 

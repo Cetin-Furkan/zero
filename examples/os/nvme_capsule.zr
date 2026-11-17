@@ -1,0 +1,296 @@
+// =============================================================================
+// ZeroOS Gate-3 PCIe `ECAM` + NVMe `@dma_queue` + `@capsule` Engine (`os/nvme_capsule.zr`)
+// =============================================================================
+// Implements `ZERO_OS_ARCHITECTURE.md` §3 & §6 Gate 3 without VFS/FAT/ext4:
+//   1. Discovers PCIe `ECAM` from ACPI `MCFG` & locates NVMe (`01h:08h:02h`)
+//   2. Initializes Admin + I/O `@dma_queue` rings (`ASQ`/`ACQ` + `SQ1`/`CQ1`)
+//   3. Queries `Identify Namespace` for exact hardware LBA shift (`512e` vs `4Kn`)
+//   4. DMAs Master Extent Table (LBA 0) & `@capsule` extent straight into DRAM
+//   5. Verifies hardware SSE4.2 `@crc32c`, seals capsule `PTE_RX` (`WX=0`), and
+//      executes the live capsule inside the Reactor ABI (including `gs:0` recover)!
+// =============================================================================
+use "hw_types.zr"
+use "paging_wx.zr"
+
+fn nvme_submit_and_poll(
+    sq_slot_addr:  u64,
+    cq_slot_addr:  u64,
+    cmd:           @NvmeCmd,
+    sq_db_addr:    u64,
+    cq_db_addr:    u64,
+    tail_and_phase: u64
+) u64 {
+    next_tail: u32 = tail_and_phase[31:1]
+    exp_phase: u64 = tail_and_phase[0:0]
+
+    sq_view := @view<NvmeCmd>(sq_slot_addr)
+    sq_view.cdw0  = cmd.cdw0
+    sq_view.nsid  = cmd.nsid
+    sq_view.rsv0  = 0
+    sq_view.mptr  = 0
+    sq_view.prp1  = cmd.prp1
+    sq_view.prp2  = cmd.prp2
+    sq_view.cdw10 = cmd.cdw10
+    sq_view.cdw11 = cmd.cdw11
+    sq_view.cdw12 = cmd.cdw12
+    sq_view.cdw13 = 0
+    sq_view.cdw14 = 0
+    sq_view.cdw15 = 0
+    @sfence()
+
+    sq_db := @mmio<u32>(sq_db_addr)
+    cq_db := @mmio<u32>(cq_db_addr)
+    sq_db.write(next_tail)
+
+    status_mmio := @mmio<u16>(cq_slot_addr + 14)
+    got_done: u64 = 0
+    raw_st:   u64 = 0
+    loop <max: 50000000 | until: got_done == 1> {
+        st16: u16 = status_mmio.read()
+        if st16[0:0] == exp_phase {
+            raw_st = st16
+            got_done = 1
+        } else {
+            @pause()
+        }
+    }
+    if got_done == 0 {
+        return 0
+    }
+    cq_db.write(next_tail)
+    if raw_st[15:1] != 0 {
+        return 0
+    }
+    return 1
+}
+
+fn find_nvme_bar0_via_mcfg(handoff: @BootHandoff) u64 {
+    if handoff.mcfg == 0 {
+        return 0
+    }
+    hdr := @view<AcpiSdtHeader>(handoff.mcfg)
+    if hdr.signature != MCFG_SIG || hdr.length < 60 {
+        return 0
+    }
+    ent := @view<AcpiMcfgEntry>(handoff.mcfg + 44)
+    if ent.ecam_base == 0 {
+        return 0
+    }
+
+    start_bus: u64 = ent.start_bus
+    end_bus:   u64 = ent.end_bus
+    if end_bus > start_bus + 7 {
+        end_bus = start_bus + 7
+    }
+    bus_span: u64 = (end_bus - start_bus + 1) << 20
+    ensure_uc_mmio_mapped(ent.ecam_base + (start_bus << 20), bus_span)
+
+    for b in start_bus..(end_bus + 1) {
+        ub: u64 = b
+        for d in 0..32 {
+            ud: u64 = d
+            for f in 0..8 {
+                uf: u64 = f
+                cfg_addr: u64 = ent.ecam_base + (ub << 20) + (ud << 15) + (uf << 12)
+                cfg := @mmio<u32>(cfg_addr, 16)
+                vd: u32 = cfg[0]
+                if vd == 0xFFFF_FFFF {
+                    if uf == 0 {
+                        break
+                    }
+                    continue
+                }
+                cls: u32 = cfg[2]
+                if cls[31:8] == 0x010802 {
+                    // Enable PCI Memory Space (bit 1) + Bus Master DMA (bit 2)
+                    cmd_st: u32 = cfg[1]
+                    cfg[1] = cmd_st | 0x06
+
+                    bar_lo: u64 = cfg[4]
+                    bar_phys: u64 = bar_lo & 0xFFFF_FFF0
+                    if (bar_lo & 0x06) == 0x04 {
+                        bar_hi: u64 = cfg[5]
+                        bar_phys = bar_phys | (bar_hi << 32)
+                    }
+                    return bar_phys
+                }
+                if uf == 0 {
+                    hdr_t: u32 = cfg[3]
+                    if hdr_t[23:23] == 0 {
+                        break
+                    }
+                }
+            }
+        }
+    }
+    return 0
+}
+
+// Probes NVMe via `MCFG`, streams & CRC32C-verifies `@capsule` 0, seals `PTE_RX` (`WX=0`), & runs it!
+// Returns `0` cleanly when booted without an NVMe namespace / Master Extent disk attached.
+fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
+    bar0: u64 = find_nvme_bar0_via_mcfg(handoff)
+    if bar0 == 0 {
+        return 0
+    }
+    ensure_uc_mmio_mapped(bar0, 0x2000)
+
+    regs32 := @mmio<u32>(bar0, 2048)
+    regs64 := @mmio<u64>(bar0, 1024)
+
+    cap_reg:   u64 = regs64[0]
+    dstrd:     u64 = cap_reg[35:32]
+    db_stride: u64 = 4 << dstrd     // bytes per doorbell register
+
+    // 1. Reset NVMe controller (`CC.EN = 0 -> CSTS.RDY == 0`)
+    if regs32[5][0:0] != 0 {
+        regs32[5] = 0
+        rdy_clr: u64 = 0
+        loop <max: 50000000 | until: rdy_clr == 1> {
+            if regs32[7][0:0] == 0 {
+                rdy_clr = 1
+            } else {
+                @pause()
+            }
+        }
+        if rdy_clr == 0 {
+            return 0
+        }
+    }
+
+    // 2. Bind Admin `@dma_queue` rings (`cap = 16`) & enable controller (`CC = 0x0046_0001`)
+    regs32[9] = 0x000F_000F         // AQA: ACQS = 15, ASQS = 15
+    regs64[5] = nvme_admin_sq.base  // ASQ physical base
+    regs64[6] = nvme_admin_cq.base  // ACQ physical base
+    regs32[5] = 0x0046_0001         // CC: IOCQES=4 (16B), IOSQES=6 (64B), EN=1
+
+    rdy_on: u64 = 0
+    loop <max: 50000000 | until: rdy_on == 1> {
+        if regs32[7][0:0] == 1 {
+            rdy_on = 1
+        } else {
+            @pause()
+        }
+    }
+    if rdy_on == 0 {
+        return 0
+    }
+
+    asq_db: u64 = bar0 + 0x1000
+    acq_db: u64 = bar0 + 0x1000 + db_stride
+    iosq_db: u64 = bar0 + 0x1000 + 2 * db_stride
+    iocq_db: u64 = bar0 + 0x1000 + 3 * db_stride
+
+    // 3. Admin Identify Namespace 1 (`Opcode = 0x06`, `CNS = 0x00`) -> read hardware `LBADS` shift
+    id_cmd := NvmeCmd{
+        cdw0: 0x0001_0006, nsid: 1, rsv0: 0, mptr: 0,
+        prp1: nvme_meta_page.base, prp2: 0,
+        cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0
+    }
+    if nvme_submit_and_poll(nvme_admin_sq.slot_addr(0), nvme_admin_cq.slot_addr(0), id_cmd, asq_db, acq_db, (1 << 1) | 1) == 0 {
+        return 0
+    }
+    flbas: u64 = nvme_meta_page[26] & 0x0F
+    lbads: u64 = nvme_meta_page[128 + flbas * 4 + 2]
+    if lbads < 9 || lbads > 12 {
+        return 0
+    }
+
+    // 4. Admin Create I/O CQ 1 (`Opcode = 0x05`) & Create I/O SQ 1 (`Opcode = 0x01`)
+    ccq_cmd := NvmeCmd{
+        cdw0: 0x0002_0005, nsid: 0, rsv0: 0, mptr: 0,
+        prp1: nvme_io_cq1.base, prp2: 0,
+        cdw10: (15 << 16) | 1, cdw11: 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0
+    }
+    if nvme_submit_and_poll(nvme_admin_sq.slot_addr(1), nvme_admin_cq.slot_addr(1), ccq_cmd, asq_db, acq_db, (2 << 1) | 1) == 0 {
+        return 0
+    }
+
+    csq_cmd := NvmeCmd{
+        cdw0: 0x0003_0001, nsid: 0, rsv0: 0, mptr: 0,
+        prp1: nvme_io_sq1.base, prp2: 0,
+        cdw10: (15 << 16) | 1, cdw11: (1 << 16) | 1, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0
+    }
+    if nvme_submit_and_poll(nvme_admin_sq.slot_addr(2), nvme_admin_cq.slot_addr(2), csq_cmd, asq_db, acq_db, (3 << 1) | 1) == 0 {
+        return 0
+    }
+
+    // 5. Lock-Free I/O Read (`Opcode = 0x02`) of Master Extent Table at LBA 0 (`4 KiB`)
+    blks_per_4k: u32 = (4096 >> lbads) - 1
+    meta_rd := NvmeCmd{
+        cdw0: 0x0010_0002, nsid: 1, rsv0: 0, mptr: 0,
+        prp1: nvme_meta_page.base, prp2: 0,
+        cdw10: 0, cdw11: 0, cdw12: blks_per_4k, cdw13: 0, cdw14: 0, cdw15: 0
+    }
+    if nvme_submit_and_poll(nvme_io_sq1.slot_addr(0), nvme_io_cq1.slot_addr(0), meta_rd, iosq_db, iocq_db, (1 << 1) | 1) == 0 {
+        return 0
+    }
+
+    super := @view<MasterExtentSuper>(nvme_meta_page.base)
+    if super.magic != ZEXT_MAGIC || super.version != 1 || super.extent_count == 0 {
+        return 0
+    }
+    ext0 := @view<MasterExtentEntry>(nvme_meta_page.base + 64)
+    if ext0.byte_len < 72 || ext0.byte_len > boot_capsule.cap || (ext0.start_byte & 4095) != 0 {
+        return 0
+    }
+
+    // 6. Stream `@capsule` extent in 4KiB DMA pages directly into `boot_capsule` (`PTE_RW_NX`)
+    pages_needed: u64 = (ext0.byte_len + 4095) >> 12
+    if pages_needed > 14 {
+        return 0
+    }
+    for pg in 0..pages_needed {
+        upg: u64 = pg
+        lba_start: u64 = (ext0.start_byte + upg * 4096) >> lbads
+        sq_idx: u64 = 1 + upg
+        tail_v: u32 = sq_idx + 1
+        cid_v:  u32 = 0x20 + upg
+        cap_rd := NvmeCmd{
+            cdw0: (cid_v << 16) | 0x02, nsid: 1, rsv0: 0, mptr: 0,
+            prp1: boot_capsule.base + upg * 4096, prp2: 0,
+            cdw10: lba_start[31:0], cdw11: lba_start[63:32], cdw12: blks_per_4k,
+            cdw13: 0, cdw14: 0, cdw15: 0
+        }
+        tail_u64: u64 = sq_idx + 1
+        if nvme_submit_and_poll(nvme_io_sq1.slot_addr(sq_idx), nvme_io_cq1.slot_addr(sq_idx), cap_rd, iosq_db, iocq_db, (tail_u64 << 1) | 1) == 0 {
+            return 0
+        }
+    }
+
+    // 7. Verify `ZeroCapsuleHeader` & Hardware SSE4.2 `@crc32c` Digest
+    cap_hdr := @view<ZeroCapsuleHeader>(boot_capsule.base)
+    if cap_hdr.magic != ZCAP_MAGIC || cap_hdr.version != 1 || cap_hdr.entry_off != 64 {
+        return 0
+    }
+    code_bytes: u64 = cap_hdr.code_bytes
+    if code_bytes == 0 || (code_bytes & 7) != 0 || 64 + code_bytes > ext0.byte_len {
+        return 0
+    }
+    qwords := @view<u64>(boot_capsule.base + 64, code_bytes / 8)
+    crc_acc: u64 = 0xFFFF_FFFF
+    for qw in qwords {
+        crc_acc = @crc32c(crc_acc, qw)
+    }
+    calc_crc: u32 = (~crc_acc)[31:0]
+    if calc_crc != cap_hdr.crc32c || calc_crc != ext0.crc32c {
+        @halt()
+    }
+
+    // 8. Seal `@capsule` pages from `PTE_RW_NX` -> `PTE_RX` (`WX=0` verified!) & execute!
+    seal_capsule_wx_rx(boot_capsule.base, 64 + code_bytes, boot_capsule.cap)
+
+    entry_fn: u64 = boot_capsule.base + cap_hdr.entry_off
+    caught_cap_fault: u64 = 0
+    {
+        _bad_call := @call(entry_fn, 0, 0)
+    } recover cerr {
+        caught_cap_fault = cerr
+    }
+    if caught_cap_fault != 88 {
+        @halt()
+    }
+
+    cap_ret: u64 = @call(entry_fn, 40, 2)
+    return cap_ret
+}
