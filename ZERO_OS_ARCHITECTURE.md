@@ -1,65 +1,226 @@
-# `ZeroOS` — Hardware-Verified Bare-Metal Architecture (`i7-1165G7`)
+# `ZeroOS` — Bare-Metal Ring-0 Kernel & Reactor Architecture (`i7-1165G7`)
 
-> **`ZeroOS`** is a single-image, reactor-driven Ring-0 operating system co-designed with the **`Zero` (`.zr`)** language and self-hosted compiler (`compiler/zero1.zr`) for this exact reference machine: **HP Intel Core i7-1165G7 (Tiger Lake Willow Cove, 4C/8T, `39-bit` physical / `48-bit` virtual addressing, `Iris Xe` Gen12LP, PCIe NVMe, `i8042` keyboard, `ELAN0712` LPSS I2C touchpad)**.
+> [!IMPORTANT]
+> **`ZeroOS`** (`examples/gate1_os.zr` + `examples/os/*.zr`) is a single-image, reactor-driven, strictly `W^X` Ring-0 monolithic operating system co-designed with the self-hosted **`Zero` (`.zr`)** compiler (`compiler/zero1.zr`, `--target=efi-os` and `--target=capsule`).
 >
-> Every instruction and architectural rule in this document is verified against `/proc/cpuinfo`, `/proc/bus/input/devices`, and live `QEMU Q35 + KVM + OVMF + NVMe` hardware execution on the host machine.
+> Every hardware address, MSR, page-table flag, descriptor table, interrupt gate, and DMA ring documented below is **implemented and verified today** in `build/gate1_os_z2.efi` (`99,328 B`) and `build/gate1_laptop_z2.efi` (`95,232 B`, `0` port-`0xE9` instructions), except Section 9 which explicitly marks the Stage-2 `ZeroFS` (`ZLEDGER1`) and Gate-4 `Iris Xe` `CCS0` targets.
 
 ---
 
-## 1. Verified Silicon Capabilities & Constraints (`i7-1165G7`)
+## Table of Contents
 
-| Hardware Feature | Verified Host Status | Architectural Role in `ZeroOS` |
+1. [Verified Target Silicon & PCIe Topology (`Intel Core i7-1165G7`)](#1-verified-target-silicon--pcie-topology-intel-core-i7-1165g7)
+2. [End-to-End Boot, SMP & Command Deck Lifecycle](#2-end-to-end-boot-smp--command-deck-lifecycle)
+3. [`PE32+` Container & Physical Memory Layout](#3-pe32-container--physical-memory-layout)
+4. [4-Level Hardware `W^X` Paging Engine & Dynamic Capsule Sealing](#4-4-level-hardware-wx-paging-engine--dynamic-capsule-sealing)
+5. [The `ZeroOS` Reactor ABI, `gs:0` Faults & Zero-XSAVE Ring-0 `AVX-512`](#5-the-zeroos-reactor-abi-gs0-faults--zero-xsave-ring-0-avx-512)
+6. [Cross-Core `MOVDIR64B` + Race-Free `MONITOR`/`MWAIT` Reactor Fabric](#6-cross-core-movdir64b--race-free-monitormwait-reactor-fabric)
+7. [Tickless `I/O APIC` `IRQ1` Keyboard & `@isr` Verification](#7-tickless-io-apic-irq1-keyboard--isr-verification)
+8. [PCIe `MCFG` + Lock-Free NVMe `@dma_queue` + `.zcap` Capsule Engine](#8-pcie-mcfg--lock-free-nvme-dma_queue--zcap-capsule-engine)
+9. [Next-Stage Kernel Extensions (`ZeroFS` `ZLEDGER1` & `Iris Xe` `CCS0`)](#9-next-stage-kernel-extensions-zerofs-zledger1--iris-xe-ccs0)
+
+---
+
+## 1. Verified Target Silicon & PCIe Topology (`Intel Core i7-1165G7`)
+
+Every architectural decision in `ZeroOS` is anchored to direct inspection of `/proc/cpuinfo`, `lspci -nn`, and `/proc/bus/input/devices` on the reference Tiger Lake UP3 machine:
+
+| Subsystem | Hardware Identity (`lspci -nn` / `CPUID`) | Present / Absent Features | Role & Programming Model in `ZeroOS` |
+| :--- | :--- | :--- | :--- |
+| **CPU Cores** | `11th Gen Intel Core i7-1165G7` (`Willow Cove`, `4C / 8T`) | `48 KiB` L1D, `1.25 MiB` L2, `12 MiB` L3; `39-bit` physical / `48-bit` virtual | **1 pinned permanent reactor per hardware thread** (`r12 = 0..N-1`); zero preemptive context-switch scheduler, zero thread migration. |
+| **Vector & Crypto** | `AVX-512` (`F/BW/CD/DQ/VL/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ/IFMA`), `AES-NI`, `VAES`, `SHA-NI`, `GFNI`, `BMI1/2`, `CRC32C` | **`XCR0 = 0xE7`** (`x87 + SSE + AVX + opmask + ZMM_Hi256 + Hi16_ZMM`) unlocked on BSP + all APs | `512-bit` `ZMM0..7` (`u32x16`, `u64x8`, `{k1}` opmask tails, `vmovntdq` GOP scanout) executed directly in Ring 0 under the **Zero-XSAVE `<tile>` law**; SSE4.2 `@crc32c` verifies NVMe superblocks and capsules. |
+| **Cacheline Doorbells & Sleep** | `MOVDIR64B`, `MOVDIRI`, Ring-0 `MONITOR`/`MWAIT` | **`waitpkg` (`umwait`/`tpause`) Absent**; **`lam` Absent** | `publish(addr, cell64)` emits `MOVDIR64B` (`66 0F 38 F8`); `wait(...)` emits Intel SDM §9.10.4 race-free Ring-0 `MONITOR` + recheck + `MWAIT` + `IA32_TSC_DEADLINE` (`MSR 0x6E0`), with `CPUID.01H:ECX[3]` fallback to `PAUSE`/`sti; hlt` on hypervisors without `MWAIT`. |
+| **Memory Protection** | `4-level PML4` (`pdpe1gb`, `NX`), `PKU` (`OSPKE`) | `5-level la57` Absent | Full `W^X` `CR3` hierarchy (`verify_no_wx_pages() == 0`) + `PKRU = 0` initialized across all cores. |
+| **APIC & Timers** | Register-mode `x2APIC` (`MSR 0x800..0x83F`), `I/O APIC` (`0xFEC0_0000`), invariant `TSC` | `x2apic`, `tsc_deadline_timer`, `constant_tsc`, `nonstop_tsc` Present | `MADT`-driven `INIT-SIPI` SMP wake via `X2APIC_ICR_MSR` (`0x830`); `I/O APIC` routes `IRQ 1` $\rightarrow$ vector `0x21` with **zero periodic timer ticks**. |
+| **Integrated GPU** | `00:02.0` Intel TigerLake-LP GT2 `[Iris Xe Graphics]` `[8086:9a49]` | Shared DRAM via PPGTT + slice-local SRAM (SLM) + `WC` GOP | UEFI GOP framebuffer mapped `PTE_WC_NX` (`PAT1 = WC`) and painted at 64 bytes/store via `AVX-512` `vmovntdq`. *(Direct `CCS0` compute walker = Gate 4).* |
+| **Scoring Accelerator** | `00:08.0` Intel GNA Scoring Accelerator 2.0 `[8086:9a11]` | Low-power neural/GMM block *(No Meteor Lake NPU on this die)* | Stage-2 `gna` hardware domain target (`npu` is statically rejected on Tiger Lake). |
+| **NVMe Storage** | `02:00.0` SK hynix BC511 NVMe SSD `[1c5c:1339]` | **Intel VMD Disabled** — directly visible via ACPI `MCFG`/`ECAM` (`Class 01h:08h:02h`) | Lock-free Ring-0 Admin (`ASQ`/`ACQ`) & I/O (`SQ1`/`CQ1`) `@dma_queue` pairs over `UC+NX` `BAR0` doorbells. |
+| **Input & Buses** | `i8042` (`0x60`/`0x64` `@port`, `IRQ 1`), `00:14.0` xHCI `[8086:a0ed]`, `00:15.0/1` LPSS I2C `[8086:a0e8/9]`, `01:00.0` Wi-Fi 7 `[8086:272b]` | Built-in PS/2 AT keyboard + `ELAN0712` I2C touchpad + USB 3.2 boot | Interrupt-driven `IRQ1` scancode ring (`kbd_ring`) + GPT/FAT32 USB boot (`make usb-img`). |
+
+---
+
+## 2. End-to-End Boot, SMP & Command Deck Lifecycle
+
+```mermaid
+flowchart TD
+    UEFI["1. UEFI PE32+ Entry (efi_main on BSP)\ncompiler/efi_pe32.zr Prelude"] --> PRE["2. Pre-Exit Firmware Harvest\n• Query GOP (BGRX8888 / RGBX8888)\n• Walk RSDP -> XSDT/RSDT -> MADT & MCFG\n• Calibrate tsc_per_ms\n• Allocate <0xA0000 AP Trampoline + AP Stacks\n• GetMemoryMap + ExitBootServices()"]
+    PRE --> WX["3. Post-Exit Ring-0 Takeover (gate1_os.zr)\n• Unlock CR4.OSXSAVE + XCR0=0xE7 + PKRU=0\n• Program IA32_PAT (PA1=WC) & IA32_EFER.NXE\n• Build 4-Level W^X CR3 (verify WX==0)\n• Install Per-Core GDT + Tss64 + 256-Gate IDT"]
+    WX --> SMP["4. MADT + x2APIC SMP Bring-Up (smp_madt.zr)\n• Parse MADT Type 0 / Type 9 APIC IDs\n• Enable x2APIC (MSR 0x1B | 0xC00)\n• Wake APs via <1 MiB PTE_RX Bridge -> ap_main(slot)\n• Pin r12..r15 + IA32_GS_BASE per Reactor"]
+    SMP --> NVME["5. PCIe MCFG + NVMe Capsule Engine (nvme_capsule.zr)\n• Scan ECAM -> Map NVMe BAR0 UC+NX\n• Bind Admin & I/O @dma_queue Rings\n• DMA ZEXTENT1 + Extents 0..2 into boot_capsule\n• Hardware @crc32c Check -> seal_capsule_wx_rx (PTE_RX)"]
+    NVME --> DECK["6. Tickless IRQ1 + Obsidian Command Deck\n• Mask 8259 PICs; Route I/O APIC IRQ1 -> Vec 0x21 (@isr)\n• Render HUD via AVX-512 vmovntdq\n• Sleep in Race-Free MONITOR/MWAIT\n• Keys 1/2/3 Fan Out MOVDIR64B Tasks to Workers"]
+```
+
+---
+
+## 3. `PE32+` Container & Physical Memory Layout
+
+`compiler/efi_pe32.zr` emits a standalone UEFI application (`Machine = 0x8664`, `Subsystem = 0x0A` `EFI_APPLICATION`, zero external linker, zero `.dll` imports) with strict section permission separation:
+
+| Region / Offset | Permission | Size / Alignment | Exact Contents & Role |
+| :--- | :---: | :---: | :--- |
+| **PE32+ Headers** (`File 0x000..0x1FF`) | `RO` | `512 B` | DOS stub + COFF + Optional Header (`ImageBase` relocatable) + 3 Section Headers (`.text`, `.reloc`, `.bss`). |
+| **`.text` (`RVA 0x1000`)** | **`RX`** (`0x60000020`) | `4 KiB` aligned | UEFI boot prelude, `< 1 MiB` AP trampoline template, 256 default fault stubs, compiled `.zr` kernel functions, `@isr` handlers, and inline RIP-relative string/rodata literals. |
+| **`.reloc`** | **`RO`** (`0x42000040`) | `4 KiB` aligned | Minimal empty base-relocation block satisfying OVMF/AMI UEFI loader relocation checks while keeping all `.zr` code 100% RIP-relative. |
+| **`.bss` + `+0x00040`** | **`RW+NX`** | `64 B` (`BootHandoff`) | Magic `'ZEROHAND'` (`0x5A45_524F_4841_4E44`), GOP geometry, `rsdp`/`madt`/`mcfg`, `ap_trampoline`, `tsc_per_ms`, `code_base`/`code_bytes`. |
+| **`.bss` + `+0x00100`** | **`RW+NX`** | `16 KiB` (`MemRange[]`) | Normalized memory ranges (`kind 1` WB DRAM, `kind 2` WC GOP, `kind 3` UC MMIO, `kind 5` RO ACPI). |
+| **`.bss` + `+0x04000`** | **`RW+NX`** | `32 KiB` | Raw UEFI `GetMemoryMap` descriptor buffer harvested immediately prior to `ExitBootServices()`. |
+| **`.bss` + `+0x1C000`** | **`RW+NX`** | `112 KiB` (`..0x1C000`) | 64-byte-aligned BSP Ring-0 execution stack (`stack_top` at `+0x1C000`), `+0x1C040` `isr_line` fault vector cell. |
+| **`.bss` + `+0x1E000`** | **`RW+NX`** | `16 x 64 B = 1 KiB` | `ReactorLocal[0..15]` per-core state blocks pointed to by `r15` and `IA32_GS_BASE` (`MSR 0xC000_0101`). |
+| **`.bss` + `+0x20000`** | **`RW+NX`** | Static topological layout | All kernel `@slab`, `@ring` (`64 B` aligned), and `@dma_queue` (`4 KiB` page-aligned) spaces (`gdt_slab`, `tss_slab`, `idt_slab`, `pt_pool`, `worker_inbox`, `nvme_admin_sq/cq`, `nvme_io_sq1/cq1`, etc.). |
+| **`@capsule boot_capsule`** | **`RW+NX` $\rightarrow$ `RX` / `RO+NX`** | `256 KiB` (`4 x 64 KiB` slots, `4 KiB` aligned) | Mapped purely with **4 KiB PTEs** (never 2 MiB hugepages) so individual 64 KiB capsule slots flip cleanly from `PTE_RW_NX` (during NVMe DMA) to `PTE_RX` (`seal_capsule_wx_rx`) after `@crc32c` verification. |
+| **`< 0xA0000` AP Bridge** | **`RX`** (`4 KiB`) | Allocated `< 640 KiB` pre-exit | Required because EDK2's `MpInitChangeApLoopCallback` broadcasts `INIT` to APs during `ExitBootServices()`, forcing APs through 16-bit Real Mode `SIPI` vector `VV00:0000` before jumping straight into 64-bit `.zr` `fn ap_main(slot)`. |
+
+---
+
+## 4. 4-Level Hardware `W^X` Paging Engine & Dynamic Capsule Sealing
+
+`examples/os/paging_wx.zr` constructs an identity-mapped 4-level `CR3` hierarchy inside `pt_pool` (`512` 4 KiB page-table frames = `2 MiB` pool) using `Zero` hardware bit-slice indexing (`addr[47:39]`, `addr[38:30]`, `addr[29:21]`, `addr[20:12]`) and programmable `@PtePtr` (`@ptr<u64 | mask: 0x000F_FFFF_FFFF_F000>`) pointers:
+
+```text
+ 63  62       52 51                                   12 11  9 8   7   6   5   4    3   2   1   0
+┌───┬───────────┬───────────────────────────────────────┬─────┬──┬───┬───┬───┬────┬───┬───┬───┬───┐
+│NX │  Ignored  │       4 KiB Physical Frame Addr       │ AVL │G │PS │ D │ A │PCD │PWT│U/S│R/W│ P │
+└───┴───────────┴───────────────────────────────────────┴─────┴──┴───┴───┴───┴────┴───┴───┴───┴───┘
+```
+
+| Mapping Class | `ZeroOS` Constant | Exact Hex Mask | Hardware Caching & Access Semantics |
+| :--- | :--- | :--- | :--- |
+| **Directory Link (`PML4E`/`PDPTE`/`PDE`)** | `PTE_DIR` | `0x0000_0000_0000_0003` | `P=1, RW=1, NX=0` (leaf permissions refine access at lower levels). |
+| **Kernel `.text`, `<1M` Bridge, Sealed `@capsule`** | `PTE_RX` | `0x0000_0000_0000_0001` | `WB` Write-Back (`PAT0`), **Read + Execute (`RW=0, NX=0`)**. |
+| **Usable DRAM (`.bss`, Stacks, `@slab`, `@ring`)** | `PTE_RW_NX` | `0x8000_0000_0000_0003` | `WB` Write-Back (`PAT0`), **Read + Write, Never-Execute (`RW=1, NX=1`)**. |
+| **ACPI Tables (`RSDP`, `XSDT`, `MADT`, `MCFG`) & Unused Capsule Slots** | `PTE_RO_NX` | `0x8000_0000_0000_0001` | `WB` Write-Back (`PAT0`), **Read-Only, Never-Execute (`RW=0, NX=1`)**. |
+| **UEFI GOP Scanout Framebuffer** | `PTE_WC_NX` | `0x8000_0000_0000_000B` | `WC` Write-Combining (`PWT=1, PCD=0` $\rightarrow$ `IA32_PAT.PA1 = 0x01`), **RW+NX**. |
+| **PCIe `ECAM`, NVMe `BAR0`, `I/O APIC`** | `PTE_UC_NX` | `0x8000_0000_0000_001B` | `UC-` Uncacheable (`PWT=1, PCD=1`), **RW+NX** (strong MMIO ordering). |
+
+### Two Critical `W^X` Invariants
+
+1. **Zero Hugepage Overlap on Executable/Sealable Spans:**
+   `build_wx_pagetables` uses `1 GiB` and `2 MiB` (`PDE_PS`) hugepages aggressively for bulk DRAM, *except* any `1 GiB` / `2 MiB` window overlapping `.text`, `ap_trampoline`, `gop`, or `boot_capsule` automatically drops down to **4 KiB PTEs**. Consequently, `seal_capsule_wx_rx` flips 64 KiB capsule slots from `PTE_RW_NX` to `PTE_RX` (+ `@invlpg`) in $O(1)$ without splitting live hugepages.
+2. **Exhaustive 4-Level Hardware Audit (`verify_no_wx_pages`):**
+   Both immediately after loading `CR3` and immediately after sealing NVMe capsules, `verify_no_wx_pages()` walks every present `PML4E -> PDPTE -> PDE -> PTE` via `@PtePtr` and halts the CPU if *any* leaf has `RW == 1 && NX == 0` (`WX=0` verified on every boot).
+
+---
+
+## 5. The `ZeroOS` Reactor ABI, `gs:0` Faults & Zero-XSAVE Ring-0 `AVX-512`
+
+### 5.1 Register Calling & Pinning Convention (`--target=efi-os` and `--target=capsule`)
+
+Unlike the System V ABI (which uses `rcx` as argument 4, colliding with variable shift counts `cl`), the `ZeroOS` Reactor ABI frees `rcx` for shifts/loops and permanently dedicates `r12..r15` to zero-lookup reactor state:
+
+| Register(s) | ABI Role in `--target=efi-os` & `--target=capsule` | Hardware / Intrinsic Binding |
 | :--- | :--- | :--- |
-| **CPU Topology & Caches** | `4C / 8T`, `48 KiB` L1D, `1.25 MiB` L2, `12 MiB` L3 | **Pinned permanent reactors** (`1` per hardware thread; zero thread migration). |
-| **`AVX-512` (`F/BW/DQ/VL/VBMI2/VNNI`)** | **Present** (`XCR0 = 0xE7` unlocked at boot) | First-class in Ring 0 (`u32x16`/`u64x8`, `<simd: 8\|16>`, `{k1}` tails, `vmovntdq` scanout); safe without `2.5 KiB` ISR saves via the **`<tile>` checkpoint rule** — the compiler rejects AVX-512 outside `<tile>` and inside `@isr`/`@isr_ok`, and the outermost `<tile>` exit issues `vzeroupper`. |
-| **`MOVDIR64B` & `MOVDIRI`** | **Present** | Backing instructions for `publish(slot_addr, cell64)` (`64B` atomic direct store without sender `RFO`) and `@movdiri`. |
-| **Idle / Cacheline Wait** | **`monitor` (`MWAIT`) Present**; **`waitpkg` (`umwait`/`tpause`) Absent** | `wait(addr, deadline [, expected_old])` lowers to Intel SDM §9.10.4 race-free **Ring-0 `MONITOR` + recheck + `MWAIT`** + `IA32_TSC_DEADLINE` (with `CPUID.01H:ECX[3]` hypervisor fallback to `PAUSE`). |
-| **Paging (`pdpe1gb`, `39b` phys / `48b` virt)** | **Present** (4-level `PML4`; no 5-level `la57`) | Usable DRAM mapped `WB+RW+NX`; `.text`, `<1 MiB` AP bridge, and sealed `@capsule` extents mapped `WB+RX`; ACPI mapped `RO+NX`; GOP mapped `WC+NX`; PCIe `ECAM` / NVMe BAR0 mapped `UC+NX` (`WX=0` verified). |
-| **Protection Keys (`pku`, `ospke`)** | **Present** (`16` keys; `PKRU = 0` initialized on all cores) | Ring-0 compiler seatbelt catching stray stores into frozen spaces. |
-| **`CAT_L2`, `x2APIC`, `TSC-Deadline`, `SSE4.2 CRC32C`** | **All Present** | Register-mode `x2APIC` (`MSR 0x800+`), tickless `IA32_TSC_DEADLINE` (`MSR 0x6E0`), and hardware `crc32` (`@crc32c`) `@capsule` integrity verification. |
-| **Built-In Input & Storage** | Keyboard: `isa0060` (`0x60`/`0x64` `@port`, I/O APIC IRQ1); Storage: PCIe `NVMe` (`01h:08h:02h` via `MCFG`/`ECAM`) | Keyboard is interrupt-driven (I/O APIC IRQ1 -> vector `0x21`, GPR-only `@isr`) with tickless `MONITOR`/`MWAIT` waits; storage uses lock-free `@dma_queue` NVMe submission/completion rings. |
+| **`rdi, rsi, rdx, r10, r8, r9`** | Arguments `0..5` (`arg3 = r10` instead of `rcx`!) | Scalar / pointer args (`u32x16`/`u64x8` passed by 64B-aligned hidden address). |
+| **`rax` (`rax:rdx` / `zmm0`)** | Return value | `64b` scalar in `rax`; `16B` slice `{base, len}` in `rax:rdx`; `512b` vector in `zmm0`. |
+| **`rbx`** | Callee-saved general register | Preserved across calls. |
+| **`r12`** *(Pinned)* | Immutable **Reactor ID** (`0` = BSP, `1..N-1` = AP workers) | Read in `1` `mov` via `@reactor_id()`. Never modified by compiler codegen. |
+| **`r13`** *(Pinned)* | Reactor **Inbox Base** (`worker_inbox` slot pointer) | Read via `@inbox_base()`. |
+| **`r14`** *(Pinned)* | Per-Reactor **Scratch Arena Base** | Read via `@scratch_base()`. |
+| **`r15` + `IA32_GS_BASE`** *(Pinned)* | Per-Reactor **`ReactorLocal` Control Block** (`64 B`) | Read via `@local_base()`; compiler emits per-core fault/tile operations directly against `[gs:disp8]`! |
+
+### 5.2 Exact `ReactorLocal` (`gs:0`) 64-Byte Cacheline Layout
+
+```text
+GS Offset   Field Name          Width   Compiler & Kernel Invariant
+──────────────────────────────────────────────────────────────────────────────────────────
+[gs:0x00]   fault               u64     Active scalar `fail` code (`0` = healthy; `fail 0` -> `1`).
+                                        Checked after every non-leaf call for zero-table stack unwind!
+[gs:0x08]   tile_depth          u64     Nesting depth of active `<tile>` cooperative compute blocks.
+[gs:0x10]   if_before_tile      u64     Saved `RFLAGS.IF` bit captured on outermost (`0 -> 1`) `<tile>` entry.
+[gs:0x18]   inbox_seq           u64     Last processed `TaskCell.seq` on this worker reactor.
+[gs:0x20]   mwait_capable       u64     `1` if `CPUID.01H:ECX[3]` (`MONITOR/MWAIT`) is supported on this CPU.
+[gs:0x28]   movdir64b_capable   u64     `1` if `CPUID.07H:ECX[28]` (`MOVDIR64B`) is supported on this CPU.
+[gs:0x30]   wake_count          u64     Count of cross-core `MWAIT` wakeups serviced by this reactor.
+[gs:0x38]   last_latency_tsc    u64     Measured cross-core `MOVDIR64B -> MWAIT` round-trip `TSC` cycles.
+```
+
+### 5.3 The Zero-XSAVE Ring-0 `AVX-512` Proof (`<tile>` + `@isr`)
+
+Traditional kernels either forbid `AVX-512` in Ring 0 or suffer massive latency saving/restoring `2.5 KiB` of `ZMM0..31` + `k0..7` state (`XSAVE64`/`XRSTOR64`) on interrupts and context switches. `ZeroOS` achieves **full-speed Ring-0 `AVX-512` with zero `XSAVE` instructions** by enforcing two complementary compile-time theorems in `compiler/`:
+
+1. **Theorem A — Cooperative `<tile>` Vector Quantum (`RSP & 63 == 0`):**
+   - On `--target=efi-os` and `--target=capsule`, **every** `u32x16`/`u64x8` type, `@vec_*` intrinsic, or `<simd: 8|16>` loop **must execute lexically inside `tile { ... }` (`for ... <tile>`)** — violating this is a compile error (verified by negative probes).
+   - Every function frame pads `sub rsp, frame_bytes` so **`RSP & 63 == 0`** holds inductively across calls (`8B return_rip + 8B push_rbp + 48B/112B/... locals == 64 * k`), guaranteeing aligned 64-byte `vmovdqa64`/`vmovdqu64` vector temporaries without dynamic `and rsp, -64`.
+   - Exiting the outermost `<tile>` (`[gs:8]` transitions `1 -> 0` via normal exit, `return`, `break`, `continue`, or `recover`) automatically emits **`vzeroupper` (`C5 F8 77`)**, releasing upper vector state cleanly.
+2. **Theorem B — Statically Verified GPR-Only Interrupt Service Routines (`@isr` / `@isr_ok`):**
+   - Any function marked `@isr` emits hardware interrupt prolog/epilog (`push` of all volatile GPRs, `cld`, body, `pop` of all volatile GPRs, `iretq`) and may only call `@isr_ok` leaf helpers.
+   - `compiler/` **rejects at compile time** any `ZMM`/`XMM`/FPU instruction, `<simd>`, `<tile>`, or non-`@isr_ok` call inside `@isr` or `@isr_ok`.
+   - **Consequence:** An asynchronous hardware interrupt (such as `IRQ1` vector `0x21`) arriving mid-`<tile>` while `ZMM0..7` and `k1` hold live 512-bit data **cannot touch `ZMM0..31` or `k0..7`**, completing its entire ISR in `<40` GPR instructions and returning via `iretq` with `ZMM` registers 100% intact and **zero `XSAVE` overhead**!
 
 ---
 
-## 2. Boot, Multi-Core Takeover, Reactor Fabric & Command Deck (Gates 1a, 1b, 2, 3 + Interactive Deck Verified)
+## 6. Cross-Core `MOVDIR64B` + Race-Free `MONITOR`/`MWAIT` Reactor Fabric
 
-1. **Gate 1a — Hardened Single-Core BSP Boot (Implemented & Verified):**
-   - `PE32+` Entry (`efi_main` on BSP Core 0) queries **GOP** (`BGRX8888`, `RGBX8888`, or `PixelBitMask`; returns cleanly to firmware if GOP is absent), walks **ACPI `RSDP -> XSDT/RSDT`** *before* `ExitBootServices` to harvest physical **`MADT`** and **`MCFG`** addresses, calibrates `tsc_per_ms`, allocates `< 0xA0000` AP startup pages + `256 KiB` AP stacks, harvests `MemoryMap`, and calls **`ExitBootServices()`**.
-   - Post-exit modular `ZeroOS` (`examples/gate1_os.zr` + `examples/os/*.zr`) installs per-core `GDT` + `<packed>` `Tss64`, unlocks `XCR0 = 0xE7` + `PKRU = 0`, programs `IA32_PAT` (`WC`) and `IA32_EFER.NXE`, builds strict hardware **`W^X` 4-level `CR3` page tables** (`verify_no_wx_pages() == 0` -> `WX=0`), and installs a 256-entry scalar `IDT`.
-2. **Gate 1b — `MADT` + `x2APIC` `INIT-SIPI` Multi-Core Bring-Up (Implemented & Verified):**
-   - Because EDK2's `MpInitChangeApLoopCallback` broadcasts `INIT` during `ExitBootServices()`, `bootstrap/ap_trampoline.inc` provides an isolated `< 1 MiB` `PTE_RX` startup bridge (`>4 GiB` `CR3` safe) while keeping `Zero` 100% 64-bit.
-   - `smp_madt.zr` parses `MADT` (`Type 0` & `Type 9`), wakes every AP via `x2APIC` `INIT-SIPI` into 64-bit `.zr` `fn ap_main(slot)` with dedicated `16 KiB` stacks, per-core `GDT`/`TSS`/`XCR0`/`PKRU`/`x2APIC`, and verifies online synchronization (`C=4` / `C=8`, plus `C=1` fallback).
-3. **Gate 2 — Pinned `r12..r15` + `gs:0` Reactor Fabric, `MOVDIR64B`, `MWAIT`, `<tile>`, & `@isr` (Implemented & Verified):**
-   - `--target=efi-os` and `--target=capsule` use `rdi, rsi, rdx, r10, r8, r9`, pin `r12` (`@reactor_id`), `r13` (`@inbox_base`), `r14` (`@scratch_base`), and `r15` / `gs:0` (`ReactorLocal`), maintain 64-byte `RSP` alignment at `<tile>` checkpoints, unwind `[gs:8]`/`[gs:16]` across `return`/`break`/`continue`/`recover`, statically enforce GPR-only `@isr` (`iretq`, 0 XSAVE) & leaf `@isr_ok`, and measure live cross-core `MOVDIR64B` -> `MWAIT` -> `<tile>` -> `MOVDIR64B` round-trip latency (`CYC:~1428` cycles on 4-core KVM `cpu-pm=on`).
-4. **Gate 3 — PCIe `MCFG`/`ECAM` + Lock-Free NVMe `@dma_queue` + Self-Hosted `@capsule` Engine (Implemented & Verified):**
-   - `nvme_capsule.zr` parses ACPI `MCFG`, maps PCIe `ECAM` & NVMe `BAR0` dynamically as `PTE_UC_NX` (`WX=0`), binds 4-KiB aligned `@dma_queue` Admin (`ASQ`/`ACQ`) and I/O (`SQ1`/`CQ1`) rings, queries `Identify Namespace 1` (`LBADS`), DMAs the Master Extent Table (`ZEXTENT1` at LBA 0) and `--target=capsule` `.zcap` image (compiled by self-hosted `build/zero2`!) straight into `@capsule boot_capsule`, verifies hardware SSE4.2 `@crc32c` against both superblock and capsule headers (`@halt()` on tamper), flips capsule PTEs from `PTE_RW_NX` to `PTE_RX` (`seal_capsule_wx_rx`, re-verifying `WX=0`), catches `fail 88` via `gs:0` `recover`, and executes `@call(entry_fn, 40, 2)` returning **`CAP=777`** on the live GOP HUD!
+Worker reactors (`r12 = 1..N-1`) never poll shared spinlocks. Instead, `examples/os/reactor_fabric.zr` connects cores via 64-byte cacheline-atomic `@cell64` rings:
 
-5. **Interactive Command Deck — I/O APIC IRQ1, Tickless Wait, Multi-Capsule Worker Fabric (Implemented & Verified):**
-   - `ioapic_kbd.zr` masks the legacy 8259 PICs, parses `MADT` Type 1 (I/O APIC) and Type 2 (ISO remap of ISA IRQ 1), maps the I/O APIC `UC+NX`, routes IRQ 1 to vector `0x21` on the BSP, and installs a compiler-verified GPR-only `@isr fn kbd_irq1_isr()` that pushes make/break bytes into a 64-byte-aligned `kbd_ring` and bumps the `kbd_state` write sequence.
-   - `wait_next_scancode` sleeps with **no periodic tick**: race-free `wait(kbd_state.base, deadline, seq)` (`MONITOR` + recheck + `MWAIT`) when `ReactorLocal.mwait_capable`, otherwise an atomic `sti; hlt`; a short `IA32_TSC_DEADLINE` window is only used until the first IRQ 1 proves the route (with an i8042 poll fallback).
-   - `nvme_capsule.zr` loads up to four `ZEXTENT1` extents into 64 KiB slots of the 256 KiB `@capsule boot_capsule`, verifies each with hardware `@crc32c`, seals loaded slots `PTE_RX` / unused slots `PTE_RO_NX` (`WX=0` re-verified), and records entry points in `cap_dir_entries`.
-   - `reactor_fabric.zr` keeps worker reactors parked in `MWAIT` after boot; keys `1`/`2`/`3` fan out `CMD_EXEC_CAPSULE` `TaskCell`s via `MOVDIR64B`, each worker runs `@call(entry, 40, 2)` inside `tile { }`, and publishes a `ResultCell` back. Verified sums on 4 cores: `CAP1=2337`, `CAP2=1207754` (AVX-512 wave), `CAP3=35277270` (CRC32C/PEXT/PDEP matrix) — matching an independent Python reference model of each capsule; single-core runs execute on the BSP (`777 / 381953 / 978462`).
-   - `hud_render.zr` paints the GOP with 512-bit `u32x16` + `vmovntdq` (16 pixels per store, `{k1}` row tails) and draws the Obsidian Command Deck (reactor count, IRQ1/MWAIT status + live IRQ count, AVX-512 vs scalar cycles, sealed extents, last dispatch sum / `rdtsc` cycles, key legend).
-6. **Physical Laptop Media (`make usb-img`):** `scripts/build_usb_image.py` compiles `gate1_os.zr` with `qemu_debug :: 0` via `build/zero2` (zero port-`0xE9` I/O) and writes a 64 MiB protective-MBR + GPT + FAT32 ESP image with `/EFI/BOOT/BOOTX64.EFI`, verified by booting it from an emulated xHCI USB stick under OVMF.
+```text
+BSP (Reactor 0)                                     Worker Reactor k (1..N-1)
+───────────────                                     ─────────────────────────
+1. Build 64B `TaskCell` (`seq`, `cmd`, `seed0/1`)   Sleeping in C1/C1E power state after:
+2. `publish(worker_inbox.slot_addr(k), task)`         `monitor(rax = slot_addr, ecx=0, edx=0)`
+      │                                               recheck `[slot_addr] == old_seq`
+      ▼                                               `mwait(eax=0, ecx=0)`
+   `MOVDIR64B` writes all 64 bytes atomically   ───► Hardware monitor armed on slot cacheline
+   directly to coherent memory (no sender RFO)        wakes Worker k in ~1,400–1,700 TSC cycles!
+                                                    3. Executes `@call(capsule_entry, 40, 2)`
+                                                       inside `tile { ... }` (`ZMM` unlocked)
+4. Collects `ResultCell` from `bsp_completions` ◄─── 4. `publish(bsp_completions.slot_addr(k), res)`
+```
 
----
-
-## 3. Storage & Immutable `@capsule` Container (`--target=capsule`)
-
-`ZeroOS` replaces hierarchical VFS dentries, `FAT` chains, and `ext4` journals with two flat hardware structures:
-1. **Master Extent Table (`MasterExtentSuper` `'ZEXTENT1'` + 32-Byte `MasterExtentEntry` Array at LBA 0):**
-   - Maps `id_hash -> (start_byte, byte_len, crc32c, flags)` in `O(1)` without path traversal; `ZeroOS` loads up to 4 extents (the test disk carries 3: compute, AVX-512 wave, matrix-CRC).
-2. **Position-Independent `.zcap` `@capsule` (`ZeroCapsuleHeader` `'ZEROZCAP'`):**
-   - 64-byte header (`magic`, `version=1`, `entry_off=64`, `code_bytes`, hardware SSE4.2 `crc32c`) followed by pure `RX` Reactor-ABI machine code (`r10` arg3, `r12` `@reactor_id()`, `gs:0` scalar fault word, `<tile>` `gs:8`/`gs:16` checkpoints, inline RIP-relative literals, zero mutable `.bss`).
-   - Emitted by the self-hosted `build/zero2 --target=capsule`; capsules may use AVX-512 only inside `tile { }`.
+- **Intel SDM §9.10.4 Race-Free `wait(addr, deadline_tsc, expected_old)` Lowering:**
+  `compiler/loops_match.zr` lowers `wait` to:
+  1. Program `IA32_TSC_DEADLINE` (`MSR 0x6E0`) if `deadline_tsc != 0`.
+  2. Execute `monitor` (`0F 01 C8`) on `addr` (`rax`) **first** to arm the core's address-range hardware monitor.
+  3. **Re-read `[addr]` and compare against `expected_old` *after* `monitor` is armed** — if a `MOVDIR64B` store arrived just before `monitor`, the recheck catches it immediately and skips `mwait` (preventing lost-wakeup hangs!).
+  4. Execute `mwait` (`0F 01 C9`).
 
 ---
 
-## 4. Bring-Up Progression Summary
+## 7. Tickless `I/O APIC` `IRQ1` Keyboard & `@isr` Verification
 
-- **Gate 1a & 1b (Completed & Verified):** Standalone `PE32+` image, GOP scanout, pre-exit ACPI `MADT`/`MCFG`, strict hardware `W^X` `CR3` (`WX=0`), `<1 MiB` `PTE_RX` AP trampoline, `x2APIC` multi-core bring-up, and `@port` keyboard input.
-- **Gate 2 (Completed & Verified):** Pinned `r12..r15` + `gs:0` Reactor ABI, `@cell64`, `@ring`, `publish` (`movdir64b`), race-free `wait` (`monitor`/`mwait`), `<tile>` quanta with full unwind safety, and zero-XSAVE `@isr`/`@isr_ok`.
-- **Gate 3 & Self-Hosting (Completed & Verified):** PCIe `MCFG`/`ECAM` + NVMe `@dma_queue` driver executing CRC32C-verified, W^X-sealed `.zcap` capsules; the whole OS and all capsules are compiled by the self-hosted `build/zero2` (`zero2 == zero3`, no NASM outside the `zero0` seed).
-- **Ring-0 AVX-512 (Completed & Verified):** `u32x16`/`u64x8`, `<simd: 8|16>` with `{k1}` tails, `vmovntdq` GOP scanout, and a live `<tile | simd: 8>` vs scalar benchmark (`VEC` ≈ 2x faster on 4-core KVM).
-- **Interactive Command Deck & USB Media (Completed & Verified):** I/O APIC IRQ1 + tickless `MWAIT` key loop, three-extent NVMe capsule fabric dispatched across worker reactors, GOP Command Deck, clean `Q` shutdown, and a bootable GPT + FAT32 USB image.
-- **Gate 4 (Future — `Iris Xe` `CCS0` Compute Submit):** Minimal `FORCEWAKE` + `PPGTT` + `CCS0` `COMPUTE_WALKER` writing directly into the GOP scanout buffer. Not implemented.
+`examples/os/ioapic_kbd.zr` drives the interactive Obsidian Command Deck with **zero periodic timer interrupts**:
+
+1. **Legacy 8259 PIC Masking:** Writes `0xFF` to `@port pic1_data` (`0x21`) and `@port pic2_data` (`0xA1`).
+2. **ACPI `MADT` `I/O APIC` & `ISO` Discovery:** Walks `MADT` Entry Type `1` (`I/O APIC` physical base, default `0xFEC0_0000`) and Entry Type `2` (Interrupt Source Override remapping ISA `IRQ 1` $\rightarrow$ Global System Interrupt `kbd_gsi`, honoring polarity/trigger flags).
+3. **`UC+NX` Redirection Programming:** Maps `ioapic_phys` as `PTE_UC_NX` and programs the 64-bit redirection entry for `kbd_gsi` to fixed vector `0x21` targeting the BSP APIC ID.
+4. **GPR-Only `@isr fn kbd_irq1_isr()`:** Reads `@port kbd_status` (`0x64`) & `@port kbd_data` (`0x60`), writes the scancode into `kbd_ring[w & 63]`, increments the 64-byte-aligned `kbd_state[0]` (`write_seq`, waking the BSP's `MWAIT` monitor!), increments `kbd_state[5]` (`irq1_count`), and acknowledges Local `x2APIC` `EOI` (`MSR 0x80B = 0`).
+
+---
+
+## 8. PCIe `MCFG` + Lock-Free NVMe `@dma_queue` + `.zcap` Capsule Engine
+
+`examples/os/nvme_capsule.zr` brings up bare-metal NVMe DMA and hardware-verified code capsules in ~350 lines of pure `.zr`:
+
+1. **PCIe `MCFG`/`ECAM` Enumeration:** Reads `AcpiMcfgEntry` from `handoff.mcfg`, maps bus ECAM space `PTE_UC_NX`, locates PCI Class `01h` / Subclass `08h` / ProgIF `02h` (`NVMe`), enables `Command.MSE | Command.BME`, reads 64-bit `BAR0`, and maps `BAR0` `PTE_UC_NX`.
+2. **Controller Reset & `@dma_queue` Binding:**
+   - Clears `CC.EN`, awaits `CSTS.RDY == 0`, binds 4 KiB page-aligned `@dma_queue nvme_admin_sq` (`16 x 64B NvmeCmd`) and `nvme_admin_cq` (`16 x 16B NvmeCqe`) to `AQA`/`ASQ`/`ACQ`, sets `CC = 0x0046_0001` (`IOSQES=6, IOCQES=4, EN=1`), and awaits `CSTS.RDY == 1`.
+   - Issues `Identify Namespace 1` (`CNS=0`) to discover exact logical block shift `LBADS` (`512 B` or `4096 B`), then creates I/O Completion Queue `1` (`Opcode 0x05`) and I/O Submission Queue `1` (`Opcode 0x01`) backed by `nvme_io_cq1` / `nvme_io_sq1`.
+3. **Master Extent Table (`ZEXTENT1`) & `.zcap` (`ZEROZCAP`) Verification + `W^X` Sealing:**
+
+```text
+LBA 0: MasterExtentSuper (24 B) + MasterExtentEntry[0..3] (32 B each)
+┌──────────────────────┬───────────┬──────────────┬────────────┐
+│ magic = "ZEXTENT1"   │ version=1 │ extent_count │ generation │  + hardware @crc32c
+└──────────────────────┴───────────┴──────────────┴────────────┘
+         │
+         ▼  NVMe Read (Opcode 0x02) straight into 64 KiB slot k of `boot_capsule` (PTE_RW_NX)
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│ ZeroCapsuleHeader (64 B): magic="ZEROZCAP" | ver=1 | entry_off=64 | code_bytes | crc  │
+├───────────────────────────────────────────────────────────────────────────────────────┤
+│ Pure Position-Independent Reactor-ABI x86-64 Code (+64 .. +64+code_bytes)             │
+│ • Zero mutable .bss (rejected by --target=capsule)                                    │
+│ • Uses r10 (arg3), r12 (@reactor_id), gs:0 faults, and <tile> AVX-512                 │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼  1. Verify outer extent @crc32c AND inner ZeroCapsuleHeader @crc32c (@halt on mismatch)
+            2. seal_capsule_wx_rx(slot_base, 65536) -> flips 16 x 4K PTEs to PTE_RX + @invlpg
+            3. verify_no_wx_pages() == 0 -> Ready for worker @call(entry_fn, 40, 2)!
+```
+
+---
+
+## 9. Next-Stage Kernel Extensions (`ZeroFS` `ZLEDGER1` & `Iris Xe` `CCS0`)
+
+1. **Stage 2 — `ZeroFS` (`ZLEDGER1`) Persistent CoW Ledger (Specified in `ZERO_NEXT_GEN_SPEC.md`, Not Yet Lowered):**
+   - Preserves LBA `0` (`Bucket 0`, `0..2 MiB`) for `ZEXTENT1` immutable early-boot capsules (`CAP1..CAP3`) while formatting `Bucket 1..M` (`>= 2 MiB`) as the Bcachefs-inspired **`ZLEDGER1`** generational-bucket CoW store with Eytzinger `@crc32c` B-trees, lockless per-reactor NVMe `@dma_queue` sharding, and opt-in seekable `128-bit XMM` `AES-NI`/`SHA-NI` 64B block encryption — protected by the mandatory `ZLEDGER1` magic write guard.
+2. **Gate 4 — `Iris Xe` (`8086:9a49`) Direct `CCS0` Compute Engine (Future Target):**
+   - `FORCEWAKE_RENDER` / `FORCEWAKE_GT`, 48-bit `PPGTT` binding, and `CCS0` `COMPUTE_WALKER` ring submission writing directly into shared DRAM / GOP scanout apertures without userland Mesa/OpenCL layers.

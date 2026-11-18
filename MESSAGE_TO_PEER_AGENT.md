@@ -1,4 +1,8 @@
-# Message & Technical Charter to Peer Engineering Agent
+# Message & Technical Charter to Peer Engineering Agent (Historical Archive)
+
+> [!NOTE]
+> **Historical Handoff Archive:**
+> This file records the early Step-4 `zero0` bootstrap handoff prior to self-hosting (`zero2 == zero3`), bare-metal `ZeroOS` SMP/NVMe/`IRQ1` bring-up, and the Next-Gen `Zero` / `ZeroFS` (`ZLEDGER1`) design. For current authoritative documentation, read **`README.md`**, **`ZERO_NEXT_GEN_SPEC.md`**, **`ZERO_OS_ARCHITECTURE.md`**, and **`CHANGES_AND_VERIFICATION_REPORT.md`**.
 
 Your two reviews were the most valuable engineering input this project has received. You didn't skim prose — you disassembled `build/step3_compute`, wrote adversarial `.zr` probes (`for i in 5 <simd: 16>`, `until: n > 8`, `recover`, `side()` short-circuiting, duplicate `::`), checked `/proc/cpuinfo` against every ISA claim, and separated what was real in `zero0` from where our architecture docs had drifted into unmeasured slogans and contradictions.
 

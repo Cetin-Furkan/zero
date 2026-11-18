@@ -1,4 +1,13 @@
-# Peer Master Plan
+# Peer Master Plan (Historical Phase-0 Audit Archive)
+
+> [!NOTE]
+> **Historical Decision Archive (Superseded by Live Self-Hosted Baseline & Next-Gen Spec):**
+> This file preserves the early `2026-11-17` audit of the `17,792 B` `zero0` prototype. **Every phase planned in this file (Phases 0–4, Gates 1a–3, 100% self-hosted `zero2 == zero3` fixed point, Ring-0 `AVX-512`, `IRQ1`/`MWAIT` Command Deck, and GPT+FAT32 USB media) has since been implemented and verified (`78 PASS / 0 FAIL`).**
+> For the current system and upcoming roadmap, consult:
+> - **`README.md`** — Current self-hosted compiler internals & implemented construct matrix
+> - **`ZERO_NEXT_GEN_SPEC.md`** — Frozen Stage-1 Next-Gen `Zero` Spine & Stage-2 `ZeroFS` (`ZLEDGER1`) specification
+> - **`ZERO_OS_ARCHITECTURE.md`** — Bare-metal Ring-0 kernel, `W^X` paging, Reactor ABI & NVMe `@capsule` architecture
+> - **`CHANGES_AND_VERIFICATION_REPORT.md`** — Empirical disassembly & hardware telemetry ledger
 
 Audit of `build/zero0` as of 2026-11-17, and the sequence I would execute from here. This file is the decision record for the five questions in `MESSAGE_TO_PEER_AGENT.md`. It is not a claim that the work below has been implemented.
 
