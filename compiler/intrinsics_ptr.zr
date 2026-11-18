@@ -10,7 +10,7 @@
 // --- Composite Type Classification & Width/Alignment Queries ---
 
 fn is_struct_value_ty(ty: i64) i64 {
-    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 {
         return 0
     }
     base := ty & TY_BASE_MASK
@@ -21,7 +21,7 @@ fn is_struct_value_ty(ty: i64) i64 {
 }
 
 fn is_custom_ptr_ty(ty: i64) i64 {
-    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 {
         return 0
     }
     base := ty & TY_BASE_MASK
@@ -29,6 +29,664 @@ fn is_custom_ptr_ty(ty: i64) i64 {
         return 1
     }
     return 0
+}
+
+// --- Stage-1 `ptr* @oneshot T` Register Allocator, `ref& T` Lvalue Resolver, & `mask<...>` Engine ---
+
+fn check_no_live_oneshot_for_call(line: i64) {
+    if g[G_ONESHOT_LIVE_MASK] != 0 {
+        die_line("error: @oneshot pointer cannot remain live across a function call or syscall", line)
+    }
+}
+
+fn check_no_live_oneshot_exit(line: i64) {
+    if g[G_ONESHOT_LIVE_MASK] != 0 {
+        die_line("error: unconsumed @oneshot pointer on control-flow exit", line)
+    }
+}
+
+fn check_oneshots_consumed_from(start_loc: i64, line: i64) {
+    cnt := g[G_LOC_CNT]
+    for li in start_loc..cnt {
+        if loc_oneshot_state[li] == 1 {
+            die_line("error: unconsumed @oneshot pointer at scope exit", line)
+        }
+    }
+}
+
+fn alloc_oneshot_reg_slot(line: i64) i64 {
+    m := g[G_ONESHOT_LIVE_MASK]
+    for s in 0..4 {
+        if ((m >> s) & 1) == 0 {
+            g[G_ONESHOT_LIVE_MASK] = m | (1 << s)
+            return s
+        }
+    }
+    die_line("error: maximum 4 simultaneous live @oneshot register capabilities exceeded", line)
+    return 0
+}
+
+fn alloc_oneshot_local(sym: i64, ty: i64, line: i64) i64 {
+    cur_depth := g[G_SCOPE_DEPTH]
+    i := g[G_LOC_CNT] - 1
+    loop <max: 4096 | until: i < 0> {
+        if loc_depth[i] < cur_depth { break }
+        if loc_sym[i] == sym {
+            die_line("error: duplicate variable in same block", line)
+        }
+        i -= 1
+    }
+    rslot := alloc_oneshot_reg_slot(line)
+    idx   := g[G_LOC_CNT]
+    loc_sym[idx]           = sym
+    loc_ty[idx]            = ty
+    loc_disp[idx]          = 0 // NEVER allocated a [rbp - disp] stack slot!
+    loc_depth[idx]         = cur_depth
+    loc_oneshot_state[idx] = 1 // LIVE
+    loc_oneshot_reg[idx]   = rslot
+    g[G_LOC_CNT]           = idx + 1
+    return idx
+}
+
+fn consume_oneshot_local(li: i64, line: i64) i64 {
+    st: i64 = loc_oneshot_state[li]
+    if st != 1 {
+        die_line("error: @oneshot pointer already consumed", line)
+    }
+    rslot: i64 = loc_oneshot_reg[li]
+    loc_oneshot_state[li]  = 2 // CONSUMED
+    g[G_ONESHOT_LIVE_MASK] = g[G_ONESHOT_LIVE_MASK] & (~(1 << rslot))
+    return rslot
+}
+
+// Parses an addressable mutable lvalue for `ref& want_ty` -> leaves target 64-bit address in `rax`
+fn parse_ref_lval_addr(want_ty: i64, err_line: i64) {
+    if peek_kind() != TOK_IDENT {
+        die_line("error: ref& requires an addressable mutable variable or lvalue", err_line)
+    }
+    sym := expect_ident()
+    cur_ty: i64 = 0
+
+    li := find_local(sym)
+    if li >= 0 {
+        lty: i64   = loc_ty[li]
+        ldisp: i64 = loc_disp[li]
+        if (lty & TY_FLAG_ONESHOT) != 0 {
+            die_line("error: cannot take ref& of register-only @oneshot pointer", err_line)
+        }
+        if (lty & TY_FLAG_SPAN) != 0 {
+            if peek_kind() != TOK_LBRACK {
+                die_line("error: invalid span target for ref&", err_line)
+            }
+            g[G_TOK_IDX] += 1
+            parse_expr(1)
+            expect_kind(TOK_RBRACK)
+            emit_span_bounds_check_rax(ldisp)
+            ety := lty & TY_BASE_MASK
+            emit_scale_rax(ty_byte_size(ety))
+            emit_load_local_rcx(ldisp)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+            cur_ty = ety
+        } else {
+            if (lty & TY_FLAG_REF) != 0 {
+                emit_load_local(ldisp) // forward caller's slot pointer directly!
+                cur_ty = lty & (~TY_FLAG_REF)
+            } else {
+                if (lty & TY_FLAG_PTR) != 0 && peek_kind() == TOK_LBRACK {
+                    g[G_TOK_IDX] += 1
+                    parse_expr(1)
+                    expect_kind(TOK_RBRACK)
+                    ety_p := lty & TY_BASE_MASK
+                    emit_scale_rax(ty_byte_size(ety_p))
+                    emit_load_local_rcx(ldisp)
+                    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                    cur_ty = ety_p
+                } else {
+                    emit_lea_local(ldisp)
+                    cur_ty = lty
+                }
+            }
+        }
+    } else {
+        si := find_space(sym)
+        if si < 0 || sp_kind[si] == SKIND_PORT || peek_kind() != TOK_LBRACK {
+            die_line("error: ref& requires an addressable mutable variable or lvalue", err_line)
+        }
+        g[G_TOK_IDX] += 1
+        parse_expr(1)
+        expect_kind(TOK_RBRACK)
+        sk: i64 = sp_kind[si]
+        if sk == SKIND_RING || sk == SKIND_DMA_QUEUE {
+            emit_mov_rcx_imm64(sp_cap[si] - 1)
+            emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8)
+        } else {
+            emit_bounds_check_rax(sp_cap[si])
+        }
+        emit_scale_rax(sp_elem_sz[si])
+        emit_load_space_base_rcx(si)
+        emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+        cur_ty = sp_elem_ty[si]
+    }
+
+    // Optional `.field` / `.arr[idx]` chain on struct lvalue
+    loop <max: 32 | until: peek_kind() != TOK_DOT> {
+        cbase := cur_ty & TY_BASE_MASK
+        if (cur_ty & (TY_FLAG_PTR | TY_FLAG_VIEW1 | TY_FLAG_SPAN | TY_FLAG_ATOMIC)) != 0 || cbase < TY_STRUCT_BASE || cbase >= TY_PTR_BASE {
+            die_line("error: invalid field chain in ref& argument", err_line)
+        }
+        g[G_TOK_IDX] += 1
+        fsym := expect_ident()
+        fi   := find_struct_field(cbase - TY_STRUCT_BASE, fsym)
+        if fi < 0 {
+            die_line("error: unknown struct field in ref& argument", err_line)
+        }
+        foff: i64 = fld_off[fi]
+        fty: i64  = fld_ty[fi]
+        acnt: i64 = fld_arr_cnt[fi]
+        if foff != 0 {
+            emit_add_rax_imm(foff)
+        }
+        if acnt > 0 {
+            if peek_kind() != TOK_LBRACK {
+                die_line("error: struct array field in ref& requires [index]", err_line)
+            }
+            arr_b := alloc_temp_qword()
+            emit_store_local(arr_b)
+            g[G_TOK_IDX] += 1
+            parse_expr(1)
+            expect_kind(TOK_RBRACK)
+            emit_bounds_check_rax(acnt)
+            emit_scale_rax(ty_byte_size(fty))
+            emit_load_local_rcx(arr_b)
+            free_temp_qwords(1)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+        }
+        cur_ty = fty
+    }
+
+    if cur_ty != want_ty {
+        die_line("error: type mismatch in ref& binding", err_line)
+    }
+    if binop_prec(g[G_TOK_IDX]) > 0 || peek_kind() == TOK_LPAREN {
+        die_line("error: ref& requires an addressable lvalue, not a computed rvalue expression", err_line)
+    }
+}
+
+// Scans `mask< c0 | c1 [ | c2 ] >` starting with `lt_idx` at `<`:
+//   `mask_scan_out[0]` = part count (`2` or `3`)
+//   `mask_scan_out[1]` = `c0_start` (`lt_idx + 1`)
+//   `mask_scan_out[2]` = `pipe1_idx`
+//   `mask_scan_out[3]` = `c1_end` (`>` for 2-part, second `|` for 3-part)
+//   `mask_scan_out[4]` = `gt_idx` (`>`)
+fn scan_mask_clauses(lt_idx: i64, err_line: i64) {
+    pdepth := 0
+    bdepth := 0
+    mdepth := 0
+    pipe1  := -1
+    pipe2  := -1
+    gt_i   := -1
+    idx    := lt_idx + 1
+
+    loop <max: 65536 | until: 0 == 1> {
+        k := tok_kind[idx]
+        if k == TOK_EOF {
+            die_line("error: unclosed 'mask<...>' expression", err_line)
+        }
+        if k == TOK_LPAREN { pdepth += 1  idx += 1  continue }
+        if k == TOK_RPAREN {
+            if pdepth > 0 { pdepth -= 1 }
+            idx += 1
+            continue
+        }
+        if k == TOK_LBRACK { bdepth += 1  idx += 1  continue }
+        if k == TOK_RBRACK {
+            if bdepth > 0 { bdepth -= 1 }
+            idx += 1
+            continue
+        }
+        if k == TOK_IDENT && tok_val[idx] == g[G_SYM_MASK] && tok_kind[idx + 1] == TOK_LT {
+            mdepth += 1
+            idx += 2
+            continue
+        }
+        if pdepth == 0 && bdepth == 0 {
+            if k == TOK_GT {
+                if mdepth > 0 {
+                    mdepth -= 1
+                    idx += 1
+                    continue
+                }
+                gt_i = idx
+                break
+            }
+            if mdepth == 0 && k == TOK_PIPE {
+                if pipe1 < 0 {
+                    pipe1 = idx
+                } else {
+                    if pipe2 < 0 {
+                        pipe2 = idx
+                    } else {
+                        die_line("error: too many '|' clauses in 'mask<...>'", err_line)
+                    }
+                }
+            }
+        }
+        idx += 1
+    }
+
+    if pipe1 < 0 || pipe1 <= lt_idx + 1 {
+        die_line("error: 'mask<...>' requires 'mask<target | mask_const>'", err_line)
+    }
+    if pipe2 < 0 {
+        if gt_i <= pipe1 + 1 {
+            die_line("error: empty mask constant in 'mask<...>'", err_line)
+        }
+        mask_scan_out[0] = 2
+        mask_scan_out[1] = lt_idx + 1
+        mask_scan_out[2] = pipe1
+        mask_scan_out[3] = gt_i
+        mask_scan_out[4] = gt_i
+    } else {
+        if pipe2 <= pipe1 + 1 || gt_i <= pipe2 + 1 {
+            die_line("error: malformed 3-part 'mask<target | M | until !ZF ; max N>'", err_line)
+        }
+        mask_scan_out[0] = 3
+        mask_scan_out[1] = lt_idx + 1
+        mask_scan_out[2] = pipe1
+        mask_scan_out[3] = pipe2
+        mask_scan_out[4] = gt_i
+    }
+}
+
+// Evaluates `[c0_start .. c0_end)` as a dereferenced memory/pointer/space target -> address in `r8`,
+// returning its scalar element type. Rejects plain register/stack scalar locals or rvalues!
+fn eval_mask_spin_target_addr_r8(c0_start: i64, c0_end: i64, err_line: i64) i64 {
+    saved_end := tok_kind[c0_end]
+    tok_kind[c0_end] = TOK_EOF
+    g[G_TOK_IDX]     = c0_start
+
+    elem_ty: i64 = 0
+    is_mem       := 0
+
+    if peek_kind() == TOK_AT {
+        // Inline `@mmio<T>(addr)[idx]` or `@view<T>(addr)[idx]`
+        parse_at_expr()
+        vty := g[G_LAST_EXPR_TY]
+        if (vty & TY_FLAG_VIEW1) == 0 {
+            die_line("error: 3-part spin mask<...> requires a dereferenced memory/MMIO/pointer target", err_line)
+        }
+        if (vty & TY_FLAG_MMIO) == 0 {
+            emit_null_check_rax()
+        }
+        elem_ty = vty & TY_BASE_MASK
+        is_mem  = 1
+        if peek_kind() == TOK_LBRACK {
+            base_s := alloc_temp_qword()
+            emit_store_local(base_s)
+            g[G_TOK_IDX] += 1
+            parse_expr(1)
+            expect_kind(TOK_RBRACK)
+            emit_scale_rax(ty_byte_size(elem_ty))
+            emit_load_local_rcx(base_s)
+            free_temp_qwords(1)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+        }
+    } else {
+        if peek_kind() != TOK_IDENT {
+            die_line("error: 3-part spin mask<...> requires a dereferenced memory/pointer/space target", err_line)
+        }
+        sym := expect_ident()
+        li  := find_local(sym)
+        if li >= 0 {
+            lty: i64   = loc_ty[li]
+            ldisp: i64 = loc_disp[li]
+            if (lty & TY_FLAG_ONESHOT) != 0 {
+                die_line("error: cannot spin-poll a single-use @oneshot pointer", err_line)
+            }
+            if (lty & TY_FLAG_PTR) != 0 {
+                if peek_kind() != TOK_LBRACK {
+                    die_line("error: 3-part spin mask<...> on ptr* requires [index] dereference", err_line)
+                }
+                g[G_TOK_IDX] += 1
+                if peek_kind() == TOK_INT && peek_val() == 0 && tok_kind[g[G_TOK_IDX] + 1] == TOK_RBRACK {
+                    g[G_TOK_IDX] += 2
+                    emit_load_local(ldisp)
+                } else {
+                    parse_expr(1)
+                    expect_kind(TOK_RBRACK)
+                    emit_scale_rax(ty_byte_size(lty & TY_BASE_MASK))
+                    emit_load_local_rcx(ldisp)
+                    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                }
+                elem_ty = lty & TY_BASE_MASK
+                is_mem  = 1
+            } else {
+                if (lty & TY_FLAG_VIEW1) != 0 {
+                    emit_load_local(ldisp)
+                    if (lty & TY_FLAG_MMIO) == 0 {
+                        emit_null_check_rax()
+                    }
+                    elem_ty = lty & TY_BASE_MASK
+                    is_mem  = 1
+                    if peek_kind() == TOK_LBRACK {
+                        vb := alloc_temp_qword()
+                        emit_store_local(vb)
+                        g[G_TOK_IDX] += 1
+                        parse_expr(1)
+                        expect_kind(TOK_RBRACK)
+                        emit_scale_rax(ty_byte_size(elem_ty))
+                        emit_load_local_rcx(vb)
+                        free_temp_qwords(1)
+                        emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                    }
+                } else {
+                    if (lty & TY_FLAG_SPAN) != 0 && peek_kind() == TOK_LBRACK {
+                        g[G_TOK_IDX] += 1
+                        parse_expr(1)
+                        expect_kind(TOK_RBRACK)
+                        emit_span_bounds_check_rax(ldisp)
+                        elem_ty = lty & TY_BASE_MASK
+                        emit_scale_rax(ty_byte_size(elem_ty))
+                        emit_load_local_rcx(ldisp)
+                        emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                        is_mem = 1
+                    } else {
+                        if (lty & TY_FLAG_REF) != 0 {
+                            emit_load_local(ldisp)
+                            elem_ty = lty & (~TY_FLAG_REF)
+                            is_mem  = 1
+                        }
+                    }
+                }
+            }
+        } else {
+            si := find_space(sym)
+            if si >= 0 && sp_kind[si] != SKIND_PORT && peek_kind() == TOK_LBRACK {
+                g[G_TOK_IDX] += 1
+                parse_expr(1)
+                expect_kind(TOK_RBRACK)
+                sk: i64 = sp_kind[si]
+                if sk == SKIND_RING || sk == SKIND_DMA_QUEUE {
+                    emit_mov_rcx_imm64(sp_cap[si] - 1)
+                    emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xC8)
+                } else {
+                    emit_bounds_check_rax(sp_cap[si])
+                }
+                emit_scale_rax(sp_elem_sz[si])
+                emit_load_space_base_rcx(si)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                elem_ty = sp_elem_ty[si]
+                is_mem  = 1
+            }
+        }
+    }
+
+    if is_mem == 0 {
+        tok_kind[c0_end] = saved_end
+        die_line("error: 3-part spin mask<...> requires a dereferenced memory/pointer/space target (scalar local cannot change)", err_line)
+    }
+
+    // Optional `.field` / `.arr[idx]` chain on struct pointer target
+    loop <max: 32 | until: peek_kind() != TOK_DOT> {
+        ebase := elem_ty & TY_BASE_MASK
+        if ebase < TY_STRUCT_BASE || ebase >= TY_PTR_BASE {
+            tok_kind[c0_end] = saved_end
+            die_line("error: invalid field access in 3-part spin mask<...>", err_line)
+        }
+        g[G_TOK_IDX] += 1
+        fsym := expect_ident()
+        fi   := find_struct_field(ebase - TY_STRUCT_BASE, fsym)
+        if fi < 0 {
+            tok_kind[c0_end] = saved_end
+            die_line("error: unknown struct field in 3-part spin mask<...>", err_line)
+        }
+        foff: i64 = fld_off[fi]
+        fty: i64  = fld_ty[fi]
+        acnt: i64 = fld_arr_cnt[fi]
+        if foff != 0 {
+            emit_add_rax_imm(foff)
+        }
+        if acnt > 0 {
+            if peek_kind() != TOK_LBRACK {
+                tok_kind[c0_end] = saved_end
+                die_line("error: struct array field in spin mask<...> requires [index]", err_line)
+            }
+            ab := alloc_temp_qword()
+            emit_store_local(ab)
+            g[G_TOK_IDX] += 1
+            parse_expr(1)
+            expect_kind(TOK_RBRACK)
+            emit_bounds_check_rax(acnt)
+            emit_scale_rax(ty_byte_size(fty))
+            emit_load_local_rcx(ab)
+            free_temp_qwords(1)
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+        }
+        elem_ty = fty
+    }
+
+    tok_kind[c0_end] = saved_end
+    if g[G_TOK_IDX] != c0_end {
+        die_line("error: trailing tokens in 3-part spin mask<...> target", err_line)
+    }
+    if (elem_ty & TY_BASE_MASK) >= TY_STRUCT_BASE && (elem_ty & TY_FLAG_PTR) == 0 {
+        die_line("error: 3-part spin mask<...> target must resolve to a scalar field/element", err_line)
+    }
+
+    emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0) // mov r8, rax (pinned spin target address)
+    return elem_ty
+}
+
+// Compiles 2-part `mask<target | M>` or 3-part `mask<lval | M | until !ZF ; max N>` (`mask` already consumed; `<` is next)
+fn parse_mask_expr(flag_only_mode: i64) {
+    mline  := peek_line()
+    lt_idx := g[G_TOK_IDX]
+    expect_kind(TOK_LT)
+    scan_mask_clauses(lt_idx, mline)
+
+    parts    := mask_scan_out[0]
+    c0_start := mask_scan_out[1]
+    pipe1    := mask_scan_out[2]
+    c1_end   := mask_scan_out[3]
+    gt_idx   := mask_scan_out[4]
+
+    // Evaluate compile-time mask constant `M` in `[pipe1 + 1 .. c1_end)`
+    saved_c1 := tok_kind[c1_end]
+    tok_kind[c1_end] = TOK_EOF
+    g[G_TOK_IDX]     = pipe1 + 1
+    mval := eval_const_expr(1)
+    tok_kind[c1_end] = saved_c1
+    if g[G_TOK_IDX] != c1_end || mval == 0 {
+        die_line("error: mask<...> requires a non-zero compile-time mask constant", mline)
+    }
+
+    if parts == 3 {
+        if flag_only_mode == 1 {
+            die_line("error: 3-part spin mask<...> cannot be nested inside 'with when'", mline)
+        }
+        elem_ty := eval_mask_spin_target_addr_r8(c0_start, pipe1, mline)
+
+        // Parse `until !ZF ; max N` in `[c1_end + 1 .. gt_idx)`
+        saved_gt := tok_kind[gt_idx]
+        tok_kind[gt_idx] = TOK_EOF
+        g[G_TOK_IDX]     = c1_end + 1
+
+        usym := expect_ident()
+        if usym != g[G_SYM_UNTIL] {
+            tok_kind[gt_idx] = saved_gt
+            die_line("error: expected 'until !ZF ; max N' in 3-part mask<...>", mline)
+        }
+        if peek_kind() != TOK_BANG {
+            tok_kind[gt_idx] = saved_gt
+            die_line("error: 3-part spin mask<...> requires 'until !ZF' so timeout sets ZF=1", mline)
+        }
+        g[G_TOK_IDX] += 1
+        fsym := expect_ident()
+        if fsym != g[G_SYM_ZF] {
+            tok_kind[gt_idx] = saved_gt
+            die_line("error: 3-part spin mask<...> requires 'until !ZF'", mline)
+        }
+        expect_kind(TOK_SEMI)
+        msym := expect_ident()
+        if msym != g[G_SYM_MAX] {
+            tok_kind[gt_idx] = saved_gt
+            die_line("error: expected 'max N' after ';' in 3-part mask<...>", mline)
+        }
+        if peek_kind() == TOK_COLON {
+            g[G_TOK_IDX] += 1
+        }
+        max_spins := eval_const_expr(1)
+        tok_kind[gt_idx] = saved_gt
+        if g[G_TOK_IDX] != gt_idx || max_spins <= 0 {
+            die_line("error: 3-part mask<...> max spins must be a positive constant", mline)
+        }
+        g[G_TOK_IDX] = gt_idx + 1
+
+        // Emit self-contained volatile poll micro-loop:
+        //   Ready   -> exits via `jnz .ready` with `ZF == 0` and masked value in `rax`
+        //   Timeout -> `dec rcx` hits `0`, falling out of `jnz .spin` with `ZF == 1` live!
+        emit_mov_rcx_imm64(max_spins)
+        spin_top := g[G_CODE_OFF]
+        emit_load_r8_mem_typed(elem_ty)
+        emit_and_rax_mask64(mval)
+        ready_p := emit_jcc_rel32(0x85)                   // jnz .ready
+        emit_u8(0xF3)  emit_u8(0x90)                      // pause
+        emit_u8(0x48)  emit_u8(0xFF)  emit_u8(0xC9)       // dec rcx (sets ZF=1 on timeout!)
+        emit_u8(0x0F)  emit_u8(0x85)                      // jnz .spin
+        spin_rel := spin_top - (g[G_CODE_OFF] + 4)
+        emit_u32(spin_rel)
+        patch_rel32_here(ready_p)
+
+        g[G_LAST_EXPR_TY]  = elem_ty
+        g[G_EXPR_SET_FLAG] = FLAG_ZF
+        return
+    }
+
+    // 2-part `mask<target | M>`: evaluate `target` -> `rax`
+    g[G_TOK_IDX] = c0_start
+    parse_bounded_expr(pipe1)
+    if is_ty_vec(g[G_LAST_EXPR_TY]) == 1 || (g[G_LAST_EXPR_TY] & TY_FLAG_SPAN) != 0 || is_struct_value_ty(g[G_LAST_EXPR_TY]) == 1 {
+        die_line("error: mask<...> target must be a 64-bit/scalar integer", mline)
+    }
+    g[G_TOK_IDX] = gt_idx + 1
+
+    um: u64 = mval
+    s: i64  = @tzcnt(um)
+    w: i64  = @popcnt(um)
+    is_contig := 0
+    if w == 64 {
+        is_contig = 1
+    } else {
+        u_w_msk: u64 = (1 << w) - 1
+        if (um >> s) == u_w_msk {
+            is_contig = 1
+        }
+    }
+
+    // 1. Flag-only `with when mask<x | M> ; [!]ZF/CF`
+    if flag_only_mode == 1 {
+        if peek_kind() == TOK_SEMI {
+            f_look := g[G_TOK_IDX] + 1
+            if tok_kind[f_look] == TOK_BANG { f_look += 1 }
+            if tok_kind[f_look] == TOK_IDENT && tok_val[f_look] == g[G_SYM_CF] {
+                if w != 1 {
+                    die_line("error: mask<...> ; CF requires a single-bit mask", mline)
+                }
+                emit_bt_rax_imm(s)
+                g[G_LAST_EXPR_TY]  = TY_U64
+                g[G_EXPR_SET_FLAG] = FLAG_CF
+                return
+            }
+        }
+        if w == 1 {
+            emit_test_rax_mask64(mval)
+        } else {
+            if is_contig == 1 && w < 64 {
+                emit_bextr_rax_imm(s, w)
+            } else {
+                emit_and_rax_mask64(mval)
+            }
+        }
+        g[G_LAST_EXPR_TY]  = TY_U64
+        g[G_EXPR_SET_FLAG] = FLAG_ZF
+        return
+    }
+
+    // 2. Reject invalid `; CF` handoff if attached directly to a value-mode mask with multi-bit M
+    if peek_kind() == TOK_SEMI {
+        f_look2 := g[G_TOK_IDX] + 1
+        if tok_kind[f_look2] == TOK_BANG { f_look2 += 1 }
+        if tok_kind[f_look2] == TOK_IDENT && tok_val[f_look2] == g[G_SYM_CF] {
+            if w != 1 {
+                die_line("error: mask<...> ; CF requires a single-bit mask", mline)
+            }
+            emit_bt_rax_imm(s)
+            g[G_LAST_EXPR_TY]  = TY_U64
+            g[G_EXPR_SET_FLAG] = FLAG_CF
+            return
+        }
+    }
+
+    // 3. Fused contiguous `mask<x | M> >> S` where `S == ctz(M)` -> ONE `BMI1 bextr(S, W)`!
+    if is_contig == 1 && s > 0 && w < 64 && peek_kind() == TOK_SHR {
+        sh_i  := g[G_TOK_IDX] + 1
+        sh_tk := tok_kind[sh_i]
+        sh_nk := tok_kind[sh_i + 1]
+        if sh_nk != TOK_LPAREN && sh_nk != TOK_LBRACK && sh_nk != TOK_DOT && imm_next_binop_prec(sh_i + 1) <= 9 {
+            has_sh := 0
+            sh_val: i64 = 0
+            if sh_tk == TOK_INT {
+                sh_val = tok_val[sh_i]
+                has_sh = 1
+            } else {
+                if sh_tk == TOK_IDENT && sh_nk != TOK_LT {
+                    sh_sym := tok_val[sh_i]
+                    if find_local(sh_sym) < 0 && find_space(sh_sym) < 0 {
+                        sh_ci := find_const(sh_sym)
+                        if sh_ci >= 0 && cst_done[sh_ci] == 1 {
+                            sh_val = cst_val[sh_ci]
+                            has_sh = 1
+                        }
+                    }
+                }
+            }
+            if has_sh == 1 && sh_val == s {
+                g[G_TOK_IDX] = sh_i + 1
+                emit_bextr_rax_imm(s, w)
+                g[G_LAST_EXPR_TY]  = TY_U64
+                g[G_EXPR_SET_FLAG] = FLAG_ZF
+                return
+            }
+        }
+    }
+
+    // 4. Zero-comparison lookahead `mask<x | M> == 0` / `!= 0` (value discarded, only `ZF` tested!)
+    nxt_op := peek_kind()
+    if (nxt_op == TOK_EQ || nxt_op == TOK_NE) && tok_kind[g[G_TOK_IDX] + 1] == TOK_INT && tok_val[g[G_TOK_IDX] + 1] == 0 {
+        if imm_next_binop_prec(g[G_TOK_IDX] + 2) <= 7 {
+            if w == 1 {
+                emit_test_rax_mask64(mval)
+            } else {
+                if is_contig == 1 && w < 64 {
+                    emit_bextr_rax_imm(s, w)
+                } else {
+                    emit_and_rax_mask64(mval)
+                }
+            }
+            g[G_LAST_EXPR_TY]  = TY_U64
+            g[G_EXPR_SET_FLAG] = FLAG_ZF
+            return
+        }
+    }
+
+    // 5. Value-producing `mask<x | M>` (`bextr` when contiguous from bit 0; `and` otherwise)
+    if is_contig == 1 && s == 0 && w < 64 {
+        emit_bextr_rax_imm(0, w)
+    } else {
+        emit_and_rax_mask64(mval)
+    }
+    g[G_LAST_EXPR_TY]  = TY_U64
+    g[G_EXPR_SET_FLAG] = FLAG_ZF
 }
 
 fn expr_ty_size(ty: i64) i64  => ty_byte_size(ty)
@@ -820,6 +1478,7 @@ fn parse_at_expr() {
             return
         }
         if kw == KW_SYSCALL {
+            check_no_live_oneshot_for_call(at_line)
             if g[G_MODE_EFI] == 1 || g[G_MODE_CAPSULE] == 1 {
                 die_line("error: host print/@syscall unavailable in --target=efi-os", at_line)
             }
@@ -945,6 +1604,7 @@ fn parse_at_expr() {
         return
     }
     if sym == g[G_SYM_CALL] {
+        check_no_live_oneshot_for_call(at_line)
         if g[G_IN_ISR_MODE] != 0 {
             die_line("error: @isr/@isr_ok forbids indirect @call", at_line)
         }

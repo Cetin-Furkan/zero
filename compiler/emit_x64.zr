@@ -227,7 +227,7 @@ fn emit_lea_local_rcx(disp: i64) {
 
 // Width-exact load of scalar / bitpack / pointer local `[rbp + disp]` directly into `rcx`
 fn emit_load_local_typed_rcx(disp: i64, ty: i64) {
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR)) != 0 {
         emit_load_local_rcx(disp)
         return
     }
@@ -385,11 +385,140 @@ fn resolve_patch_chain(head: i64) {
     }
 }
 
+// Direct `jcc rel32` (`0F <cc> <rel32>`, where `cc` is `0x84`=jz, `0x85`=jnz, `0x82`=jc, `0x83`=jnc)
+// Consumes `RFLAGS` directly with ZERO `test` or `cmp` instructions!
+fn emit_jcc_rel32(cc: i64) i64 {
+    emit_u8(0x0F)
+    emit_u8(cc)
+    pos := g[G_CODE_OFF]
+    emit_u32(0)
+    return pos
+}
+
+// --- Stage-1 `@oneshot` Register Capability & `mask<...>` BMI1/BMI2/Flag Emitters ---
+
+fn oneshot_slot_to_hw_reg(slot: i64) i64 {
+    if slot == 0 { return 10 } // r10
+    if slot == 1 { return 9 }  // r9
+    if slot == 2 { return 6 }  // rsi
+    return 7                   // rdi
+}
+
+fn emit_mov_gpr64(dst_hw: i64, src_hw: i64) {
+    rex := 0x48 | (((src_hw >> 3) & 1) << 2) | ((dst_hw >> 3) & 1)
+    mrm := 0xC0 | ((src_hw & 7) << 3) | (dst_hw & 7)
+    emit_u8(rex)
+    emit_u8(0x89)
+    emit_u8(mrm)
+}
+
+fn emit_oneshot_xor_wipe(slot: i64) {
+    hw  := oneshot_slot_to_hw_reg(slot)
+    mrm := 0xC0 | ((hw & 7) << 3) | (hw & 7)
+    if hw >= 8 {
+        emit_u8(0x45) // REX.R | REX.B -> 32-bit xor zeroes full 64-bit r8..r15!
+    }
+    emit_u8(0x31)
+    emit_u8(mrm)
+}
+
+fn emit_oneshot_from_rax(slot: i64) {
+    hw := oneshot_slot_to_hw_reg(slot)
+    emit_mov_gpr64(hw, 0) // mov reg, rax
+}
+
+fn emit_oneshot_relay_and_wipe(dst_slot: i64, src_slot: i64) {
+    dst_hw := oneshot_slot_to_hw_reg(dst_slot)
+    src_hw := oneshot_slot_to_hw_reg(src_slot)
+    emit_mov_gpr64(dst_hw, src_hw) // mov dst_reg, src_reg
+    emit_oneshot_xor_wipe(src_slot) // xor src_reg32, src_reg32 (immediate hardware wipe!)
+}
+
+fn emit_oneshot_add_rax_and_wipe(slot: i64) {
+    hw  := oneshot_slot_to_hw_reg(slot)
+    rex := 0x48 | (((hw >> 3) & 1) << 2)
+    mrm := 0xC0 | ((hw & 7) << 3) // add rax, reg
+    emit_u8(rex)
+    emit_u8(0x01)
+    emit_u8(mrm)
+    emit_oneshot_xor_wipe(slot)
+}
+
+fn emit_oneshot_load_zero_u64_and_wipe(slot: i64) {
+    if slot == 0 { emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x02) } // mov rax, [r10]
+    if slot == 1 { emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x01) } // mov rax, [r9]
+    if slot == 2 { emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x06) } // mov rax, [rsi]
+    if slot == 3 { emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x07) } // mov rax, [rdi]
+    emit_oneshot_xor_wipe(slot)
+}
+
+// BMI1 `bextr rax, rax, rdx` (`rdx = (len << 8) | start`): extracts field -> bit 0 AND sets `ZF`!
+fn emit_bextr_rax_imm(start_bit: i64, bit_len: i64) {
+    ctrl := ((bit_len & 0xFF) << 8) | (start_bit & 0xFF)
+    emit_u8(0xBA)  emit_u32(ctrl)                                // mov edx, ctrl
+    emit_u8(0xC4)  emit_u8(0xE2)  emit_u8(0xE8)  emit_u8(0xF7)  emit_u8(0xC0) // bextr rax, rax, rdx
+}
+
+// `bt rax, imm8`: tests single bit `bit_idx` (`0..63`) in `rax` and sets `CF` (preserving `rax`)!
+fn emit_bt_rax_imm(bit_idx: i64) {
+    emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBA)  emit_u8(0xE0)  emit_u8(bit_idx & 63)
+}
+
+// Flag-only `test` on `rax` with 64-bit constant `mval` (sets `ZF`, preserves `rax`)
+fn emit_test_rax_mask64(mval: i64) {
+    um: u64 = mval
+    if (um >> 31) == 0 {
+        emit_u8(0xA9)  emit_u32(mval)                            // test eax, imm32
+        return
+    }
+    emit_u8(0x48)  emit_u8(0xBA)  emit_u64(mval)                 // movabs rdx, imm64
+    emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xD0)                 // test rax, rdx
+}
+
+// Value-preserving `and` on `rax` with 64-bit constant `mval` (sets `ZF`, keeps bit positions)
+fn emit_and_rax_mask64(mval: i64) {
+    um: u64 = mval
+    if (um >> 31) == 0 {
+        if um <= 127 {
+            emit_u8(0x83)  emit_u8(0xE0)  emit_u8(mval)          // and eax, imm8
+        } else {
+            emit_u8(0x25)  emit_u32(mval)                        // and eax, imm32
+        }
+        return
+    }
+    emit_u8(0x48)  emit_u8(0xBA)  emit_u64(mval)                 // movabs rdx, imm64
+    emit_u8(0x48)  emit_u8(0x21)  emit_u8(0xD0)                 // and rax, rdx
+}
+
+// Volatile memory load from `[r8]` into `rax` for 3-part `mask<lval | M | until !ZF ; max N>`
+fn emit_load_r8_mem_typed(ty: i64) {
+    base := ty & TY_BASE_MASK
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR)) != 0 || base >= TY_PTR_BASE {
+        emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x00)              // mov rax, [r8]
+        return
+    }
+    if base >= TY_BP_BASE && base < TY_STRUCT_BASE {
+        bsz: i64 = bp_bytes[base - TY_BP_BASE]
+        if bsz == 1 { base = TY_U8 }
+        if bsz == 2 { base = TY_U16 }
+        if bsz == 4 { base = TY_U32 }
+        if bsz == 8 { base = TY_U64 }
+    }
+    if base == TY_U8  { emit_u8(0x41)  emit_u8(0x0F)  emit_u8(0xB6)  emit_u8(0x00)  return }
+    if base == TY_I8  { emit_u8(0x49)  emit_u8(0x0F)  emit_u8(0xBE)  emit_u8(0x00)  return }
+    if base == TY_U16 { emit_u8(0x41)  emit_u8(0x0F)  emit_u8(0xB7)  emit_u8(0x00)  return }
+    if base == TY_I16 { emit_u8(0x49)  emit_u8(0x0F)  emit_u8(0xBF)  emit_u8(0x00)  return }
+    if base == TY_U32 { emit_u8(0x41)  emit_u8(0x8B)  emit_u8(0x00)  return }
+    if base == TY_I32 { emit_u8(0x49)  emit_u8(0x63)  emit_u8(0x00)  return }
+    emit_u8(0x49)  emit_u8(0x8B)  emit_u8(0x00)                  // mov rax, [r8]
+}
+
 // --- Type Width Helpers, Narrow Truncation, & Memory Load/Store ---
 
 fn is_ty_unsigned(ty: i64) i64 {
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_SPAN)) != 0 { return 1 }
-    base := ty & TY_BASE_MASK
+    uty := ty & (~TY_FLAG_REF)
+    if (uty & (TY_FLAG_VIEW1 | TY_FLAG_SPAN | TY_FLAG_PTR)) != 0 { return 1 }
+    base := uty & TY_BASE_MASK
     if base == TY_U64 || base == TY_U32 || base == TY_U16 || base == TY_U8 {
         return 1
     }
@@ -404,7 +533,7 @@ fn is_ty_unsigned(ty: i64) i64 {
 
 fn ty_byte_size(ty: i64) i64 {
     if (ty & TY_FLAG_SPAN) != 0 { return 16 }
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return 8 }
     base := ty & TY_BASE_MASK
     if base == TY_U8  || base == TY_I8  { return 1 }
     if base == TY_U16 || base == TY_I16 { return 2 }
@@ -417,7 +546,7 @@ fn ty_byte_size(ty: i64) i64 {
 }
 
 fn emit_narrow_rax(ty: i64) {
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_SPAN | TY_FLAG_ATOMIC)) != 0 { return }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_SPAN | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return }
     base := ty & TY_BASE_MASK
     if base == TY_U32X16 || base == TY_U64X8 { return }
     if base >= TY_STRUCT_BASE { return }
@@ -438,7 +567,7 @@ fn emit_narrow_rax(ty: i64) {
 
 // Guest `rax` = source address -> loads into `rax` (`zmm0` for 512b vectors, `&struct` for structs)
 fn emit_load_mem_typed(ty: i64) {
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR)) != 0 {
         emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x00)
         return
     }
@@ -477,7 +606,7 @@ fn emit_load_mem_typed(ty: i64) {
 
 // Guest `rcx` = destination address, `rax` = value (`zmm0` for 512b vectors, `&src` for structs)
 fn emit_store_mem_typed(ty: i64) {
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 {
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR)) != 0 {
         emit_u8(0x48)  emit_u8(0x89)  emit_u8(0x01)
         return
     }
@@ -508,6 +637,9 @@ fn emit_store_mem_typed(ty: i64) {
         return
     }
     if base >= TY_STRUCT_BASE {
+        if g[G_ONESHOT_LIVE_MASK] != 0 {
+            die_cur("error: @oneshot pointer cannot remain live across struct copy")
+        }
         sz: i64 = ut_size[base - TY_STRUCT_BASE]
         if sz > 0 {
             emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC6) // mov rsi, rax (src)
@@ -804,7 +936,8 @@ fn emit_shl_rax_imm(sh: i64) {
 // Returns `1` if handled as compact immediate x86-64 instruction (advancing `g[G_TOK_IDX]`
 // and updating `g[G_LAST_EXPR_TY]`), or `0` to fall back to general RHS evaluation.
 fn try_emit_imm_rhs_binop(op: i64, prec: i64, lhs_ty: i64) i64 {
-    if (lhs_ty & TY_FLAG_SPAN) != 0 { return 0 }
+    if (lhs_ty & (TY_FLAG_SPAN | TY_FLAG_ONESHOT)) != 0 { return 0 }
+    if (lhs_ty & TY_FLAG_PTR) != 0 && op != TOK_PLUS && op != TOK_MINUS { return 0 }
     lbase := lhs_ty & TY_BASE_MASK
     if (lhs_ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) == 0 {
         if lbase == TY_U32X16 || lbase == TY_U64X8 { return 0 }
@@ -857,17 +990,29 @@ fn try_emit_imm_rhs_binop(op: i64, prec: i64, lhs_ty: i64) i64 {
     }
 
     if op == TOK_PLUS {
-        if imm < -0x8000_0000 || imm > 0x7FFF_FFFF { return 0 }
-        emit_add_rax_imm32(imm)
-        g[G_LAST_EXPR_TY] = TY_I64
+        eff_add := imm
+        out_add := TY_I64
+        if (lhs_ty & TY_FLAG_PTR) != 0 {
+            eff_add = imm * ty_byte_size(lhs_ty & TY_BASE_MASK)
+            out_add = lhs_ty
+        }
+        if eff_add < -0x8000_0000 || eff_add > 0x7FFF_FFFF { return 0 }
+        emit_add_rax_imm32(eff_add)
+        g[G_LAST_EXPR_TY] = out_add
         g[G_TOK_IDX] = idx + 1
         return 1
     }
 
     if op == TOK_MINUS {
-        if imm < -0x8000_0000 || imm > 0x7FFF_FFFF { return 0 }
-        emit_sub_rax_imm32(imm)
-        g[G_LAST_EXPR_TY] = TY_I64
+        eff_sub := imm
+        out_sub := TY_I64
+        if (lhs_ty & TY_FLAG_PTR) != 0 {
+            eff_sub = imm * ty_byte_size(lhs_ty & TY_BASE_MASK)
+            out_sub = lhs_ty
+        }
+        if eff_sub < -0x8000_0000 || eff_sub > 0x7FFF_FFFF { return 0 }
+        emit_sub_rax_imm32(eff_sub)
+        g[G_LAST_EXPR_TY] = out_sub
         g[G_TOK_IDX] = idx + 1
         return 1
     }
@@ -984,7 +1129,12 @@ fn emit_scalar_div_mod_rcx(is_mod: i64, is_uns: i64) {
 // loads RHS directly into `rcx` via `emit_load_local_typed_rcx` and emits the op in registers!
 fn try_emit_local_rhs_binop(op: i64, prec: i64, lhs_ty: i64) i64 {
     if op == TOK_PIPE_GT || op == TOK_AND2 || op == TOK_OR2 { return 0 }
-    if (lhs_ty & TY_FLAG_SPAN) != 0 { return 0 }
+    if (lhs_ty & (TY_FLAG_SPAN | TY_FLAG_ONESHOT)) != 0 { return 0 }
+    if (lhs_ty & TY_FLAG_PTR) != 0 {
+        if (op != TOK_PLUS && op != TOK_MINUS) || ty_byte_size(lhs_ty & TY_BASE_MASK) != 1 {
+            return 0
+        }
+    }
     lbase := lhs_ty & TY_BASE_MASK
     if (lhs_ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) == 0 {
         if lbase == TY_U32X16 || lbase == TY_U64X8 { return 0 }
@@ -1012,7 +1162,7 @@ fn try_emit_local_rhs_binop(op: i64, prec: i64, lhs_ty: i64) i64 {
 
     rhs_ty: i64   = loc_ty[li]
     rhs_disp: i64 = loc_disp[li]
-    if (rhs_ty & TY_FLAG_SPAN) != 0 { return 0 }
+    if (rhs_ty & (TY_FLAG_SPAN | TY_FLAG_PTR | TY_FLAG_ONESHOT | TY_FLAG_REF)) != 0 { return 0 }
     rbase := rhs_ty & TY_BASE_MASK
     if (rhs_ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) == 0 {
         if rbase == TY_U32X16 || rbase == TY_U64X8 { return 0 }
@@ -1030,6 +1180,16 @@ fn try_emit_local_rhs_binop(op: i64, prec: i64, lhs_ty: i64) i64 {
     if both_u == 1 { out_ty = TY_U64 }
 
     g[G_TOK_IDX] = idx + 1
+
+    if (lhs_ty & TY_FLAG_PTR) != 0 {
+        if op == TOK_PLUS {
+            emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+        } else {
+            emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8)
+        }
+        g[G_LAST_EXPR_TY] = lhs_ty
+        return 1
+    }
 
     if op == TOK_PLUS  { emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)  g[G_LAST_EXPR_TY] = out_ty  return 1 }
     if op == TOK_MINUS { emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8)  g[G_LAST_EXPR_TY] = out_ty  return 1 }

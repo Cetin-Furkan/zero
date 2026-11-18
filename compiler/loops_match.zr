@@ -28,7 +28,7 @@ LMS_LINE       :: 8
 
 fn lm_ty_size(ty: i64) i64 {
     if (ty & TY_FLAG_SPAN) != 0 { return 16 }
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return 8 }
     base := ty & TY_BASE_MASK
     if base == TY_U32X16 || base == TY_U64X8 { return 64 }
     if base >= TY_PTR_BASE    { return 8 }
@@ -41,7 +41,7 @@ fn lm_ty_size(ty: i64) i64 {
 }
 
 fn lm_ty_align(ty: i64) i64 {
-    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return 8 }
     base := ty & TY_BASE_MASK
     if base == TY_U32X16 || base == TY_U64X8 { return 64 }
     if base >= TY_PTR_BASE    { return 8 }
@@ -54,7 +54,7 @@ fn lm_ty_align(ty: i64) i64 {
 }
 
 fn lm_is_struct_val(ty: i64) i64 {
-    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 0 }
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return 0 }
     base := ty & TY_BASE_MASK
     if base >= TY_STRUCT_BASE && base < TY_PTR_BASE { return 1 }
     return 0
@@ -189,6 +189,7 @@ fn lm_emit_wait_deadline_prefix() {
 }
 
 fn parse_wait_call(line: i64) {
+    check_no_live_oneshot_for_call(line)
     if g[G_MODE_EFI] == 0 {
         die_line("error: ring-0 intrinsic requires --target=efi-os", line)
     }
@@ -625,23 +626,556 @@ fn parse_stmt_if() {
         return
     }
 
-    // Runtime `if`
-    parse_expr(1)
-    else_patch := emit_jz_rel32()
+    // Runtime `if` (with `@oneshot` linear branch-join verification!)
+    if_line   := peek_line()
+    outer_cnt := g[G_LOC_CNT]
+    entry_msk := g[G_ONESHOT_LIVE_MASK]
+    live0 := -1  live1 := -1  live2 := -1  live3 := -1
+    if entry_msk != 0 {
+        for li in 0..outer_cnt {
+            if loc_oneshot_state[li] == 1 {
+                if live0 < 0 { live0 = li } else {
+                    if live1 < 0 { live1 = li } else {
+                        if live2 < 0 { live2 = li } else { live3 = li }
+                    }
+                }
+            }
+        }
+    }
+
+    else_patch := lm_compile_cond_jump_false(0)
     parse_scoped_block()
+    then_div := g[G_BLOCK_DIVERGED]
+    then_msk := g[G_ONESHOT_LIVE_MASK]
 
     if peek_kind() == TOK_KW && peek_kw() == KW_ELSE {
         g[G_TOK_IDX] += 1
         end_patch := emit_jmp_rel32()
         patch_rel32_here(else_patch)
+
+        // Restore entry `@oneshot` state for the `else` arm
+        g[G_ONESHOT_LIVE_MASK] = entry_msk
+        if live0 >= 0 { loc_oneshot_state[live0] = 1 }
+        if live1 >= 0 { loc_oneshot_state[live1] = 1 }
+        if live2 >= 0 { loc_oneshot_state[live2] = 1 }
+        if live3 >= 0 { loc_oneshot_state[live3] = 1 }
+
         if peek_kind() == TOK_KW && peek_kw() == KW_IF {
             parse_stmt_if()
         } else {
             parse_scoped_block()
         }
+        else_div := g[G_BLOCK_DIVERGED]
+        else_msk := g[G_ONESHOT_LIVE_MASK]
         patch_rel32_here(end_patch)
+
+        if then_div == 1 && else_div == 1 {
+            g[G_BLOCK_DIVERGED] = 1
+        } else {
+            if then_div == 1 && else_div == 0 {
+                g[G_BLOCK_DIVERGED] = 0
+            } else {
+                if then_div == 0 && else_div == 1 {
+                    g[G_ONESHOT_LIVE_MASK] = then_msk
+                    if live0 >= 0 && ((then_msk >> loc_oneshot_reg[live0]) & 1) == 0 { loc_oneshot_state[live0] = 2 }
+                    if live1 >= 0 && ((then_msk >> loc_oneshot_reg[live1]) & 1) == 0 { loc_oneshot_state[live1] = 2 }
+                    if live2 >= 0 && ((then_msk >> loc_oneshot_reg[live2]) & 1) == 0 { loc_oneshot_state[live2] = 2 }
+                    if live3 >= 0 && ((then_msk >> loc_oneshot_reg[live3]) & 1) == 0 { loc_oneshot_state[live3] = 2 }
+                    g[G_BLOCK_DIVERGED] = 0
+                } else {
+                    if then_msk != else_msk {
+                        die_line("error: asymmetric @oneshot consumption across if/else branches", if_line)
+                    }
+                    g[G_BLOCK_DIVERGED] = 0
+                }
+            }
+        }
     } else {
         patch_rel32_here(else_patch)
+        if then_div == 1 {
+            g[G_ONESHOT_LIVE_MASK] = entry_msk
+            if live0 >= 0 { loc_oneshot_state[live0] = 1 }
+            if live1 >= 0 { loc_oneshot_state[live1] = 1 }
+            if live2 >= 0 { loc_oneshot_state[live2] = 1 }
+            if live3 >= 0 { loc_oneshot_state[live3] = 1 }
+        } else {
+            if then_msk != entry_msk {
+                die_line("error: @oneshot pointer consumed inside conditional branch without else", if_line)
+            }
+        }
+        g[G_BLOCK_DIVERGED] = 0
+    }
+}
+
+// --- Stage-1 Zero-`cmp` Flag Condition & `when` / `with` / `when while` / `when for` Engine ---
+
+// Parses `[!]{ZF|CF}`, verifies `have_flag == want_flag`, and returns the `jcc` opcode that jumps on FALSE!
+fn lm_parse_flag_spec_false_cc(have_flag: i64, err_line: i64) i64 {
+    inv := 0
+    if peek_kind() == TOK_BANG {
+        inv = 1
+        g[G_TOK_IDX] += 1
+    }
+    fsym := expect_ident()
+    want_flag: i64 = 0
+    if fsym == g[G_SYM_ZF] { want_flag = FLAG_ZF }
+    if fsym == g[G_SYM_CF] { want_flag = FLAG_CF }
+    if want_flag == 0 {
+        die_line("error: expected hardware flag 'ZF' or 'CF'", err_line)
+    }
+    if have_flag != want_flag {
+        die_line("error: CPU flag referenced in 'when' is dead, clobbered, or mismatched", err_line)
+    }
+    if want_flag == FLAG_ZF {
+        if inv == 1 { return 0x84 } // `!ZF` false when `ZF == 1` -> `jz`
+        return 0x85                 // `ZF`  false when `ZF == 0` -> `jnz`
+    }
+    if inv == 1 { return 0x82 }     // `!CF` false when `CF == 1` -> `jc`
+    return 0x83                     // `CF`  false when `CF == 0` -> `jnc`
+}
+
+// Compiles a branch condition and emits a direct jump-if-false `rel32`, returning the patch offset:
+//   - Bare `[!]{ZF|CF}` -> reads live `RFLAGS` (`0` `cmp`, `0` `test`!)
+//   - Top-level `mask<target | M> == 0` / `!= 0` -> reads `ZF` directly from `bextr`/`test`/`and` (`0` `cmp`!)
+//   - General boolean expression -> `parse_expr(1)` + `emit_jz_rel32()`
+fn lm_compile_cond_jump_false(prev_live_flag: i64) i64 {
+    cline := peek_line()
+    idx0  := g[G_TOK_IDX]
+
+    // 1. Bare `[!]{ZF|CF}` followed immediately by `=>`, `{`, or `;`
+    f_idx := idx0
+    if tok_kind[f_idx] == TOK_BANG { f_idx += 1 }
+    if tok_kind[f_idx] == TOK_IDENT {
+        fsym := tok_val[f_idx]
+        if (fsym == g[G_SYM_ZF] || fsym == g[G_SYM_CF]) && find_local(fsym) < 0 {
+            after_k := tok_kind[f_idx + 1]
+            if after_k == TOK_FAT_ARROW || after_k == TOK_LBRACE || after_k == TOK_SEMI {
+                fcc := lm_parse_flag_spec_false_cc(prev_live_flag, cline)
+                return emit_jcc_rel32(fcc)
+            }
+        }
+    }
+
+    // 2. Direct `mask<target | M> == 0` or `mask<target | M> != 0` followed by `=>`, `{`, or `;`
+    if tok_kind[idx0] == TOK_IDENT && tok_val[idx0] == g[G_SYM_MASK] && tok_kind[idx0 + 1] == TOK_LT && find_local(tok_val[idx0]) < 0 {
+        scan_mask_clauses(idx0 + 1, cline)
+        gt_i := mask_scan_out[4]
+        op_k := tok_kind[gt_i + 1]
+        if (op_k == TOK_EQ || op_k == TOK_NE) && tok_kind[gt_i + 2] == TOK_INT && tok_val[gt_i + 2] == 0 {
+            end_k := tok_kind[gt_i + 3]
+            if end_k == TOK_FAT_ARROW || end_k == TOK_LBRACE || end_k == TOK_SEMI {
+                g[G_TOK_IDX] = idx0 + 1 // consume `mask`
+                parse_mask_expr(1)      // flag-only: `test` (1-bit), `bextr` (contiguous), or `and` (scattered)
+                g[G_TOK_IDX] = gt_i + 3 // consume `== 0` or `!= 0`
+                if op_k == TOK_EQ {
+                    return emit_jcc_rel32(0x85) // `== 0` false when `!= 0` (`jnz`, ZERO cmp!)
+                }
+                return emit_jcc_rel32(0x84)     // `!= 0` false when `== 0` (`jz`,  ZERO cmp!)
+            }
+        }
+    }
+
+    // 3. General boolean condition
+    parse_expr(1)
+    return emit_jz_rel32()
+}
+
+fn lm_parse_arm_block_or_arrow() {
+    if peek_kind() == TOK_FAT_ARROW {
+        g[G_TOK_IDX] += 1
+        saved_loc := g[G_LOC_CNT]
+        g[G_SCOPE_DEPTH]    += 1
+        g[G_BLOCK_DIVERGED]  = 0
+        parse_stmt()
+        if g[G_BLOCK_DIVERGED] == 0 {
+            check_oneshots_consumed_from(saved_loc, peek_line())
+        }
+        g[G_SCOPE_DEPTH] -= 1
+        g[G_LOC_CNT]      = saved_loc
+        return
+    }
+    parse_scoped_block()
+}
+
+// Emits a `tzcnt` + `blsr` (`jnz .loop`, 0 `cmp`) hardware set-bit iteration over `mask_slot`!
+fn lm_emit_bits_loop_from_slot(var1_sym: i64, var1_line: i64, mask_slot: i64, saved_loc: i64) {
+    v_disp := alloc_local(var1_sym, TY_I64, var1_line)
+
+    has_rec := block_has_trailing_recover(g[G_TOK_IDX])
+    rec_slot: i64 = 0
+    if has_rec == 1 {
+        rec_slot = g[G_REC_DEPTH]
+        rec_jmp_head[rec_slot]  = -1
+        rec_tile_base[rec_slot] = g[G_TILE_DEPTH]
+        g[G_REC_DEPTH] = rec_slot + 1
+    }
+
+    ld := g[G_LP_DEPTH]
+    lp_cont_tgt[ld]  = -1
+    lp_brk_head[ld]  = -1
+    lp_cont_head[ld] = -1
+    lp_tile_base[ld] = g[G_TILE_DEPTH]
+    g[G_LP_DEPTH]    = ld + 1
+
+    emit_load_local(mask_slot)
+    exit_p   := emit_jz_rel32() // skip loop if initial mask == 0
+    body_top := g[G_CODE_OFF]
+
+    // `tzcnt rax, rax` (`F3 48 0F BC C0`) -> index of lowest set bit
+    emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBC)  emit_u8(0xC0)
+    emit_store_local(v_disp)
+
+    parse_scoped_block()
+
+    g[G_LP_DEPTH] = ld
+    resolve_patch_chain(lp_cont_head[ld])
+    emit_load_local(mask_slot)
+    // `blsr rax, rax` (`C4 E2 F8 F3 C8`) clears lowest set bit AND sets `ZF = 1` when `rax == 0`!
+    emit_u8(0xC4)  emit_u8(0xE2)  emit_u8(0xF8)  emit_u8(0xF3)  emit_u8(0xC8)
+    emit_store_local(mask_slot) // `mov [rbp+disp], rax` preserves `ZF`!
+    emit_u8(0x0F)  emit_u8(0x85) // `jnz body_top` (ZERO cmp / test!)
+    emit_u32(body_top - (g[G_CODE_OFF] + 4))
+
+    patch_rel32_here(exit_p)
+    resolve_patch_chain(lp_brk_head[ld])
+    g[G_SCOPE_DEPTH]    -= 1
+    g[G_LOC_CNT]         = saved_loc
+    g[G_BLOCK_DIVERGED]  = 0
+    if has_rec == 1 {
+        finish_recover_clause(rec_slot)
+    }
+}
+
+// `when for idx in lo..hi ; filter_cond { ... }` OR `when for lane in word @bits { ... }`
+fn parse_stmt_when_for() {
+    expect_kw(KW_FOR)
+    saved_loc := g[G_LOC_CNT]
+    g[G_SCOPE_DEPTH] += 1
+
+    var1_line := peek_line()
+    var1_sym  := expect_ident()
+    expect_kw(KW_IN)
+
+    parse_expr(1)
+
+    // 1. `when for lane in ticket.lane_mask @bits { ... }`
+    if peek_kind() == TOK_AT && tok_kind[g[G_TOK_IDX] + 1] == TOK_IDENT && tok_val[g[G_TOK_IDX] + 1] == g[G_SYM_BITS] {
+        g[G_TOK_IDX] += 2
+        mask_slot := alloc_anon_qwords(1)
+        emit_store_local(mask_slot)
+        lm_emit_bits_loop_from_slot(var1_sym, var1_line, mask_slot, saved_loc)
+        return
+    }
+
+    // 2. `when for idx in lo..hi ; filter_cond { ... }`
+    if peek_kind() != TOK_DOT2 {
+        die_line("error: 'when for' expects either 'lo..hi ; filter' or 'expr @bits'", var1_line)
+    }
+    g[G_TOK_IDX] += 1
+    idx_disp := alloc_local(var1_sym, TY_I64, var1_line)
+    emit_store_local(idx_disp)
+
+    parse_expr(1)
+    hi_disp := alloc_anon_qwords(1)
+    emit_store_local(hi_disp)
+
+    expect_kind(TOK_SEMI)
+
+    ld := g[G_LP_DEPTH]
+    lp_cont_tgt[ld]  = -1
+    lp_brk_head[ld]  = -1
+    lp_cont_head[ld] = -1
+    lp_tile_base[ld] = g[G_TILE_DEPTH]
+    g[G_LP_DEPTH]    = ld + 1
+
+    head_off := g[G_CODE_OFF]
+    emit_load_local(idx_disp)
+    emit_load_local_rcx(hi_disp)
+    emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx
+    emit_u8(0x0F)  emit_u8(0x8D)                // jge .exit
+    exit_p := g[G_CODE_OFF]
+    emit_u32(0)
+
+    skip_iter_p := lm_compile_cond_jump_false(0)
+
+    parse_scoped_block()
+
+    patch_rel32_here(skip_iter_p)
+    resolve_patch_chain(lp_cont_head[ld])
+    emit_inc_local_qword(idx_disp)
+    emit_jmp_to(head_off)
+
+    patch_rel32_here(exit_p)
+    g[G_LP_DEPTH] = ld
+    resolve_patch_chain(lp_brk_head[ld])
+    g[G_SCOPE_DEPTH]    -= 1
+    g[G_LOC_CNT]         = saved_loc
+    g[G_BLOCK_DIVERGED]  = 0
+}
+
+// `when while [v :=] mask<...> ; [!]{ZF|CF} { ... }`
+fn parse_stmt_when_while() {
+    wline := peek_line()
+    g[G_TOK_IDX] += 1 // consume `while`
+
+    saved_loc := g[G_LOC_CNT]
+    g[G_SCOPE_DEPTH] += 1
+
+    has_var := 0
+    v_disp: i64 = 0
+    v_ty: i64   = TY_U64
+
+    if peek_kind() == TOK_IDENT && peek_val() != g[G_SYM_MASK] {
+        nk := tok_kind[g[G_TOK_IDX] + 1]
+        if nk == TOK_WALRUS {
+            vsym := expect_ident()
+            g[G_TOK_IDX] += 1
+            v_disp  = alloc_local(vsym, TY_U64, wline)
+            has_var = 1
+        } else {
+            if nk == TOK_COLON {
+                vsym := expect_ident()
+                g[G_TOK_IDX] += 1
+                v_ty = parse_full_type_tag()
+                if (v_ty & (TY_FLAG_ONESHOT | TY_FLAG_REF | TY_FLAG_SPAN)) != 0 {
+                    die_line("error: invalid binding type in 'when while'", wline)
+                }
+                expect_kind(TOK_ASSIGN)
+                v_disp  = alloc_local(vsym, v_ty, wline)
+                has_var = 1
+            }
+        }
+    }
+
+    ld := g[G_LP_DEPTH]
+    lp_cont_tgt[ld]  = -1
+    lp_brk_head[ld]  = -1
+    lp_cont_head[ld] = -1
+    lp_tile_base[ld] = g[G_TILE_DEPTH]
+    g[G_LP_DEPTH]    = ld + 1
+
+    head_off := g[G_CODE_OFF]
+
+    if peek_kind() != TOK_IDENT || peek_val() != g[G_SYM_MASK] || tok_kind[g[G_TOK_IDX] + 1] != TOK_LT {
+        die_line("error: 'when while' expects a 'mask<...> ; [!]{ZF|CF}' stage", wline)
+    }
+    g[G_TOK_IDX] += 1
+    if has_var == 1 {
+        parse_mask_expr(0)
+        emit_narrow_rax(v_ty)
+        emit_store_local(v_disp) // pure `mov` -> preserves `ZF` / `CF`!
+    } else {
+        parse_mask_expr(1)
+    }
+    m_flag := g[G_EXPR_SET_FLAG]
+    expect_kind(TOK_SEMI)
+    exit_cc := lm_parse_flag_spec_false_cc(m_flag, wline)
+    exit_p  := emit_jcc_rel32(exit_cc)
+
+    parse_scoped_block()
+
+    resolve_patch_chain(lp_cont_head[ld])
+    emit_jmp_to(head_off)
+
+    patch_rel32_here(exit_p)
+    g[G_LP_DEPTH] = ld
+    resolve_patch_chain(lp_brk_head[ld])
+    g[G_SCOPE_DEPTH]    -= 1
+    g[G_LOC_CNT]         = saved_loc
+    g[G_BLOCK_DIVERGED]  = 0
+}
+
+fn parse_stmt_when(prev_live_flag: i64) {
+    wline := peek_line()
+    g[G_TOK_IDX] += 1 // consume `when`
+
+    if peek_kind() == TOK_KW && peek_kw() == KW_FOR {
+        parse_stmt_when_for()
+        return
+    }
+    if peek_kind() == TOK_IDENT && peek_val() == g[G_SYM_WHILE] {
+        parse_stmt_when_while()
+        return
+    }
+
+    outer_cnt := g[G_LOC_CNT]
+    entry_msk := g[G_ONESHOT_LIVE_MASK]
+    live0 := -1  live1 := -1  live2 := -1  live3 := -1
+    if entry_msk != 0 {
+        for li in 0..outer_cnt {
+            if loc_oneshot_state[li] == 1 {
+                if live0 < 0 { live0 = li } else {
+                    if live1 < 0 { live1 = li } else {
+                        if live2 < 0 { live2 = li } else { live3 = li }
+                    }
+                }
+            }
+        }
+    }
+
+    skip_p := lm_compile_cond_jump_false(prev_live_flag)
+
+    if peek_kind() == TOK_SEMI {
+        g[G_TOK_IDX] += 1
+        if peek_kind() != TOK_KW || peek_kw() != KW_FOR {
+            die_line("error: ';' after 'when <cond>' expects 'for'", wline)
+        }
+        parse_stmt_for()
+    } else {
+        lm_parse_arm_block_or_arrow()
+    }
+
+    arm_div := g[G_BLOCK_DIVERGED]
+    arm_msk := g[G_ONESHOT_LIVE_MASK]
+    patch_rel32_here(skip_p)
+
+    if arm_div == 1 {
+        g[G_ONESHOT_LIVE_MASK] = entry_msk
+        if live0 >= 0 { loc_oneshot_state[live0] = 1 }
+        if live1 >= 0 { loc_oneshot_state[live1] = 1 }
+        if live2 >= 0 { loc_oneshot_state[live2] = 1 }
+        if live3 >= 0 { loc_oneshot_state[live3] = 1 }
+    } else {
+        if arm_msk != entry_msk {
+            die_line("error: @oneshot pointer consumed inside single-arm 'when' without diverging", wline)
+        }
+    }
+    g[G_BLOCK_DIVERGED] = 0
+}
+
+// `with when mask<...> ; [!]{ZF|CF} { ... } [else { ... }]`
+// OR `with v := stage ; when [!]{ZF|CF} { ... } [else { ... }]`
+fn parse_stmt_with() {
+    wline := peek_line()
+    g[G_TOK_IDX] += 1 // consume `with`
+
+    stage_flag: i64 = 0
+
+    if peek_kind() == TOK_IDENT && peek_val() == g[G_SYM_WHEN] {
+        g[G_TOK_IDX] += 1
+        if peek_kind() != TOK_IDENT || peek_val() != g[G_SYM_MASK] || tok_kind[g[G_TOK_IDX] + 1] != TOK_LT {
+            die_line("error: 'with when' expects 'mask<target | M> ; [!]{ZF|CF}'", wline)
+        }
+        g[G_TOK_IDX] += 1
+        parse_mask_expr(1)
+        stage_flag = g[G_EXPR_SET_FLAG]
+        expect_kind(TOK_SEMI)
+    } else {
+        vsym := expect_ident()
+        has_expl_ty := 0
+        v_ty: i64   = TY_U64
+        if peek_kind() == TOK_WALRUS {
+            g[G_TOK_IDX] += 1
+        } else {
+            expect_kind(TOK_COLON)
+            v_ty = parse_full_type_tag()
+            has_expl_ty = 1
+            expect_kind(TOK_ASSIGN)
+        }
+        parse_expr(1)
+        stage_flag = g[G_EXPR_SET_FLAG]
+        if stage_flag == 0 {
+            die_line("error: 'with' stage expression must leave a live hardware flag via mask<...>", wline)
+        }
+        if has_expl_ty == 0 {
+            v_ty = g[G_LAST_EXPR_TY]
+        }
+        if (v_ty & (TY_FLAG_ONESHOT | TY_FLAG_REF | TY_FLAG_SPAN)) != 0 || is_ty_vec(v_ty) == 1 || lm_is_struct_val(v_ty) == 1 {
+            die_line("error: invalid stage binding type in 'with'", wline)
+        }
+        if vsym != g[G_SYM_WILDCARD] {
+            v_disp := alloc_local(vsym, v_ty, wline)
+            emit_narrow_rax(v_ty)
+            emit_store_local(v_disp) // pure `mov` -> preserves `RFLAGS`!
+        }
+        expect_kind(TOK_SEMI)
+        if peek_kind() != TOK_IDENT || peek_val() != g[G_SYM_WHEN] {
+            die_line("error: expected 'when' after ';' in 'with'", wline)
+        }
+        g[G_TOK_IDX] += 1
+    }
+
+    outer_cnt := g[G_LOC_CNT]
+    entry_msk := g[G_ONESHOT_LIVE_MASK]
+    live0 := -1  live1 := -1  live2 := -1  live3 := -1
+    if entry_msk != 0 {
+        for li in 0..outer_cnt {
+            if loc_oneshot_state[li] == 1 {
+                if live0 < 0 { live0 = li } else {
+                    if live1 < 0 { live1 = li } else {
+                        if live2 < 0 { live2 = li } else { live3 = li }
+                    }
+                }
+            }
+        }
+    }
+
+    false_cc := lm_parse_flag_spec_false_cc(stage_flag, wline)
+    false_p  := emit_jcc_rel32(false_cc)
+
+    lm_parse_arm_block_or_arrow()
+    then_div := g[G_BLOCK_DIVERGED]
+    then_msk := g[G_ONESHOT_LIVE_MASK]
+
+    if peek_kind() == TOK_KW && peek_kw() == KW_ELSE {
+        g[G_TOK_IDX] += 1
+        end_p := emit_jmp_rel32()
+        patch_rel32_here(false_p)
+
+        g[G_ONESHOT_LIVE_MASK] = entry_msk
+        if live0 >= 0 { loc_oneshot_state[live0] = 1 }
+        if live1 >= 0 { loc_oneshot_state[live1] = 1 }
+        if live2 >= 0 { loc_oneshot_state[live2] = 1 }
+        if live3 >= 0 { loc_oneshot_state[live3] = 1 }
+
+        if peek_kind() == TOK_KW && peek_kw() == KW_IF {
+            parse_stmt_if()
+        } else {
+            if peek_kind() == TOK_IDENT && peek_val() == g[G_SYM_WHEN] {
+                parse_stmt_when(0)
+            } else {
+                parse_scoped_block()
+            }
+        }
+        else_div := g[G_BLOCK_DIVERGED]
+        else_msk := g[G_ONESHOT_LIVE_MASK]
+        patch_rel32_here(end_p)
+
+        if then_div == 1 && else_div == 1 {
+            g[G_BLOCK_DIVERGED] = 1
+        } else {
+            if then_div == 1 && else_div == 0 {
+                g[G_BLOCK_DIVERGED] = 0
+            } else {
+                if then_div == 0 && else_div == 1 {
+                    g[G_ONESHOT_LIVE_MASK] = then_msk
+                    if live0 >= 0 && ((then_msk >> loc_oneshot_reg[live0]) & 1) == 0 { loc_oneshot_state[live0] = 2 }
+                    if live1 >= 0 && ((then_msk >> loc_oneshot_reg[live1]) & 1) == 0 { loc_oneshot_state[live1] = 2 }
+                    if live2 >= 0 && ((then_msk >> loc_oneshot_reg[live2]) & 1) == 0 { loc_oneshot_state[live2] = 2 }
+                    if live3 >= 0 && ((then_msk >> loc_oneshot_reg[live3]) & 1) == 0 { loc_oneshot_state[live3] = 2 }
+                    g[G_BLOCK_DIVERGED] = 0
+                } else {
+                    if then_msk != else_msk {
+                        die_line("error: asymmetric @oneshot consumption across with/else branches", wline)
+                    }
+                    g[G_BLOCK_DIVERGED] = 0
+                }
+            }
+        }
+    } else {
+        patch_rel32_here(false_p)
+        if then_div == 1 {
+            g[G_ONESHOT_LIVE_MASK] = entry_msk
+            if live0 >= 0 { loc_oneshot_state[live0] = 1 }
+            if live1 >= 0 { loc_oneshot_state[live1] = 1 }
+            if live2 >= 0 { loc_oneshot_state[live2] = 1 }
+            if live3 >= 0 { loc_oneshot_state[live3] = 1 }
+        } else {
+            if then_msk != entry_msk {
+                die_line("error: @oneshot pointer consumed inside single-arm 'with' without diverging", wline)
+            }
+        }
+        g[G_BLOCK_DIVERGED] = 0
     }
 }
 
@@ -1726,6 +2260,104 @@ fn parse_stmt_for() {
             die_cur("error: parse fault (cannot iterate @port)")
         }
         g[G_TOK_IDX] += 1
+
+        // Check `@ring(start_seq .. batch_len)` cyclic wrap-around iteration!
+        if peek_kind() == TOK_AT {
+            ak1 := tok_kind[g[G_TOK_IDX] + 1]
+            if (ak1 == TOK_KW && tok_kw[g[G_TOK_IDX] + 1] == KW_RING) || (ak1 == TOK_IDENT && tok_val[g[G_TOK_IDX] + 1] == g[G_SYM_RING]) {
+                rline := peek_line()
+                if sp_kind[sp_i] != SKIND_RING {
+                    die_line("error: @ring(start .. len) loop requires an @ring space", rline)
+                }
+                g[G_TOK_IDX] += 2 // consume `@ring`
+                expect_kind(TOK_LPAREN)
+                parse_expr(1)
+                start_disp := alloc_anon_qwords(1)
+                emit_store_local(start_disp)
+                expect_kind(TOK_DOT2)
+                parse_expr(1)
+                len_disp := alloc_anon_qwords(1)
+                emit_store_local(len_disp)
+                expect_kind(TOK_RPAREN)
+
+                r_base_disp := alloc_anon_qwords(1)
+                lm_emit_space_base_rax(sp_i)
+                emit_store_local(r_base_disp)
+
+                step_disp := alloc_anon_qwords(1)
+                emit_mov_rax_imm64(0)
+                emit_store_local(step_disp)
+
+                r_elem_ty: i64 = sp_elem_ty[sp_i]
+                r_elem_sz: i64 = sp_elem_sz[sp_i]
+                r_wrap_msk: i64 = sp_cap[sp_i] - 1
+
+                slot_disp: i64 = 0
+                r_elem_disp: i64 = 0
+                if var2_sym != 0 {
+                    slot_disp   = alloc_local(var1_sym, TY_U64, var1_line)
+                    r_elem_disp = alloc_local(var2_sym, r_elem_ty, var1_line)
+                } else {
+                    slot_disp   = alloc_anon_qwords(1)
+                    r_elem_disp = alloc_local(var1_sym, r_elem_ty, var1_line)
+                }
+
+                r_tile  := 0
+                r_tline := rline
+                if peek_kind() == TOK_LT {
+                    lm_parse_opt_for_lenses(1)
+                    if lm_lens_tmp[0] != 0 || lm_lens_tmp[3] != 1 {
+                        die_line("error: invalid lens on @ring(start .. len) loop", rline)
+                    }
+                    r_tile  = lm_lens_tmp[1]
+                    r_tline = lm_lens_tmp[6]
+                }
+
+                if r_tile == 1 {
+                    emit_tile_enter_checked(r_tline)
+                }
+
+                ld_r := g[G_LP_DEPTH]
+                lp_cont_tgt[ld_r]  = -1
+                lp_brk_head[ld_r]  = -1
+                lp_cont_head[ld_r] = -1
+                lp_tile_base[ld_r] = g[G_TILE_DEPTH]
+                g[G_LP_DEPTH]      = ld_r + 1
+
+                r_head := g[G_CODE_OFF]
+                emit_load_local(step_disp)
+                emit_load_local_rcx(len_disp)
+                emit_u8(0x48)  emit_u8(0x39)  emit_u8(0xC8) // cmp rax, rcx (step vs batch_len)
+                emit_u8(0x0F)  emit_u8(0x83)                // jae .exit (unsigned)
+                r_exit_p := g[G_CODE_OFF]
+                emit_u32(0)
+
+                // `slot = (start_seq + step) & (cap - 1)` (1-instruction power-of-2 wrap!)
+                emit_load_local_rcx(start_disp)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+                emit_and_rax_mask64(r_wrap_msk)
+                emit_store_local(slot_disp)
+
+                lm_emit_load_span_elem(slot_disp, r_base_disp, r_elem_disp, r_elem_ty, r_elem_sz, -1)
+                parse_scoped_block()
+
+                resolve_patch_chain(lp_cont_head[ld_r])
+                emit_inc_local_qword(step_disp)
+                emit_jmp_to(r_head)
+
+                patch_rel32_here(r_exit_p)
+                g[G_LP_DEPTH] = ld_r
+                resolve_patch_chain(lp_brk_head[ld_r])
+                if r_tile == 1 {
+                    emit_tile_exit_one()
+                }
+                g[G_SCOPE_DEPTH]   -= 1
+                g[G_LOC_CNT]        = saved_loc
+                g[G_BLOCK_DIVERGED] = 0
+                return
+            }
+        }
+
         base_disp = alloc_anon_qwords(1)
         lm_emit_space_base_rax(sp_i)
         emit_store_local(base_disp)
@@ -1741,6 +2373,12 @@ fn parse_stmt_for() {
         // Evaluate `lo` / `mask` / `span_expr` BEFORE binding loop vars!
         parse_expr(1)
         ety1 := g[G_LAST_EXPR_TY]
+        if peek_kind() == TOK_AT {
+            ak_bad := tok_kind[g[G_TOK_IDX] + 1]
+            if (ak_bad == TOK_KW && tok_kw[g[G_TOK_IDX] + 1] == KW_RING) || (ak_bad == TOK_IDENT && tok_val[g[G_TOK_IDX] + 1] == g[G_SYM_RING]) {
+                die_cur("error: @ring(start .. len) loop requires an @ring space")
+            }
+        }
         if (ety1 & TY_FLAG_SPAN) != 0 {
             emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0)                 // mov r8, rax
             base_disp = alloc_anon_qwords(1)
@@ -2067,63 +2705,27 @@ fn parse_stmt_for() {
         return
     }
 
-    // --- Branch 3: `<bits>` Hardware Set-Bit Iteration (`tzcnt` + `blsr`) ---
-    v_disp := alloc_local(var1_sym, TY_I64, var1_line)
+    // --- Branch 3: `<bits>` or `@bits` Hardware Set-Bit Iteration (`tzcnt` + `blsr; jnz`) ---
     mask_slot := alloc_anon_qwords(1)
     emit_store_local(mask_slot)
 
-    if peek_kind() != TOK_LT {
-        die_cur("error: unimplemented or invalid loop lens")
-    }
-    lt_ln := peek_line()
-    g[G_TOK_IDX] += 1
-    if peek_kind() != TOK_IDENT || peek_val() != g[G_SYM_BITS] {
-        die_line("error: unimplemented or invalid loop lens", lt_ln)
-    }
-    g[G_TOK_IDX] += 1
-    if peek_kind() != TOK_GT {
-        die_line("error: unimplemented or invalid loop lens", lt_ln)
-    }
-    g[G_TOK_IDX] += 1
-
-    has_rec := block_has_trailing_recover(g[G_TOK_IDX])
-    rec_slot: i64 = 0
-    if has_rec == 1 {
-        rec_slot = g[G_REC_DEPTH]
-        rec_jmp_head[rec_slot]  = -1
-        rec_tile_base[rec_slot] = g[G_TILE_DEPTH]
-        g[G_REC_DEPTH] = rec_slot + 1
+    if peek_kind() == TOK_AT && tok_kind[g[G_TOK_IDX] + 1] == TOK_IDENT && tok_val[g[G_TOK_IDX] + 1] == g[G_SYM_BITS] {
+        g[G_TOK_IDX] += 2
+    } else {
+        if peek_kind() != TOK_LT {
+            die_cur("error: unimplemented or invalid loop lens")
+        }
+        lt_ln := peek_line()
+        g[G_TOK_IDX] += 1
+        if peek_kind() != TOK_IDENT || peek_val() != g[G_SYM_BITS] {
+            die_line("error: unimplemented or invalid loop lens", lt_ln)
+        }
+        g[G_TOK_IDX] += 1
+        if peek_kind() != TOK_GT {
+            die_line("error: unimplemented or invalid loop lens", lt_ln)
+        }
+        g[G_TOK_IDX] += 1
     }
 
-    ld := g[G_LP_DEPTH]
-    lp_cont_tgt[ld]  = -1
-    lp_brk_head[ld]  = -1
-    lp_cont_head[ld] = -1
-    lp_tile_base[ld] = g[G_TILE_DEPTH]
-    g[G_LP_DEPTH]    = ld + 1
-
-    head_off := g[G_CODE_OFF]
-    emit_load_local(mask_slot)
-    exit_p := emit_jz_rel32()
-    // `tzcnt rax, rax` (`F3 48 0F BC C0`)
-    emit_u8(0xF3)  emit_u8(0x48)  emit_u8(0x0F)  emit_u8(0xBC)  emit_u8(0xC0)
-    emit_store_local(v_disp)
-
-    parse_raw_brace_stmts()
-
-    g[G_LP_DEPTH] = ld
-    resolve_patch_chain(lp_cont_head[ld])
-    emit_load_local(mask_slot)
-    // `blsr rax, rax` (`C4 E2 F8 F3 C8`)
-    emit_u8(0xC4)  emit_u8(0xE2)  emit_u8(0xF8)  emit_u8(0xF3)  emit_u8(0xC8)
-    emit_store_local(mask_slot)
-    emit_jmp_to(head_off)
-
-    patch_rel32_here(exit_p)
-    resolve_patch_chain(lp_brk_head[ld])
-    g[G_SCOPE_DEPTH] -= 1
-    g[G_LOC_CNT] = saved_loc
-    if has_rec == 1 {
-        finish_recover_clause(rec_slot)
-    }
+    lm_emit_bits_loop_from_slot(var1_sym, var1_line, mask_slot, saved_loc)
 }

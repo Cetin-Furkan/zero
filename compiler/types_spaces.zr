@@ -41,7 +41,7 @@ fn find_struct_field(ut_idx: i64, fsym: i64) i64 {
 }
 
 fn is_ty_vec(ty: i64) i64 {
-    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 0 }
+    if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return 0 }
     base := ty & TY_BASE_MASK
     if base == TY_U32X16 || base == TY_U64X8 { return 1 }
     return 0
@@ -59,7 +59,7 @@ fn check_ring0_zmm_allowed(line: i64) {
 
 fn ts_type_size(ty: i64) i64 {
     if (ty & TY_FLAG_SPAN) != 0 { return 16 }
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return 8 }
     base := ty & TY_BASE_MASK
     if base == TY_U32X16 || base == TY_U64X8 { return 64 }
     if base >= TY_PTR_BASE { return 8 }
@@ -77,7 +77,7 @@ fn ts_type_size(ty: i64) i64 {
 
 fn ty_align(ty: i64) i64 {
     if (ty & TY_FLAG_SPAN) != 0 { return 8 }
-    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 { return 8 }
+    if (ty & (TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) != 0 { return 8 }
     base := ty & TY_BASE_MASK
     if base == TY_U32X16 || base == TY_U64X8 { return 64 }
     if base >= TY_PTR_BASE { return 8 }
@@ -147,6 +147,37 @@ fn parse_full_type_tag() i64 {
         }
         elem := parse_full_type_tag()
         return (elem & TY_BASE_MASK) | TY_FLAG_VIEW1
+    }
+
+    // `ptr* [@oneshot] ElemType` (8B typed pointer or register-only oneshot capability)
+    if peek_kind() == TOK_IDENT && peek_val() == g[G_SYM_PTR] && tok_kind[g[G_TOK_IDX] + 1] == TOK_STAR {
+        p_line := peek_line()
+        g[G_TOK_IDX] += 2
+        os_flag: i64 = 0
+        if peek_kind() == TOK_AT {
+            g[G_TOK_IDX] += 1
+            if peek_kind() != TOK_IDENT || peek_val() != g[G_SYM_ONESHOT] {
+                die_line("error: only '@oneshot' nature is valid after 'ptr*'", p_line)
+            }
+            g[G_TOK_IDX] += 1
+            os_flag = TY_FLAG_ONESHOT
+        }
+        elem := parse_full_type_tag()
+        if (elem & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF | TY_FLAG_ONESHOT)) != 0 {
+            die_line("error: invalid element type for 'ptr*'", p_line)
+        }
+        return (elem & TY_BASE_MASK) | TY_FLAG_PTR | os_flag
+    }
+
+    // `ref& ElemType` (zero-copy alias to caller variable)
+    if peek_kind() == TOK_IDENT && peek_val() == g[G_SYM_REF] && tok_kind[g[G_TOK_IDX] + 1] == TOK_AMP {
+        r_line := peek_line()
+        g[G_TOK_IDX] += 2
+        elem := parse_full_type_tag()
+        if (elem & (TY_FLAG_SPAN | TY_FLAG_ONESHOT | TY_FLAG_REF)) != 0 {
+            die_line("error: invalid target type for 'ref&'", r_line)
+        }
+        return elem | TY_FLAG_REF
     }
 
     sym := expect_ident()
@@ -262,7 +293,10 @@ fn eval_ts_const_primary() i64 {
             return 8
         }
         ty := parse_full_type_tag()
-        if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) == 0 {
+        if (ty & TY_FLAG_ONESHOT) != 0 {
+            die_cur("error: @oneshot pointer lives strictly in registers and has no memory sizeof/alignof")
+        }
+        if (ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) == 0 {
             base := ty & TY_BASE_MASK
             if base >= TY_STRUCT_BASE && base < TY_PTR_BASE {
                 st_idx := base - TY_STRUCT_BASE
@@ -585,6 +619,9 @@ fn ts_skip_top_rhs() {
             if k == TOK_IDENT && tok_kind[idx + 1] == TOK_COLON2 {
                 break
             }
+            if k == TOK_IDENT && tok_val[idx] == g[G_SYM_STRUCT] && tok_kind[idx + 1] == TOK_IDENT {
+                break
+            }
             if k == TOK_AT {
                 if tok_kind[idx + 2] == TOK_KW && tok_kw[idx + 2] == KW_FN {
                     break
@@ -630,13 +667,51 @@ fn skip_top_colon2_decl() {
     ts_skip_top_rhs()
 }
 
-// Skips any top-level `@space name : <...>` declaration (`@` NOT yet consumed)
+// Skips either `<...>` or `Type[Cap]` space specification
+fn ts_skip_space_spec() {
+    if peek_kind() == TOK_LT {
+        ts_skip_angle_block()
+        return
+    }
+    loop <max: 64 | until: peek_kind() == TOK_LBRACK> {
+        if peek_kind() == TOK_EOF {
+            die_cur("error: parse fault (expected '[' or '<' in space declaration)")
+        }
+        g[G_TOK_IDX] += 1
+    }
+    expect_kind(TOK_LBRACK)
+    bdepth := 1
+    loop <max: 4096 | until: bdepth == 0> {
+        bk := peek_kind()
+        if bk == TOK_EOF {
+            die_cur("error: parse fault (unclosed '[' in space declaration)")
+        }
+        if bk == TOK_LBRACK { bdepth += 1 }
+        if bk == TOK_RBRACK { bdepth -= 1 }
+        g[G_TOK_IDX] += 1
+    }
+}
+
+// Skips any top-level `@space name : <...> | Type[Cap]` declaration (`@` NOT yet consumed)
 fn skip_top_space_decl() {
     expect_kind(TOK_AT)
     g[G_TOK_IDX] += 1
     expect_ident()
     expect_kind(TOK_COLON)
-    ts_skip_angle_block()
+    ts_skip_space_spec()
+}
+
+// Skips any top-level `struct Name [@cell64 | @packed] [<...>] { ... }` declaration
+fn skip_top_struct_decl() {
+    expect_ident() // `struct`
+    expect_ident() // `Name`
+    if peek_kind() == TOK_AT {
+        g[G_TOK_IDX] += 2
+    }
+    if peek_kind() == TOK_LT {
+        ts_skip_angle_block()
+    }
+    ts_skip_brace_block()
 }
 
 fn ts_check_top_unique(sym: i64, line: i64) {
@@ -827,7 +902,7 @@ fn resolve_all_structs() {
             if is_cell64 == 1 {
                 max_align = 64
             }
-            is_packed: i64 = 0
+            is_packed: i64 = ut_pre_packed[ut_idx]
 
             // Optional `<packed>` or `<align: Bytes>`
             if peek_kind() == TOK_LT {
@@ -865,12 +940,48 @@ fn resolve_all_structs() {
                     die_line("error: unimplemented '@cold' split", peek_line())
                 }
 
-                fsym := expect_ident()
+                fline := peek_line()
+                fsym  := expect_ident()
                 expect_kind(TOK_COLON)
-                fty  := parse_full_type_tag()
+                fty   := parse_full_type_tag()
+                if (fty & TY_FLAG_ONESHOT) != 0 {
+                    die_line("error: @oneshot pointer cannot be stored in a struct", fline)
+                }
+                if (fty & TY_FLAG_REF) != 0 {
+                    die_line("error: ref& alias cannot be stored in a struct", fline)
+                }
+
+                arr_cnt: i64 = 0
+                if peek_kind() == TOK_LBRACK {
+                    g[G_TOK_IDX] += 1
+                    arr_start := g[G_TOK_IDX]
+                    bdep := 1
+                    rbr := arr_start
+                    loop <max: 1024 | until: bdep == 0> {
+                        bk := tok_kind[rbr]
+                        if bk == TOK_EOF {
+                            die_line("error: parse fault (unclosed '[' in struct array field)", fline)
+                        }
+                        if bk == TOK_LBRACK { bdep += 1 }
+                        if bk == TOK_RBRACK {
+                            bdep -= 1
+                            if bdep == 0 { break }
+                        }
+                        rbr += 1
+                    }
+                    arr_cnt = try_eval_const_fenced(arr_start, rbr)
+                    if g[G_CST_UNRES] != 0 {
+                        deferred = 1
+                        break
+                    }
+                    if arr_cnt < 1 {
+                        die_line("error: struct array field length must be >= 1", fline)
+                    }
+                    g[G_TOK_IDX] = rbr + 1
+                }
 
                 // Defer if an embedded by-value struct field has not resolved yet
-                if (fty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) == 0 {
+                if (fty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR | TY_FLAG_REF)) == 0 {
                     fbase := fty & TY_BASE_MASK
                     if fbase >= TY_STRUCT_BASE && fbase < TY_PTR_BASE {
                         dep_idx := fbase - TY_STRUCT_BASE
@@ -881,7 +992,11 @@ fn resolve_all_structs() {
                     }
                 }
 
-                fsz := ts_type_size(fty)
+                elem_sz := ts_type_size(fty)
+                fsz     := elem_sz
+                if arr_cnt > 0 {
+                    fsz = elem_sz * arr_cnt
+                }
                 fal := ty_align(fty)
                 if is_packed == 0 {
                     if fal > max_align {
@@ -891,11 +1006,12 @@ fn resolve_all_structs() {
                 }
 
                 fi := g[G_FLD_CNT]
-                fld_sym[fi]  = fsym
-                fld_ty[fi]   = fty
-                fld_off[fi]  = cur_off
-                fld_sz[fi]   = fsz
-                g[G_FLD_CNT] = fi + 1
+                fld_sym[fi]     = fsym
+                fld_ty[fi]      = fty
+                fld_off[fi]     = cur_off
+                fld_sz[fi]      = fsz
+                fld_arr_cnt[fi] = arr_cnt
+                g[G_FLD_CNT]    = fi + 1
 
                 cur_off += fsz
                 fcnt += 1
@@ -913,8 +1029,14 @@ fn resolve_all_structs() {
             expect_kind(TOK_RBRACE)
 
             if is_cell64 == 1 {
-                if cur_off > 64 {
-                    die_line("error: @cell64 layout exceeds 64-byte hardware cacheline", ut_line[ut_idx])
+                if ut_strict64[ut_idx] == 1 {
+                    if cur_off != 64 {
+                        die_line("error: struct @cell64 must be exactly 64 bytes", ut_line[ut_idx])
+                    }
+                } else {
+                    if cur_off > 64 {
+                        die_line("error: @cell64 layout exceeds 64-byte hardware cacheline", ut_line[ut_idx])
+                    }
                 }
                 cur_off   = 64
                 max_align = 64
@@ -1026,14 +1148,94 @@ fn resolve_all_spaces() {
         g[G_TOK_IDX] = sp_tok[si]
         sline: i64   = sp_line[si]
         sk: i64      = sp_kind[si]
+
+        ety: i64 = TY_U8
+        esz: i64 = 1
+        cap: i64 = 0
+
+        if peek_kind() != TOK_LT {
+            // Concise `Type[Cap]` bracket form (`@slab vault_arena : u8[262144]`, `@ring io_wheel : IoTicket[16]`)
+            if sk == SKIND_PORT {
+                die_line("error: @port requires <u8|u16|u32 | port_num>", sline)
+            }
+            ety = parse_full_type_tag()
+            if (ety & (TY_FLAG_ONESHOT | TY_FLAG_REF | TY_FLAG_SPAN)) != 0 {
+                die_line("error: invalid element type for topological space", sline)
+            }
+            esz = ts_type_size(ety)
+            eal := ty_align(ety)
+            expect_kind(TOK_LBRACK)
+            c_start := g[G_TOK_IDX]
+            bdep := 1
+            rbr := c_start
+            loop <max: 4096 | until: bdep == 0> {
+                bk := tok_kind[rbr]
+                if bk == TOK_EOF {
+                    die_line("error: parse fault (unclosed '[' in space declaration)", sline)
+                }
+                if bk == TOK_LBRACK { bdep += 1 }
+                if bk == TOK_RBRACK {
+                    bdep -= 1
+                    if bdep == 0 { break }
+                }
+                rbr += 1
+            }
+            saved_rk := tok_kind[rbr]
+            tok_kind[rbr] = TOK_EOF
+            g[G_TOK_IDX]  = c_start
+            cap = eval_ts_const_expr(1)
+            tok_kind[rbr] = saved_rk
+            if g[G_TOK_IDX] != rbr {
+                die_line("error: parse fault (trailing tokens in space capacity)", sline)
+            }
+            g[G_TOK_IDX] = rbr + 1
+
+            if sk == SKIND_SLAB {
+                if cap <= 0 { die_line("error: parse fault (@slab cap must be > 0)", sline) }
+            } else {
+                if sk == SKIND_ARENA {
+                    if ety != TY_U8 || cap <= 0 {
+                        die_line("error: @arena requires u8[cap] with cap > 0", sline)
+                    }
+                } else {
+                    if sk == SKIND_CAPSULE {
+                        if ety != TY_U8 || cap < 4096 || (cap & 4095) != 0 {
+                            die_line("error: @capsule requires 4KiB-aligned u8[cap] (and --target=capsule forbids mutable @slab/@ring)", sline)
+                        }
+                    } else {
+                        if sk == SKIND_RING {
+                            if esz != 64 || eal != 64 || cap < 2 || (cap & (cap - 1)) != 0 {
+                                die_line("error: @ring/@dma_queue requires valid aligned element size and power-of-2 cap", sline)
+                            }
+                        } else {
+                            if (esz != 16 && esz != 32 && esz != 64) || cap < 2 || (cap & (cap - 1)) != 0 {
+                                die_line("error: @ring/@dma_queue requires valid aligned element size and power-of-2 cap", sline)
+                            }
+                        }
+                    }
+                }
+            }
+
+            aligned_off_b := (g[G_BSS_OFF] + 4095) & (~4095)
+            sp_elem_ty[si]  = ety
+            sp_elem_sz[si]  = esz
+            sp_cap[si]      = cap
+            sp_bss_off[si]  = aligned_off_b
+            sp_vaddr[si]    = ELF_DATA_BASE + aligned_off_b
+            sp_port_num[si] = 0
+            sp_align[si]    = 4096
+            g[G_BSS_OFF]    = aligned_off_b + cap * esz
+            continue
+        }
+
         expect_kind(TOK_LT)
 
         if sk == SKIND_PORT {
-            ety := parse_full_type_tag()
+            ety = parse_full_type_tag()
             if ety != TY_U8 && ety != TY_U16 && ety != TY_U32 {
                 die_line("error: invalid @port width or port number", sline)
             }
-            esz := ts_type_size(ety)
+            esz = ts_type_size(ety)
             expect_kind(TOK_PIPE)
             pnum := parse_const_lens_expr()
             if pnum < 0 || pnum > 0xFFFF {
@@ -1049,10 +1251,6 @@ fn resolve_all_spaces() {
             sp_align[si]    = 0
             continue
         }
-
-        ety: i64 = TY_U8
-        esz: i64 = 1
-        cap: i64 = 0
 
         if sk == SKIND_SLAB {
             ety = parse_full_type_tag()
@@ -1156,6 +1354,9 @@ fn prescan_one_fn_sig(fn_attr: i64) {
             expect_ident()
             expect_kind(TOK_COLON)
             pty := parse_full_type_tag()
+            if (pty & TY_FLAG_ONESHOT) != 0 {
+                die_line("error: @oneshot pointer cannot cross function parameter boundaries", fline)
+            }
             if fn_attr != 0 && is_ty_vec(pty) == 1 {
                 die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", fline)
             }
@@ -1178,6 +1379,9 @@ fn prescan_one_fn_sig(fn_attr: i64) {
     if peek_kind() != TOK_LBRACE && peek_kind() != TOK_FAT_ARROW {
         rty = parse_full_type_tag()
     }
+    if (rty & (TY_FLAG_ONESHOT | TY_FLAG_REF)) != 0 {
+        die_line("error: @oneshot and ref& cannot be returned from a function", fline)
+    }
     if fn_attr != 0 && is_ty_vec(rty) == 1 {
         die_line("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call", fline)
     }
@@ -1195,6 +1399,10 @@ fn prescan_all_fn_sigs() {
     g[G_TOK_IDX] = 0
     loop <max: 262144 | until: peek_kind() == TOK_EOF> {
         k := peek_kind()
+        if k == TOK_IDENT && peek_val() == g[G_SYM_STRUCT] && tok_kind[g[G_TOK_IDX] + 1] == TOK_IDENT {
+            skip_top_struct_decl()
+            continue
+        }
         if k == TOK_IDENT && tok_kind[g[G_TOK_IDX] + 1] == TOK_COLON2 {
             skip_top_colon2_decl()
             continue
@@ -1338,7 +1546,50 @@ fn prescan_all() {
             sp_line[si] = sline
             g[G_SP_CNT] = si + 1
 
-            ts_skip_angle_block()
+            ts_skip_space_spec()
+            continue
+        }
+
+        if k == TOK_IDENT && peek_val() == g[G_SYM_STRUCT] && tok_kind[g[G_TOK_IDX] + 1] == TOK_IDENT {
+            g[G_TOK_IDX] += 1 // consume `struct`
+            dline := peek_line()
+            dsym  := expect_ident()
+            ts_check_top_unique(dsym, dline)
+
+            ut_idx := g[G_UT_CNT]
+            ut_sym[ut_idx]        = dsym
+            ut_kind[ut_idx]       = UKIND_STRUCT
+            ut_size[ut_idx]       = 0
+            ut_strict64[ut_idx]   = 0
+            ut_pre_packed[ut_idx] = 0
+            ut_line[ut_idx]       = dline
+
+            if peek_kind() == TOK_AT {
+                g[G_TOK_IDX] += 1
+                ak := peek_kind()
+                if (ak == TOK_KW && peek_kw() == KW_CELL64) || (ak == TOK_IDENT && peek_val() == g[G_SYM_CELL64]) {
+                    g[G_TOK_IDX] += 1
+                    ut_kind[ut_idx]     = UKIND_CELL64
+                    ut_strict64[ut_idx] = 1
+                } else {
+                    if ak == TOK_IDENT && peek_val() == g[G_SYM_PACKED] {
+                        g[G_TOK_IDX] += 1
+                        ut_pre_packed[ut_idx] = 1
+                    } else {
+                        if (ak == TOK_KW && peek_kw() == KW_COLD) || (ak == TOK_IDENT && peek_val() == g[G_SYM_COLD]) {
+                            die_line("error: unimplemented '@cold' split", dline)
+                        }
+                        die_line("error: unknown '@' nature on struct", dline)
+                    }
+                }
+            }
+
+            ut_tok[ut_idx] = g[G_TOK_IDX]
+            g[G_UT_CNT]    = ut_idx + 1
+            if peek_kind() == TOK_LT {
+                ts_skip_angle_block()
+            }
+            ts_skip_brace_block()
             continue
         }
 
@@ -1353,12 +1604,14 @@ fn prescan_all() {
             // 1. Plain `Name :: { ... }` struct
             if rk == TOK_LBRACE {
                 ut_idx := g[G_UT_CNT]
-                ut_sym[ut_idx]  = dsym
-                ut_kind[ut_idx] = UKIND_STRUCT
-                ut_size[ut_idx] = 0
-                ut_tok[ut_idx]  = g[G_TOK_IDX]
-                ut_line[ut_idx] = dline
-                g[G_UT_CNT]     = ut_idx + 1
+                ut_sym[ut_idx]        = dsym
+                ut_kind[ut_idx]       = UKIND_STRUCT
+                ut_size[ut_idx]       = 0
+                ut_strict64[ut_idx]   = 0
+                ut_pre_packed[ut_idx] = 0
+                ut_tok[ut_idx]        = g[G_TOK_IDX]
+                ut_line[ut_idx]       = dline
+                g[G_UT_CNT]           = ut_idx + 1
                 ts_skip_brace_block()
                 continue
             }
@@ -1369,12 +1622,14 @@ fn prescan_all() {
                 if nk == TOK_KW && tok_kw[g[G_TOK_IDX] + 1] == KW_CELL64 {
                     g[G_TOK_IDX] += 2
                     ut_idx := g[G_UT_CNT]
-                    ut_sym[ut_idx]  = dsym
-                    ut_kind[ut_idx] = UKIND_CELL64
-                    ut_size[ut_idx] = 0
-                    ut_tok[ut_idx]  = g[G_TOK_IDX]
-                    ut_line[ut_idx] = dline
-                    g[G_UT_CNT]     = ut_idx + 1
+                    ut_sym[ut_idx]        = dsym
+                    ut_kind[ut_idx]       = UKIND_CELL64
+                    ut_size[ut_idx]       = 0
+                    ut_strict64[ut_idx]   = 0
+                    ut_pre_packed[ut_idx] = 0
+                    ut_tok[ut_idx]        = g[G_TOK_IDX]
+                    ut_line[ut_idx]       = dline
+                    g[G_UT_CNT]           = ut_idx + 1
                     ts_skip_brace_block()
                     continue
                 }
@@ -1399,10 +1654,12 @@ fn prescan_all() {
                 lt_tok := g[G_TOK_IDX]
                 ts_skip_angle_block()
                 ut_idx := g[G_UT_CNT]
-                ut_sym[ut_idx]  = dsym
-                ut_size[ut_idx] = 0
-                ut_tok[ut_idx]  = lt_tok
-                ut_line[ut_idx] = dline
+                ut_sym[ut_idx]        = dsym
+                ut_size[ut_idx]       = 0
+                ut_strict64[ut_idx]   = 0
+                ut_pre_packed[ut_idx] = 0
+                ut_tok[ut_idx]        = lt_tok
+                ut_line[ut_idx]       = dline
                 if peek_kind() == TOK_LBRACE {
                     ut_kind[ut_idx] = UKIND_STRUCT
                     g[G_UT_CNT]     = ut_idx + 1

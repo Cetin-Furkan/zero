@@ -198,6 +198,16 @@ fn lexer_init() {
     g[G_SYM_VEC_STREAM]    = sym_intern_str("vec_stream")
     g[G_SYM_VEC_SUM32]     = sym_intern_str("vec_sum32")
     g[G_SYM_VEC_SUM64]     = sym_intern_str("vec_sum64")
+
+    // Stage-1 Next-Gen `Zero` Spine Contextual Symbols
+    g[G_SYM_REF]           = sym_intern_str("ref")
+    g[G_SYM_STRUCT]        = sym_intern_str("struct")
+    g[G_SYM_ONESHOT]       = sym_intern_str("oneshot")
+    g[G_SYM_WHEN]          = sym_intern_str("when")
+    g[G_SYM_WITH]          = sym_intern_str("with")
+    g[G_SYM_WHILE]         = sym_intern_str("while")
+    g[G_SYM_ZF]            = sym_intern_str("ZF")
+    g[G_SYM_CF]            = sym_intern_str("CF")
 }
 
 // Canonicalizes `path_scratch[0..raw_len)` into `canon_buf[0..out_len)` (NUL-terminated)
@@ -477,7 +487,11 @@ fn tokenize_range(start_off: i64, end_off: i64, allow_imports: i64, dir_pool_off
             }
 
             kw: i64 = sym_kw[sym_id]
-            if kw != 0 {
+            prev_is_at := 0
+            if g[G_TOK_CNT] > 0 && tok_kind[g[G_TOK_CNT] - 1] == TOK_AT {
+                prev_is_at = 1
+            }
+            if kw != 0 && (kw < KW_SLAB || prev_is_at == 1) {
                 push_tok(TOK_KW, kw, line, sym_id, 0)
             } else {
                 push_tok(TOK_IDENT, 0, line, sym_id, 0)
@@ -719,7 +733,41 @@ fn tokenize_range(start_off: i64, end_off: i64, allow_imports: i64, dir_pool_off
         if c == '~' { push_tok(TOK_TILDE,   0, line, 0, 0)  pos += 1  continue }
         if c == '!' { push_tok(TOK_BANG,    0, line, 0, 0)  pos += 1  continue }
         if c == '?' { push_tok(TOK_QMARK,   0, line, 0, 0)  pos += 1  continue }
-        if c == ';' { push_tok(TOK_SEMI,    0, line, 0, 0)  pos += 1  continue }
+        if c == ';' {
+            // Semicolon Law: ';' is ONLY legal inline between a stage and its flag/loop consumer.
+            // A ';' at the end of a line (before '\n', '//', '}', or EOF) is a hard parse error.
+            sp := pos + 1
+            loop <max: 65536 | until: sp >= end_off> {
+                sc: u8 = src_buf[sp]
+                if sc == ' ' || sc == '\t' || sc == '\r' {
+                    sp += 1
+                    continue
+                }
+                if sc == '/' && sp + 1 < end_off && src_buf[sp + 1] == '*' {
+                    sp += 2
+                    has_nl := 0
+                    loop <max: 65536 | until: sp >= end_off> {
+                        if src_buf[sp] == '\n' { has_nl = 1  break }
+                        if sp + 1 < end_off && src_buf[sp] == '*' && src_buf[sp + 1] == '/' {
+                            sp += 2
+                            break
+                        }
+                        sp += 1
+                    }
+                    if has_nl == 1 {
+                        die_line("error: ';' at end of line is forbidden (';' is only for inline flag/stage handoff)", line)
+                    }
+                    continue
+                }
+                break
+            }
+            if sp >= end_off || src_buf[sp] == '\n' || src_buf[sp] == '}' || (src_buf[sp] == '/' && sp + 1 < end_off && src_buf[sp + 1] == '/') {
+                die_line("error: ';' at end of line is forbidden (';' is only for inline flag/stage handoff)", line)
+            }
+            push_tok(TOK_SEMI, 0, line, 0, 0)
+            pos += 1
+            continue
+        }
         if c == '+' { push_tok(TOK_PLUS,    0, line, 0, 0)  pos += 1  continue }
         if c == '-' { push_tok(TOK_MINUS,   0, line, 0, 0)  pos += 1  continue }
         if c == '*' { push_tok(TOK_STAR,    0, line, 0, 0)  pos += 1  continue }

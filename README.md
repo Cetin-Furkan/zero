@@ -5,8 +5,8 @@
 > [!IMPORTANT]
 > **Core Engineering Honesty Rule:**
 > Neither the compiler nor the documentation ever claims a construct exists before it lowers to verified machine instructions. Any unlowered syntax, attribute, memory space, or loop lens is a **hard compile-time error** tested by negative probes.
-> - **Implemented & Verified Today (`build/zero2` == `build/zero3`, `78 PASS / 0 FAIL`):** Documented in Sections 1–5 below, `ZERO_OS_ARCHITECTURE.md`, and `CHANGES_AND_VERIFICATION_REPORT.md`.
-> - **Frozen Next-Generation Specification (Stage 1 Language Spine + Stage 2 `ZeroFS` `ZLEDGER1`):** Documented in full engineer-to-engineer detail in **`ZERO_NEXT_GEN_SPEC.md`**.
+> - **Implemented & Verified Today (`build/zero2` == `build/zero3` at `627,661 B`, `97 PASS / 0 FAIL`):** Tracks 1–3 + **Stage 1 Next-Generation `Zero` Language Spine** (`ptr*`, `ref&`, `ptr* @oneshot`, `;` flag-handoff, `mask<...>`, `when` / `with when` / `when while` / `when for`, `@ring(s..n)`, `@bits`), documented below, in `ZERO_NEXT_GEN_SPEC.md` §2, `ZERO_OS_ARCHITECTURE.md`, and `CHANGES_AND_VERIFICATION_REPORT.md`.
+> - **Frozen Specification for Next Stage (Stage 2 `ZeroFS` `ZLEDGER1` + Hardware Domains):** Documented in full engineer-to-engineer detail in **`ZERO_NEXT_GEN_SPEC.md` §3**.
 
 ---
 
@@ -15,9 +15,9 @@
 | Document | Scope & Audience |
 | :--- | :--- |
 | **`README.md`** *(this file)* | Repository map, self-hosted `compiler/*.zr` internals, complete **Implemented Construct & Opcode Matrix**, and build/test/USB instructions. |
-| **`ZERO_NEXT_GEN_SPEC.md`** | **Frozen Specification for Stages 1 & 2:** `ptr*` / `ref&`, `ptr* @oneshot` register capability & `xor` wipe, `;` flag-handoff law, `mask<...>` zero-`cmp` `RFLAGS` fusion (`bextr`/`bzhi`/`bt`/`test`/volatile spin), `when` / `with when` / `when while` / `when for`, `@ring` / `@bits`, the 135-line canonical `.zr` reference program, non-POSIX hardware domains, and **`ZeroFS` (`ZLEDGER1`)** CoW storage. |
+| **`ZERO_NEXT_GEN_SPEC.md`** | **Stage 1 Implemented Spine (§2) & Stage 2 Frozen `ZeroFS` Spec (§3):** `ptr*` / `ref&`, `ptr* @oneshot` register capability & `xor` wipe, `;` flag-handoff law, `mask<...>` zero-`cmp` `RFLAGS` fusion (`bextr`/`bt`/`test`/volatile spin), `when` / `with when` / `when while` / `when for`, `@ring` / `@bits`, the 135-line canonical `.zr` reference program, non-POSIX hardware domains, and **`ZeroFS` (`ZLEDGER1`)** CoW storage. |
 | **`ZERO_OS_ARCHITECTURE.md`** | Deep Ring-0 kernel reference: UEFI `PE32+` boot prelude, 4-level `W^X` `CR3` paging, `<1 MiB` `x2APIC` `INIT-SIPI` SMP wake, Reactor ABI (`r12..r15` + `gs:0`), Zero-XSAVE Ring-0 `AVX-512` proof, `MOVDIR64B`/`MWAIT` fabric, `IRQ1` keyboard, and NVMe `@dma_queue` + `.zcap` capsules. |
-| **`CHANGES_AND_VERIFICATION_REPORT.md`** | Exact artifact byte sizes, `zero2 == zero3` fixed-point proof, `objdump` disassembly gates, 54 negative compile-rejection probes, multi-core telemetry (`C=4, 2, 1`), and GPT+FAT32 USB verification. |
+| **`CHANGES_AND_VERIFICATION_REPORT.md`** | Exact artifact byte sizes, `zero2 == zero3` fixed-point proof (`627,661 B`), `objdump` disassembly gates, 70 negative compile-rejection probes, multi-core telemetry (`C=4, 2, 1`), and GPT+FAT32 USB verification. |
 
 ---
 
@@ -26,13 +26,13 @@
 ```mermaid
 flowchart LR
     SEED["bootstrap/seed0.asm\n(Stage-0 NASM Seed Only)"] -->|"nasm -f bin"| Z0["build/zero0\n48,112 B W^X ELF64"]
-    Z0 -->|"compiles compiler/*.zr"| Z1["build/zero1\n549,308 B W^X ELF64"]
-    Z1 -->|"compiles compiler/*.zr"| Z2["build/zero2\n508,289 B W^X ELF64"]
-    Z2 -->|"self-reproduces\ncmp == 0 bytes diff!"| Z3["build/zero3\n508,289 B Fixed Point"]
+    Z0 -->|"compiles compiler/*.zr"| Z1["build/zero1\n680,737 B W^X ELF64"]
+    Z1 -->|"compiles compiler/*.zr"| Z2["build/zero2\n627,661 B W^X ELF64"]
+    Z2 -->|"self-reproduces\ncmp == 0 bytes diff!"| Z3["build/zero3\n627,661 B Fixed Point"]
 
-    Z2 -->|"default target"| ELF["Linux Static ELF64\nPhdr[0] RX + Phdr[1] RW\n(8 Golden Suites)"]
+    Z2 -->|"default target"| ELF["Linux Static ELF64\nPhdr[0] RX + Phdr[1] RW\n(9 Golden Suites)"]
     Z2 -->|"--target=efi-os"| EFI["UEFI Bare-Metal PE32+\ngate1_os_z2.efi (99,328 B)\ngate1_laptop_z2.efi (95,232 B)"]
-    Z2 -->|"--target=capsule"| CAP["Position-Independent .zcap\nZEROZCAP + Hardware CRC32C\n(3 NVMe Capsule Extents)"]
+    Z2 -->|"--target=capsule"| CAP["Position-Independent .zcap\nZEROZCAP + Hardware CRC32C\n(4 Verified Capsule Extents)"]
     EFI -->|"scripts/build_usb_image.py"| USB["build/zeroos_usb.img\n64 MiB GPT + FAT32 ESP\n/EFI/BOOT/BOOTX64.EFI"]
 ```
 
@@ -52,15 +52,15 @@ flowchart LR
 ├── bootstrap/                         # Stage-0 x86-64 NASM seed (`zero0`) — ONLY assembly in the repo
 │   ├── seed0.asm                      # W^X ELF64 entry + CLI (`--lex`, `--target=efi-os`, `--target=capsule`)
 │   └── *.inc                          # Stage-0 bootstrap parser/emitter used solely to build `zero1`
-├── compiler/                          # 100% Pure `.zr` Self-Hosted Compiler (11 modules, ~382 KB source)
-│   ├── zero1.zr                       # Prescan, statement/lvalue compiler, multi-pass driver & CLI
-│   ├── defs.zr                        # `TOK_*`/`KW_*`/`TY_*`/`SKIND_*` constants, static `@slab` arenas, host syscalls
-│   ├── lexer.zr                       # Tokenizer + recursive canonical `use "rel/path.zr"` module expander
-│   ├── types_spaces.zr                # `::` fixpoint solver, BitPacks, Structs, `@cell64`, `@ptr`, `@slab`/`@ring`/`@capsule`
-│   ├── parser_expr.zr                 # Pratt/precedence expressions, pipelines `|>`, bit-slices `[hi:lo]`, ZMM ALU
-│   ├── intrinsics_ptr.zr              # Silicon/Ring-0/Reactor intrinsics, `@view`/`@mmio`/`@port`/`@stream`/`@atomic`, `@vec_*`
-│   ├── loops_match.zr                 # `for`/`loop` lenses (`<tile>`, `<simd:8|16>`, `<bits>`, `<unroll>`), `match`, `publish`, `wait`
-│   ├── emit_x64.zr                    # Native x86-64 encoder (64B RSP invariant, `[gs:0]` unwind, `<tile>` + `vzeroupper`)
+├── compiler/                          # 100% Pure `.zr` Self-Hosted Compiler (11 modules, ~471 KB source)
+│   ├── zero1.zr                       # Prescan, statement/lvalue/`@oneshot`/`RFLAGS` driver & CLI
+│   ├── defs.zr                        # `TOK_*`/`KW_*`/`TY_*`/`FLAG_*` constants, static `@slab` arenas, host syscalls
+│   ├── lexer.zr                       # Tokenizer, line-end `;` rejection, recursive canonical `use "rel/path.zr"`
+│   ├── types_spaces.zr                # `::` fixpoint solver, `ptr*`/`ref&`/`@oneshot`, `struct @cell64`, `T[N]`, spaces
+│   ├── parser_expr.zr                 # Pratt expressions, `mask<...>`, `ptr*` cast/index/arith, `ref&`, ZMM ALU
+│   ├── intrinsics_ptr.zr              # `mask<...>` BMI1/BT/spin lowering, `@oneshot` verifiers, `ref&` lvalue binder
+│   ├── loops_match.zr                 # `when` / `with when` / `when while` / `when for`, `@ring(s..n)`, `@bits`, `<tile>`, `<simd>`
+│   ├── emit_x64.zr                    # Native x86-64 encoder (64B RSP, `bextr`/`bt`, `@oneshot` `mov`+`xor` wipes)
 │   ├── evex_zmm.zr                    # 4-byte `EVEX` (`0x62`) encoder (`zmm0..7`, `{k1}{z}`/`{k1}`, `vmovntdq`, reductions)
 │   ├── efi_pe32.zr                    # Standalone PE32+ UEFI writer (boot prelude, `<1M` AP bridge, 256 ISR stubs)
 │   └── containers.zr                  # 2-segment W^X ELF64 & CRC32C-signed `ZEROZCAP` (`.zcap`) binary writers
@@ -83,9 +83,9 @@ flowchart LR
 ├── scripts/
 │   └── build_usb_image.py             # Generates 64 MiB protective-MBR + GPT + FAT32 USB stick (`BOOTX64.EFI`)
 └── tests/
-    ├── run_tests.sh                   # 7-stage automated verifier (`78 PASS, 0 FAIL` in ~13s under KVM)
+    ├── run_tests.sh                   # 7-stage automated verifier (`97 PASS, 0 FAIL` in ~14s under KVM)
     ├── lib/                           # Diamond-import multi-file `use "lib/..."` modules
-    └── *.zr / *.expected              # `first`, `step3_compute`, `step4_systems`, `phase0..4` golden suites
+    └── *.zr / *.expected              # `first`, `step3_compute`, `step4_systems`, `phase0..5` golden suites
 ```
 
 ---
@@ -105,7 +105,7 @@ Engineers modifying `compiler/*.zr` should understand six core invariants of the
    - Order-independent `NAME :: expr` constants, `<field: uN | ...>` bitpacks, structs, `@cell64`, custom `@ptr` lenses, and `@sizeof(T)` / `@alignof(T)` queries iterate to a fixed point. Unresolved cycles or duplicate names fail compilation deterministically.
 4. **Unified 32-Bit Type Tag Encoding (`compiler/defs.zr`):**
    - Bits `[11:0]` (`TY_BASE_MASK = 0x0FFF`): primitive scalars (`TY_I64=1 .. TY_U8=8`), 512-bit vectors (`TY_U32X16=9`, `TY_U64X8=10`), `TY_BP_BASE + idx` (`0x100+`), `TY_STRUCT_BASE + idx` (`0x300+`), `TY_PTR_BASE + idx` (`0x500+`).
-   - Upper modifier flags: `TY_FLAG_VIEW1` (`0x1000` 8B single-object pointer), `TY_FLAG_SPAN` (`0x2000` 16B `{ptr, len}` slice), `TY_FLAG_MMIO` (`0x4000` volatile uncached aperture), `TY_FLAG_STREAM` (`0x8000` non-temporal `movnti`/`vmovntdq`), `TY_FLAG_ATOMIC` (`0x10000` `lock` operations).
+   - Upper modifier flags: `TY_FLAG_VIEW1` (`0x1000` 8B single-object pointer), `TY_FLAG_SPAN` (`0x2000` 16B `{ptr, len}` slice), `TY_FLAG_MMIO` (`0x4000` volatile uncached aperture), `TY_FLAG_STREAM` (`0x8000` non-temporal `movnti`/`vmovntdq`), `TY_FLAG_ATOMIC` (`0x10000` `lock` operations), `TY_FLAG_PTR` (`0x20000` raw `ptr* T`), `TY_FLAG_ONESHOT` (`0x40000` ephemeral GPR-only `ptr* @oneshot T`), and `TY_FLAG_REF` (`0x80000` non-null `ref& T` lvalue alias).
 5. **Inductive 64-Byte Stack Alignment (`RSP & 63 == 0` in `compiler/emit_x64.zr`):**
    - Every function prologue reserves `frame_bytes = 64 * k - 16` (`48`, `112`, `176`, … bytes after `8B call rip + 8B push rbp`), keeping `RSP` **64-byte cacheline aligned** at every call site and `<tile>` boundary without dynamic stack realignment.
    - Local scalars within `[-128, +127]` of `rbp` encode with compact 1-byte `disp8`; `EVEX` 512-bit spills use compressed `disp8 * 64` addressing.
@@ -119,7 +119,7 @@ Engineers modifying `compiler/*.zr` should understand six core invariants of the
 | Category / Construct | Status | Exact Machine Lowering & Enforced Invariants |
 | :--- | :---: | :--- |
 | **2-Segment `W^X` `ELF64`, `PE32+`, & `.zcap` Containers** | **Implemented** | Zero `RWX` segments/sections across host `ELF64`, UEFI `PE32+` (`--target=efi-os`), and CRC32C-signed position-independent `.zcap` (`--target=capsule`). |
-| **100% Self-Hosted Fixed Point (`zero2 == zero3`)** | **Implemented** | `508,289 B` byte-identical fixed point (`cmp -s build/zero2 build/zero3`). With `build/zero0` deleted, `zero2` rebuilds itself, all tests, all capsules, and `ZeroOS` byte-for-byte. |
+| **100% Self-Hosted Fixed Point (`zero2 == zero3`)** | **Implemented** | `627,661 B` byte-identical fixed point (`cmp -s build/zero2 build/zero3`). With `build/zero0` deleted, `zero2` rebuilds itself, all tests, all capsules, and `ZeroOS` byte-for-byte. |
 | **Scalars, Unsigned Rules, Bit-Slices `[hi:lo]`, Rotates & `\|>`** | **Implemented** | `i8..i64`, `u8..u64`, `bit`, `bool`, `mask64`; unsigned `shr`/`div`/`setb..seta`; div-by-zero `fail 1`; inline bitfield extract `x[hi:lo]` & RMW `lval[hi:lo] = v`; `<<<`/`>>>` (`rol`/`ror`); `x \|> f(a)` pipelines; `fn f() T => expr`; comptime dead-branch `if` elimination (`qemu_debug :: 0`). |
 | **BitPacks `<a: u32 \| ...>`, Structs `Name :: { ... }`, `@Type`** | **Implemented** | Exact 8/16/32/64-bit packed integers; natural/`<packed>`/`<align: 64B>`/`@cell64` structs; `Struct{...}` literals; `rep movsb` copy; non-null `@Type` pointer parameters (`fail 3` on null). |
 | **Spaces (`@slab`, `@arena`, `@capsule`, `@ring`, `@dma_queue`, `@port`)** | **Implemented** | `@slab`/`@arena`/`@capsule` emit unsigned bounds check `idx < cap` (`fail 2`); `@ring`/`@dma_queue` wrap `(idx & (cap - 1))` (`4 KiB` aligned for DMA); `@port` emits direct `in`/`out`. `--target=capsule` rejects mutable `.bss` spaces. |
@@ -129,7 +129,7 @@ Engineers modifying `compiler/*.zr` should understand six core invariants of the
 | **Reactor ABI (`r12..r15`, `gs:0`), `publish`, `wait`, `<tile>`, `@isr`** | **Implemented** | `rdi, rsi, rdx, r10, r8, r9`; pinned `r12..r15`; `[gs:0]` `fail`/`recover` unwind; `publish` $\rightarrow$ `movdir64b`; `@movdiri`; race-free `wait` $\rightarrow$ `monitor` + recheck + `mwait`; `<tile>` unwind + `vzeroupper`; GPR-only `@isr`/`@isr_ok`. |
 | **512-Bit Ring-0 `AVX-512` (`u32x16`, `u64x8`, `<simd: 8\|16>`)** | **Implemented** | Full ZMM ALU, `@vec_splat`, `@vec_iota`, `{k1}{z}` masked `@vec_load`, `{k1}` masked `@vec_store`, `@vec_stream` (`vmovntdq`), 64b-safe `@vec_sum`, `<simd>` loops with `{k1}` tails, enforced inside `<tile>` on Ring-0 targets. |
 | **Bare-Metal `ZeroOS`: `W^X`, `x2APIC` SMP, NVMe `@capsule`s, `IRQ1` Deck & USB** | **Implemented** | 4-core Q35+KVM+OVMF+NVMe boot, 3 CRC32C-verified W^X-sealed `.zcap` extents dispatched across workers (`CAP1=2337`, `CAP2=1207754`, `CAP3=35277270`), tickless `IRQ1`/`MWAIT` Obsidian Command Deck, and `build/zeroos_usb.img` GPT+FAT32 boot stick. |
-| **Stage 1: Next-Gen Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `;` flag-handoff, `mask<...>`, `when` / `with when` / `when while` / `when for`, `@ring(s..n)`, `@bits`)** | **Frozen Spec (`ZERO_NEXT_GEN_SPEC.md`)** | Specified in `ZERO_NEXT_GEN_SPEC.md` §2 — next implementation stage in `compiler/*.zr`. |
+| **Stage 1: Next-Gen Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `;` flag-handoff, `mask<...>`, `when` / `with when` / `when while` / `when for`, `@ring(s..n)`, `@bits`)** | **Implemented** | Raw 8B `ptr* T`, zero-sigil caller `ref& T`, zero-spill GPR-only `ptr* @oneshot T` (`[r10, r9, rsi, rdi]` + immediate `xor` wipes), line-end `;` parse error, zero-`cmp` `mask<...>` (`bextr`, `bt`, `test`, 3-part `pause`+`dec rcx` spin), `when`/`with when`/`when while`/`when for`, `@ring(s..n)`, and `tzcnt`+`blsr` `@bits` (`tests/phase5_nextgen_spine.zr` + `cap_spine_probe.zcap`). |
 | **Stage 2: Non-POSIX Hardware Domains & `ZeroFS` (`ZLEDGER1`) CoW Ledger** | **Frozen Spec (`ZERO_NEXT_GEN_SPEC.md`)** | Specified in `ZERO_NEXT_GEN_SPEC.md` §3 — 2 MiB generational buckets, Eytzinger `@crc32c` B-tree, `000..111` adaptive pieces, seekable `128b XMM` `AES-NI`/`SHA-NI` lock, and `ZLEDGER1` magic write guard. |
 | **`<tile: Size>` Cache-Blocking, `@cold` Splitting, `Iris Xe` `CCS0` GPU Walker** | **Future Target (Rejected Today)** | Explicitly rejected at compile time (or unscheduled until Gate 4) per the Honesty Rule. |
 
@@ -140,7 +140,7 @@ Engineers modifying `compiler/*.zr` should understand six core invariants of the
 ### Core Commands
 
 ```bash
-# 1. Full clean bootstrap + 7-stage verification suite (~13 seconds with KVM; 78 PASS / 0 FAIL)
+# 1. Full clean bootstrap + 7-stage verification suite (~14 seconds with KVM; 97 PASS / 0 FAIL)
 make clean && make test
 
 # 2. Build physical laptop 64 MiB GPT + FAT32 bootable USB image (qemu_debug :: 0, zero 0xE9 I/O)
@@ -152,11 +152,11 @@ make qemu
 
 ### What `make test` (`tests/run_tests.sh`) Verifies Automatically
 
-1. **Stage 1 (Self-Hosting & `W^X`):** Builds `zero0 -> zero1 -> zero2 -> zero3`, verifies `cmp -s zero2 zero3` (`0` diff), checks `readelf -lW` for zero `RWE` segments, and tests `--lex`.
-2. **Stage 2 (8 Golden Suites & Disassembly Audit):** Compiles `first`, `step3_compute`, `step4_systems`, `phase0_scalar`, `phase1_zero_lang`, `phase2_zero_power`, `phase3_reactor_fabric`, and `phase4_avx512_simd` via `build/zero2`, diffs stdout against `.expected`, and verifies exact silicon/EVEX instructions via `objdump -d`.
-3. **Stage 3 (54 Negative Compile-Rejection Probes):** Verifies `build/zero2` rejects 54 invalid programs across `ELF64`, `--target=efi-os`, and `--target=capsule` (unlowered lenses, Ring-0 AVX-512 outside `<tile>`, `@isr` vector clobbers, capsule `.bss` leaks, bounds/const errors).
+1. **Stage 1 (Self-Hosting & `W^X`):** Builds `zero0 -> zero1 -> zero2 -> zero3`, verifies `cmp -s zero2 zero3` (`627,661 B`, `0` diff), checks `readelf -lW` for zero `RWE` segments, and tests `--lex`.
+2. **Stage 2 (9 Golden Suites & Disassembly Audit):** Compiles `first`, `step3_compute`, `step4_systems`, `phase0_scalar`, `phase1_zero_lang`, `phase2_zero_power`, `phase3_reactor_fabric`, `phase4_avx512_simd`, and `phase5_nextgen_spine` via `build/zero2`, diffs stdout against `.expected`, and verifies exact silicon/EVEX + Stage-1 Next-Gen Spine instructions (`bextr`, `bt`, `blsr`, `tzcnt`, `@oneshot` `mov`+`xor` wipes, zero-`cmp` `RFLAGS` fusion) via `objdump -d`.
+3. **Stage 3 (70 Negative Compile-Rejection Probes):** Verifies `build/zero2` rejects 70 invalid programs across `ELF64`, `--target=efi-os`, and `--target=capsule` (54 baseline probes + 16 Stage-1 probes covering line-end `;`, `struct @cell64` size != 64B, `@oneshot` double-use/2-hop/call-hazard/leak/asymmetric-branch/struct-field, `ref&` rvalue/`@oneshot`, dead `ZF`, multi-bit `CF`, `@ring` on `@slab`, and scalar spin `mask<...>`).
 4. **Stage 4 (Unhandled Fault Exit):** Confirms uncaught `fail` exits with status `1`.
-5. **Stage 5 (Bare-Metal Containers):** Builds 3 `.zcap` capsules + debug `gate1_os_z2.efi` + `qemu_debug :: 0` `gate1_laptop_z2.efi` (proving `0` port-`0xE9` instructions in laptop binary vs `7` in debug control).
+5. **Stage 5 (Bare-Metal Containers):** Builds 4 `.zcap` capsules (`capsule_z2`, `cap_avx512_wave`, `cap_matrix_crc`, and Ring-0 Next-Gen Spine `cap_spine_probe.zcap`) + debug `gate1_os_z2.efi` + `qemu_debug :: 0` `gate1_laptop_z2.efi` (proving `0` port-`0xE9` instructions in laptop binary vs `7` in debug control).
 6. **Stage 6 (Live Multi-Core `ZeroOS` Under QEMU/KVM + OVMF + NVMe):** Boots 4-core SMP, injects PS/2 keys `1 2 3 b a q`, verifies exact capsule sums (`2337`, `1207754`, `35277270`), framebuffer pixel colors, IRQ1 counter, `-smp 1` fallback, NVMe-less fallback, and `-vga none` clean return.
 7. **Stage 7 (Bootable GPT + FAT32 USB Stick):** Audits protective MBR + primary/backup GPT CRCs + FAT32 cluster chains, extracts `/EFI/BOOT/BOOTX64.EFI` to prove byte-identity with `gate1_laptop_z2.efi`, and boots OVMF from emulated xHCI `usb-storage`.
 

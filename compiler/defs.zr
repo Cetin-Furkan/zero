@@ -162,6 +162,14 @@ TY_FLAG_SPAN    :: 0x2000   // 16B `{ ptr: u64, len: u64 }` (`str`, `bytes`, `[]
 TY_FLAG_MMIO    :: 0x4000   // @mmio<T> volatile aperture modifier (no null fault)
 TY_FLAG_STREAM  :: 0x8000   // @stream<u32|u64> non-temporal `movnti` span modifier
 TY_FLAG_ATOMIC  :: 0x10000  // @atomic<u32|u64> hardware `lock` pointer
+TY_FLAG_PTR     :: 0x20000  // `ptr* T` 8B canonical 64-bit typed pointer
+TY_FLAG_ONESHOT :: 0x40000  // `ptr* @oneshot T` register-only single-use capability (0 stack bytes)
+TY_FLAG_REF     :: 0x80000  // `ref& T` zero-copy caller slot alias
+
+// --- Live CPU `RFLAGS` Provenance Tags ---
+FLAG_NONE       :: 0
+FLAG_ZF         :: 1
+FLAG_CF         :: 2
 
 // --- Global Compiler State Indices (`g[G_*]`) ---
 G_MODE_CAPSULE        :: 0  // 1 on `--target=capsule`
@@ -208,6 +216,12 @@ G_BSS_FIX_CNT         :: 40 // EFI RIP-relative `.bss` fixup count (`bss_fix_*`)
 G_EFI_ISR_STUBS_OFF   :: 41 // `.text` offset of 256-entry ISR stub table (`@isr_stub_base`)
 G_EFI_CODE_SPAN_PATCH :: 42 // `.text` offset of `BootHandoff.code_bytes` imm32 patch
 G_TILE_USED_ZMM       :: 43 // 1 if active `<tile>` emitted any 512-bit ZMM op (`vzeroupper` on exit)
+G_LIVE_FLAG           :: 44 // `FLAG_ZF` / `FLAG_CF` left live by immediately preceding statement
+G_NEW_STMT_FLAG       :: 45 // `FLAG_ZF` / `FLAG_CF` produced by current statement
+G_EXPR_SET_FLAG       :: 46 // `FLAG_ZF` / `FLAG_CF` set by current top-of-expr `mask<...>`
+G_ONESHOT_LIVE_MASK   :: 47 // 4-bit active register mask over `@oneshot` pool `[r10, r9, rsi, rdi]`
+G_ALLOW_ONESHOT_RELAY :: 48 // 1 only when parsing direct `dst: ptr* @oneshot T = src`
+G_BLOCK_DIVERGED      :: 49 // 1 if block/arm ended unconditionally in return/fail/break/continue
 
 // --- Pre-Interned Contextual & Intrinsic Symbol IDs (`g[G_SYM_*]`) ---
 G_SYM_MAIN            :: 64
@@ -348,6 +362,16 @@ G_SYM_VEC_STREAM      :: 189
 G_SYM_VEC_SUM32       :: 190
 G_SYM_VEC_SUM64       :: 191
 
+// Stage-1 Next-Gen `Zero` Spine Contextual Symbols
+G_SYM_REF             :: 192
+G_SYM_STRUCT          :: 193
+G_SYM_ONESHOT         :: 194
+G_SYM_WHEN            :: 195
+G_SYM_WITH            :: 196
+G_SYM_WHILE           :: 197
+G_SYM_ZF              :: 198
+G_SYM_CF              :: 199
+
 // --- Static `@slab` Arenas (Zero-Initialized in `Phdr[1]` `.bss`, 0 disk bytes) ---
 @slab g             : <i64 | max: 512>
 
@@ -382,7 +406,9 @@ G_SYM_VEC_SUM64       :: 191
 @slab ut_kind       : <u8  | max: 512>
 @slab ut_size       : <u32 | max: 512>      // 0 until resolved; byte size once resolved
 @slab ut_align      : <u32 | max: 512>      // alignment in bytes (1 for <packed>, 64 for @cell64)
-@slab ut_packed     : <u8  | max: 512>      // 1 if <packed>, else 0
+@slab ut_packed     : <u8  | max: 512>      // 1 if <packed> or @packed, else 0
+@slab ut_strict64   : <u8  | max: 512>      // 1 if `struct Name @cell64` (requires exact 64B)
+@slab ut_pre_packed : <u8  | max: 512>      // 1 if `struct Name @packed`
 @slab ut_fstart     : <u32 | max: 512>      // start in `fld_*` (structs) or `bpf_*` (bitpacks)
 @slab ut_fcnt       : <u32 | max: 512>      // field count
 @slab ut_tok        : <u32 | max: 512>      // prescan saved token index
@@ -402,6 +428,7 @@ G_SYM_VEC_SUM64       :: 191
 @slab fld_ty        : <u32 | max: 4096>
 @slab fld_off       : <u32 | max: 4096>
 @slab fld_sz        : <u32 | max: 4096>
+@slab fld_arr_cnt   : <u32 | max: 4096>     // 0 = single field; >= 1 = inline fixed array `T[N]`
 
 // Custom `@ptr<...>` metadata tables (indexed by `ut_idx = base - TY_PTR_BASE`)
 @slab ptr_elem_ty   : <u32 | max: 512>
@@ -436,10 +463,14 @@ G_SYM_VEC_SUM64       :: 191
 @slab fn_code_len   : <u32 | max: 2048>     // byte length of compiled fn
 @slab fn_param_ty   : <u32 | max: 16384>
 
-@slab loc_sym       : <u32 | max: 4096>
-@slab loc_ty        : <u32 | max: 4096>
-@slab loc_disp      : <i64 | max: 4096>
-@slab loc_depth     : <u32 | max: 4096>
+@slab loc_sym           : <u32 | max: 4096>
+@slab loc_ty            : <u32 | max: 4096>
+@slab loc_disp          : <i64 | max: 4096>
+@slab loc_depth         : <u32 | max: 4096>
+@slab loc_oneshot_state : <u8  | max: 4096> // 0 = normal, 1 = LIVE, 2 = CONSUMED
+@slab loc_oneshot_reg   : <u8  | max: 4096> // 0..3 -> [r10, r9, rsi, rdi]
+@slab oneshot_snap_buf  : <u8  | max: 4096> // branch symmetry snapshot buffer
+@slab mask_scan_out     : <i64 | max: 8>    // clause scanner output for `mask<...>`
 
 @slab lp_cont_tgt   : <i64 | max: 64>
 @slab lp_brk_head   : <i64 | max: 64>

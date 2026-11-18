@@ -154,16 +154,18 @@ fn skip_balanced_braces() {
 
 fn parse_raw_brace_stmts() {
     expect_kind(TOK_LBRACE)
+    g[G_LIVE_FLAG]      = 0
+    g[G_BLOCK_DIVERGED] = 0
     loop <max: 65536 | until: peek_kind() == TOK_RBRACE> {
         if peek_kind() == TOK_EOF {
             die_cur("error: parse fault (unclosed '{' block)")
         }
         if peek_kind() == TOK_SEMI {
-            g[G_TOK_IDX] += 1
-            continue
+            die_cur("error: ';' is only legal as an inline stage-to-flag/loop handoff, not a statement separator")
         }
         parse_stmt()
     }
+    g[G_LIVE_FLAG] = 0
     expect_kind(TOK_RBRACE)
 }
 
@@ -171,6 +173,9 @@ fn parse_scoped_block() {
     saved_loc := g[G_LOC_CNT]
     g[G_SCOPE_DEPTH] += 1
     parse_raw_brace_stmts()
+    if g[G_BLOCK_DIVERGED] == 0 {
+        check_oneshots_consumed_from(saved_loc, peek_line())
+    }
     g[G_SCOPE_DEPTH] -= 1
     g[G_LOC_CNT] = saved_loc
 }
@@ -305,6 +310,7 @@ fn parse_stmt_loop() {
 }
 
 fn parse_stmt_print() {
+    check_no_live_oneshot_for_call(peek_line())
     if g[G_MODE_EFI] == 1 {
         die_cur("error: host print/@syscall unavailable in --target=efi-os")
     }
@@ -578,27 +584,44 @@ fn z1_finish_lval_chain(init_ty: i64, init_direct_loc: i64, ldisp: i64) {
     bf_shift: i64  = 0
     bf_width: i64  = 0
 
-    // 1. Walk `.field` across nested Structs and/or terminal BitPack
+    // 1. Walk `.field` (and `[idx]` for inline `T[N]` arrays) across nested Structs and/or terminal BitPack
     loop <max: 32 | until: peek_kind() != TOK_DOT> {
         g[G_TOK_IDX] += 1
         fsym  := expect_ident()
         cbase := cur_ty & TY_BASE_MASK
 
-        if cbase >= TY_STRUCT_BASE && cbase < TY_PTR_BASE {
+        if (cur_ty & (TY_FLAG_PTR | TY_FLAG_VIEW1 | TY_FLAG_SPAN | TY_FLAG_ATOMIC)) == 0 && cbase >= TY_STRUCT_BASE && cbase < TY_PTR_BASE {
             fi := find_struct_field(cbase - TY_STRUCT_BASE, fsym)
             if fi < 0 {
                 die_cur("error: parse fault (unknown struct field)")
             }
             foff: i64 = fld_off[fi]
+            fty: i64  = fld_ty[fi]
+            acnt: i64 = fld_arr_cnt[fi]
             if foff != 0 {
                 emit_add_rax_imm32(foff)
             }
-            cur_ty        = fld_ty[fi]
+            if acnt > 0 {
+                if peek_kind() != TOK_LBRACK {
+                    die_cur("error: fixed-array struct field assignment requires [index]")
+                }
+                arr_b := alloc_temp_qword()
+                emit_store_local(arr_b)
+                g[G_TOK_IDX] += 1
+                parse_expr(1)
+                expect_kind(TOK_RBRACK)
+                emit_bounds_check_rax(acnt)
+                emit_scale_rax(ty_byte_size(fty))
+                emit_load_local_rcx(arr_b)
+                free_temp_qwords(1)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+            }
+            cur_ty        = fty
             is_direct_loc = 0
             continue
         }
 
-        if cbase >= TY_BP_BASE && cbase < TY_STRUCT_BASE {
+        if (cur_ty & (TY_FLAG_PTR | TY_FLAG_VIEW1 | TY_FLAG_SPAN | TY_FLAG_ATOMIC)) == 0 && cbase >= TY_BP_BASE && cbase < TY_STRUCT_BASE {
             bfi := find_bp_field(cbase - TY_BP_BASE, fsym)
             if bfi < 0 {
                 die_cur("error: parse fault (unknown bitpack field)")
@@ -614,7 +637,7 @@ fn z1_finish_lval_chain(init_ty: i64, init_direct_loc: i64, ldisp: i64) {
 
     // 2. Optional hardware `[hi:lo]` bit-slice RMW (`lo[15:0] = fn_addr[15:0]`)
     if is_bitfield == 0 && peek_kind() == TOK_LBRACK {
-        if (cur_ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC)) != 0 || (cur_ty & TY_BASE_MASK) >= TY_STRUCT_BASE || is_ty_vec(cur_ty) == 1 {
+        if (cur_ty & (TY_FLAG_SPAN | TY_FLAG_VIEW1 | TY_FLAG_ATOMIC | TY_FLAG_PTR)) != 0 || (cur_ty & TY_BASE_MASK) >= TY_STRUCT_BASE || is_ty_vec(cur_ty) == 1 {
             die_cur("error: parse fault (bit-slice lvalue requires scalar)")
         }
         packed   := parse_bitslice_bounds()
@@ -638,6 +661,9 @@ fn z1_finish_lval_chain(init_ty: i64, init_direct_loc: i64, ldisp: i64) {
 
     parse_expr(1)
     rhs_ty := g[G_LAST_EXPR_TY]
+    if (rhs_ty & TY_FLAG_ONESHOT) != 0 {
+        die_line("error: cannot assign @oneshot pointer to persistent variable or memory", op_line)
+    }
 
     // 3a. BitPack field or `[hi:lo]` bit-slice RMW
     if is_bitfield == 1 {
@@ -812,11 +838,21 @@ fn parse_ident_stmt() {
     sym       := expect_ident()
     k         := peek_kind()
 
-    // 1. `name := expr`
+    // 1. `name := expr` (and wildcard `_ := expr`)
     if k == TOK_WALRUS {
         g[G_TOK_IDX] += 1
         parse_expr(1)
-        ty   := g[G_LAST_EXPR_TY]
+        ty        := g[G_LAST_EXPR_TY]
+        expr_flag := g[G_EXPR_SET_FLAG]
+        if (ty & TY_FLAG_ONESHOT) != 0 {
+            die_line("error: @oneshot pointer requires explicit 'ptr* @oneshot T' declaration", decl_line)
+        }
+        if sym == g[G_SYM_WILDCARD] {
+            if expr_flag != 0 {
+                g[G_NEW_STMT_FLAG] = expr_flag
+            }
+            return
+        }
         disp := alloc_local(sym, ty, decl_line)
         if is_ty_vec(ty) == 1 {
             emit_zmm0_store_rbp(disp)
@@ -832,7 +868,10 @@ fn parse_ident_stmt() {
             return
         }
         emit_narrow_rax(ty)
-        emit_store_local(disp)
+        emit_store_local(disp) // pure `mov` -> preserves live `ZF` / `CF` from `mask<...>`!
+        if expr_flag != 0 {
+            g[G_NEW_STMT_FLAG] = expr_flag
+        }
         return
     }
 
@@ -840,6 +879,61 @@ fn parse_ident_stmt() {
     if k == TOK_COLON {
         g[G_TOK_IDX] += 1
         ty := parse_full_type_tag()
+
+        // 2a. Register-only `ptr* @oneshot T` capability birth OR single-hop relay (`mov` + `xor` wipe)!
+        if (ty & TY_FLAG_ONESHOT) != 0 {
+            if sym == g[G_SYM_WILDCARD] {
+                die_line("error: @oneshot capability cannot be discarded into '_'", decl_line)
+            }
+            expect_kind(TOK_ASSIGN)
+
+            // Check 1-hop register relay: `shown : ptr* @oneshot T = secret_p`
+            if peek_kind() == TOK_IDENT {
+                src_li := find_local(peek_val())
+                if src_li >= 0 && (loc_ty[src_li] & TY_FLAG_ONESHOT) != 0 {
+                    after_src := tok_kind[g[G_TOK_IDX] + 1]
+                    if after_src != TOK_LBRACK && after_src != TOK_DOT && after_src != TOK_LPAREN && binop_prec(g[G_TOK_IDX] + 1) == 0 {
+                        g[G_TOK_IDX] += 1 // consume `secret_p`
+                        if (loc_ty[src_li] & TY_BASE_MASK) != (ty & TY_BASE_MASK) {
+                            die_line("error: element type mismatch in @oneshot relay", decl_line)
+                        }
+                        if loc_oneshot_state[src_li] != 1 {
+                            die_line("error: @oneshot pointer already consumed", decl_line)
+                        }
+                        // Allocate `dst` BEFORE freeing `src` so `dst_slot != src_slot` is guaranteed!
+                        dst_li   := alloc_oneshot_local(sym, ty, decl_line)
+                        dst_slot := loc_oneshot_reg[dst_li]
+                        src_slot := consume_oneshot_local(src_li, decl_line)
+                        emit_oneshot_relay_and_wipe(dst_slot, src_slot)
+                        return
+                    }
+                }
+            }
+
+            // Birth of new `@oneshot` capability from address expression:
+            parse_expr(1)
+            if (g[G_LAST_EXPR_TY] & TY_FLAG_ONESHOT) != 0 {
+                die_line("error: invalid @oneshot expression", decl_line)
+            }
+            if is_ty_vec(g[G_LAST_EXPR_TY]) == 1 || (g[G_LAST_EXPR_TY] & TY_FLAG_SPAN) != 0 || lm_is_struct_val(g[G_LAST_EXPR_TY]) == 1 {
+                die_line("error: @oneshot pointer initializer must be a 64-bit address", decl_line)
+            }
+            os_li   := alloc_oneshot_local(sym, ty, decl_line)
+            os_slot := loc_oneshot_reg[os_li]
+            emit_oneshot_from_rax(os_slot)
+            emit_u8(0x31)  emit_u8(0xC0) // xor eax, eax (wipe scratch rax so ONLY os_reg holds address!)
+            return
+        }
+
+        // 2b. Local `ref& T` alias `r : ref& u64 = x`
+        if (ty & TY_FLAG_REF) != 0 {
+            expect_kind(TOK_ASSIGN)
+            parse_ref_lval_addr(ty & (~TY_FLAG_REF), decl_line)
+            r_disp := alloc_local(sym, ty, decl_line)
+            emit_store_local(r_disp)
+            return
+        }
+
         if is_ty_vec(ty) == 1 {
             disp := alloc_local(sym, ty, decl_line)
             if peek_kind() == TOK_ASSIGN {
@@ -874,12 +968,23 @@ fn parse_ident_stmt() {
         }
         expect_kind(TOK_ASSIGN)
         parse_expr(1)
+        if (g[G_LAST_EXPR_TY] & TY_FLAG_ONESHOT) != 0 {
+            die_line("error: cannot assign @oneshot pointer to persistent variable", decl_line)
+        }
+        e_flag := g[G_EXPR_SET_FLAG]
+        if sym == g[G_SYM_WILDCARD] {
+            if e_flag != 0 { g[G_NEW_STMT_FLAG] = e_flag }
+            return
+        }
         disp := alloc_local(sym, ty, decl_line)
         if (ty & TY_FLAG_SPAN) != 0 {
             emit_store_span_local(disp)
         } else {
             emit_narrow_rax(ty)
             emit_store_local(disp)
+            if e_flag != 0 {
+                g[G_NEW_STMT_FLAG] = e_flag
+            }
         }
         return
     }
@@ -934,6 +1039,114 @@ fn parse_ident_stmt() {
     if li >= 0 {
         lty: i64   = loc_ty[li]
         ldisp: i64 = loc_disp[li]
+
+        // 5-oneshot. Register-only `ptr* @oneshot T` single terminal store `shown[idx] = val` + `xor` wipe!
+        if (lty & TY_FLAG_ONESHOT) != 0 {
+            if peek_kind() != TOK_LBRACK {
+                die_line("error: @oneshot pointer cannot be reassigned; only 1 [idx] dereference is legal", decl_line)
+            }
+            g[G_TOK_IDX] += 1
+            ety_os := lty & TY_BASE_MASK
+            esz_os := ty_byte_size(ety_os)
+            has_idx_s := 0
+            idx_s: i64 = 0
+            if peek_kind() == TOK_INT && peek_val() == 0 && tok_kind[g[G_TOK_IDX] + 1] == TOK_RBRACK {
+                g[G_TOK_IDX] += 2
+            } else {
+                parse_expr(1)
+                expect_kind(TOK_RBRACK)
+                emit_scale_rax(esz_os)
+                idx_s     = alloc_temp_qword()
+                has_idx_s = 1
+                emit_store_local(idx_s)
+            }
+            if peek_kind() != TOK_ASSIGN {
+                die_line("error: compound assignment on @oneshot pointer is forbidden (would read+write twice)", decl_line)
+            }
+            g[G_TOK_IDX] += 1
+            parse_expr(1)
+            if (g[G_LAST_EXPR_TY] & TY_FLAG_ONESHOT) != 0 {
+                die_line("error: cannot store @oneshot pointer into memory", decl_line)
+            }
+            rslot := consume_oneshot_local(li, decl_line)
+            hw_os := oneshot_slot_to_hw_reg(rslot)
+            emit_mov_gpr64(1, hw_os) // mov rcx, oneshot_reg
+            emit_oneshot_xor_wipe(rslot)
+            if has_idx_s == 1 {
+                val_s := alloc_temp_qword()
+                emit_store_local(val_s)
+                emit_load_local(idx_s)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC1) // add rcx, rax
+                emit_load_local(val_s)
+                free_temp_qwords(2)
+            }
+            emit_store_mem_typed(ety_os)
+            emit_u8(0x31)  emit_u8(0xC9) // xor ecx, ecx (wipe scratch address in rcx too!)
+            return
+        }
+
+        // 5-ref. Zero-copy `ref& T` alias write-through (`out_bytes = val`, `out_bytes += val`, `r.f = val`)
+        if (lty & TY_FLAG_REF) != 0 {
+            r_target_ty := lty & (~TY_FLAG_REF)
+            if (r_target_ty & TY_FLAG_PTR) != 0 && peek_kind() == TOK_LBRACK {
+                emit_load_local(ldisp)
+                emit_u8(0x48)  emit_u8(0x8B)  emit_u8(0x00) // load ptr* value from caller slot
+                ptr_tmp := alloc_temp_qword()
+                emit_store_local(ptr_tmp)
+                g[G_TOK_IDX] += 1
+                parse_expr(1)
+                expect_kind(TOK_RBRACK)
+                emit_scale_rax(ty_byte_size(r_target_ty & TY_BASE_MASK))
+                emit_load_local_rcx(ptr_tmp)
+                free_temp_qwords(1)
+                emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                z1_finish_lval_chain(r_target_ty & TY_BASE_MASK, 0, 0)
+                return
+            }
+            emit_load_local(ldisp)
+            z1_finish_lval_chain(r_target_ty, 0, 0)
+            return
+        }
+
+        // 5-ptr. Classic 64-bit `ptr* T` local (`p[idx]... = val`, `p = new_ptr`, `p += off`)
+        if (lty & TY_FLAG_PTR) != 0 {
+            if peek_kind() == TOK_LBRACK {
+                p_ety := lty & TY_BASE_MASK
+                if tok_kind[g[G_TOK_IDX] + 1] == TOK_INT && tok_val[g[G_TOK_IDX] + 1] == 0 && tok_kind[g[G_TOK_IDX] + 2] == TOK_RBRACK {
+                    g[G_TOK_IDX] += 3
+                    emit_load_local(ldisp)
+                } else {
+                    g[G_TOK_IDX] += 1
+                    parse_expr(1)
+                    expect_kind(TOK_RBRACK)
+                    emit_scale_rax(ty_byte_size(p_ety))
+                    emit_load_local_rcx(ldisp)
+                    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8) // add rax, rcx
+                }
+                z1_finish_lval_chain(p_ety, 0, 0)
+                return
+            }
+            if peek_kind() == TOK_PLUS_EQ || peek_kind() == TOK_MINUS_EQ {
+                pop := peek_kind()
+                g[G_TOK_IDX] += 1
+                parse_expr(1)
+                if (g[G_LAST_EXPR_TY] & TY_FLAG_ONESHOT) != 0 {
+                    die_line("error: invalid @oneshot operand", decl_line)
+                }
+                emit_scale_rax(ty_byte_size(lty & TY_BASE_MASK))
+                emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC1) // mov rcx, rax
+                emit_load_local(ldisp)
+                if pop == TOK_PLUS_EQ {
+                    emit_u8(0x48)  emit_u8(0x01)  emit_u8(0xC8)
+                } else {
+                    emit_u8(0x48)  emit_u8(0x29)  emit_u8(0xC8)
+                }
+                emit_store_local(ldisp)
+                return
+            }
+            z1_finish_lval_chain(lty, 1, ldisp)
+            return
+        }
 
         // 5a. Span / `@stream` local (`s[idx]... = ...` or `s = other_span`)
         if (lty & TY_FLAG_SPAN) != 0 {
@@ -1043,7 +1256,16 @@ fn parse_ident_stmt() {
 }
 
 fn parse_stmt() {
+    prev_live_flag     := g[G_LIVE_FLAG]
+    g[G_LIVE_FLAG]      = 0
+    g[G_NEW_STMT_FLAG]  = 0
+    g[G_BLOCK_DIVERGED] = 0
+
     k := peek_kind()
+
+    if k == TOK_SEMI {
+        die_cur("error: ';' is only legal as an inline stage-to-flag/loop handoff, not a statement separator")
+    }
 
     if k == TOK_LBRACE {
         parse_guarded_block_stmt()
@@ -1094,13 +1316,20 @@ fn parse_stmt() {
                 if peek_kind() != TOK_RBRACE {
                     die_cur("error: @isr/@isr_ok forbids value return in @isr")
                 }
+                check_no_live_oneshot_exit(rline)
                 emit_isr_epilogue()
+                g[G_BLOCK_DIVERGED] = 1
                 return
             }
             if g[G_CUR_RET_TY] == TY_VOID || peek_kind() == TOK_RBRACE {
+                check_no_live_oneshot_exit(rline)
                 emit_mov_rax_imm64(0)
             } else {
                 parse_expr(1)
+                if (g[G_LAST_EXPR_TY] & TY_FLAG_ONESHOT) != 0 {
+                    die_line("error: cannot return @oneshot pointer", rline)
+                }
+                check_no_live_oneshot_exit(rline)
                 if is_ty_vec(g[G_CUR_RET_TY]) == 1 {
                     check_avx512_context(rline)
                     if g[G_LAST_EXPR_TY] != g[G_CUR_RET_TY] {
@@ -1116,43 +1345,53 @@ fn parse_stmt() {
             }
             emit_tile_unwind_count(g[G_TILE_DEPTH])
             emit_u8(0xC9)  emit_u8(0xC3) // leave; ret
+            g[G_BLOCK_DIVERGED] = 1
             return
         }
 
         if kw == KW_BREAK {
+            bline := peek_line()
             g[G_TOK_IDX] += 1
+            check_no_live_oneshot_exit(bline)
             ld := g[G_LP_DEPTH]
             if ld <= 0 { die_cur("error: parse fault (break outside loop)") }
             top := ld - 1
             emit_tile_unwind_count(g[G_TILE_DEPTH] - lp_tile_base[top])
             jpos := emit_jmp_rel32()
             lp_brk_head[top] = push_patch_node(lp_brk_head[top], jpos)
+            g[G_BLOCK_DIVERGED] = 1
             return
         }
 
         if kw == KW_CONTINUE {
+            cline := peek_line()
             g[G_TOK_IDX] += 1
+            check_no_live_oneshot_exit(cline)
             ld := g[G_LP_DEPTH]
             if ld <= 0 { die_cur("error: parse fault (continue outside loop)") }
             top := ld - 1
             emit_tile_unwind_count(g[G_TILE_DEPTH] - lp_tile_base[top])
             jpos := emit_jmp_rel32()
             lp_cont_head[top] = push_patch_node(lp_cont_head[top], jpos)
+            g[G_BLOCK_DIVERGED] = 1
             return
         }
 
         if kw == KW_FAIL {
+            fline := peek_line()
             if g[G_IN_ISR_MODE] != 0 {
                 die_cur("error: @isr/@isr_ok forbids fail, publish, wait, tile, reactor regs, or non-@isr_ok call")
             }
             g[G_TOK_IDX] += 1
             parse_expr(1)
+            check_no_live_oneshot_exit(fline)
             // Rewrite dynamic `0` to `1` (§5.3)
             emit_u8(0x48)  emit_u8(0x85)  emit_u8(0xC0)
             emit_u8(0x75)  emit_u8(0x05)
             emit_u8(0xB8)  emit_u32(1)
             emit_fault_store_rax()
             emit_unwind_or_return_fault()
+            g[G_BLOCK_DIVERGED] = 1
             return
         }
 
@@ -1179,7 +1418,20 @@ fn parse_stmt() {
             return
         }
 
+        // Stage-1 contextual `when ...` (`when cond`, `when for`, `when while`)
+        if isym == g[G_SYM_WHEN] && nk != TOK_WALRUS && nk != TOK_COLON && nk != TOK_ASSIGN && find_local(isym) < 0 {
+            parse_stmt_when(prev_live_flag)
+            return
+        }
+
+        // Stage-1 contextual `with ...` (`with when mask<...> ; FLAG`, `with v := stage ; when FLAG`)
+        if isym == g[G_SYM_WITH] && nk != TOK_WALRUS && nk != TOK_COLON && nk != TOK_ASSIGN && find_local(isym) < 0 {
+            parse_stmt_with()
+            return
+        }
+
         parse_ident_stmt()
+        g[G_LIVE_FLAG] = g[G_NEW_STMT_FLAG]
         return
     }
 
@@ -1210,20 +1462,25 @@ fn compile_one_fn_decl(fn_attr: i64) {
     fidx := find_or_add_fn(fsym)
     fn_code_off[fidx] = g[G_CODE_OFF]
 
-    // Reset per-function frame, scope, patch-chain, ZMM, & ISR state
-    g[G_LOC_CNT]       = 0
-    g[G_SCOPE_DEPTH]   = 1
-    g[G_FRAME_QW]      = 0
-    g[G_TEMP_DEPTH]    = 0
-    g[G_MAX_FRAME_QW]  = 0
-    g[G_LP_DEPTH]      = 0
-    g[G_REC_DEPTH]     = 0
-    g[G_TILE_DEPTH]    = 0
-    g[G_TILE_USED_ZMM] = 0
-    g[G_PATCH_CNT]     = 0
-    g[G_CUR_RET_TY]    = fn_ret_ty[fidx]
-    g[G_IN_ISR_MODE]   = fn_attr
-    g[G_IN_FN_BODY]    = 1
+    // Reset per-function frame, scope, patch-chain, ZMM, flag, oneshot, & ISR state
+    g[G_LOC_CNT]           = 0
+    g[G_SCOPE_DEPTH]       = 1
+    g[G_FRAME_QW]          = 0
+    g[G_TEMP_DEPTH]        = 0
+    g[G_MAX_FRAME_QW]      = 0
+    g[G_LP_DEPTH]          = 0
+    g[G_REC_DEPTH]         = 0
+    g[G_TILE_DEPTH]        = 0
+    g[G_TILE_USED_ZMM]     = 0
+    g[G_LIVE_FLAG]         = 0
+    g[G_NEW_STMT_FLAG]     = 0
+    g[G_EXPR_SET_FLAG]     = 0
+    g[G_ONESHOT_LIVE_MASK] = 0
+    g[G_BLOCK_DIVERGED]    = 0
+    g[G_PATCH_CNT]         = 0
+    g[G_CUR_RET_TY]        = fn_ret_ty[fidx]
+    g[G_IN_ISR_MODE]       = fn_attr
+    g[G_IN_FN_BODY]        = 1
 
     frame_patch: i64 = 0
     if fn_attr == 1 {
@@ -1301,6 +1558,9 @@ fn compile_one_fn_decl(fn_attr: i64) {
         emit_u8(0xC9)  emit_u8(0xC3)
     } else {
         parse_raw_brace_stmts()
+        if g[G_BLOCK_DIVERGED] == 0 {
+            check_oneshots_consumed_from(0, peek_line())
+        }
         if fn_attr == 1 {
             emit_isr_epilogue()
         } else {
@@ -1330,6 +1590,11 @@ fn compile_all_functions() {
     g[G_TOK_IDX] = 0
     loop <max: 262144 | until: peek_kind() == TOK_EOF> {
         k := peek_kind()
+
+        if k == TOK_IDENT && peek_val() == g[G_SYM_STRUCT] && tok_kind[g[G_TOK_IDX] + 1] == TOK_IDENT {
+            skip_top_struct_decl()
+            continue
+        }
 
         if k == TOK_IDENT && tok_kind[g[G_TOK_IDX] + 1] == TOK_COLON2 {
             skip_top_colon2_decl()

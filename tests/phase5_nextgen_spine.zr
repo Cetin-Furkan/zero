@@ -1,0 +1,432 @@
+PERM_BITS     :: 0b11 << 42
+WRITE_BIT     :: 1 << 43
+CRYPT_BIT     :: 1 << 44
+PIECES_BITS   :: 0b111 << 46
+ADDR42_MASK   :: 0x0000_03FF_FFFF_FFFF
+READY_PHASE   :: 1
+
+FAULT_DENIED  :: 4
+FAULT_CORRUPT :: 5
+
+struct PieceHeader32 {
+    exact_len : u64
+    key_tag   : u64
+    p0        : u64
+    p1        : u64
+}
+
+struct ExtentChain64 @cell64 {
+    exact_len : u64
+    key_tag   : u64
+    pieces    : u64[5]
+    next_ext  : u64
+}
+
+struct IoTicket @cell64 {
+    seq       : u64
+    lane_mask : u64
+    ext_word  : u64
+    key_hash  : u64
+    dst_off   : u64
+    crc       : u32
+    flags     : u32
+    pad       : u64[2]
+}
+
+@slab    vault_arena : u8[262144]
+@slab    lane_out    : u64[64]
+@ring    io_wheel    : IoTicket[16]
+@capsule code_vault  : u8[65536]
+
+fn decode_end(ext: u64) u64 {
+    scale := (ext >> 61) & 0b111
+    len11 := (ext >> 50) & 0x7FF
+    when scale == 0 => return len11
+    return len11 << (scale * 3 + 3)
+}
+
+fn unlock_secret_block(
+    arena      : ptr* u8,
+    ext        : u64,
+    caller_key : u64,
+    out_bytes  : ref& u64
+) u64 {
+    when mask<ext | PERM_BITS> == 0 => fail FAULT_DENIED
+
+    base_off := mask<ext | ADDR42_MASK> << 6
+    hdr      := ptr* PieceHeader32 (arena + base_off)
+
+    with when mask<ext | CRYPT_BIT> ; !ZF {
+        when caller_key == 0 || hdr[0].key_tag != caller_key => fail FAULT_DENIED
+
+        secret_p : ptr* @oneshot u64 = arena + base_off + 64
+        shown    : ptr* @oneshot u64 = secret_p
+        out_bytes = hdr[0].exact_len
+        plain_word := shown[0] ^ caller_key
+        return plain_word
+    }
+
+    out_bytes = decode_end(ext)
+    raw_q := ptr* u64 (arena + base_off)
+    return raw_q[0]
+}
+
+fn fold_extent_pieces(arena: ptr* u8, ext: u64, total_out: ref& u64) u64 {
+    when mask<ext | PERM_BITS> == 0 => fail FAULT_DENIED
+
+    with pcs := mask<ext | PIECES_BITS> >> 46 ; when ZF {
+        total_out = decode_end(ext)
+        direct_p := ptr* u64 (arena + (mask<ext | ADDR42_MASK> << 6))
+        return direct_p[0]
+    }
+
+    base_addr := arena + (mask<ext | ADDR42_MASK> << 6)
+
+    when pcs <= 3 {
+        h32 := ptr* PieceHeader32 (base_addr)
+        total_out = h32[0].exact_len
+        a := ptr* u64 (arena + (mask<h32[0].p0 | ADDR42_MASK> << 6))
+        b := ptr* u64 (arena + (mask<h32[0].p1 | ADDR42_MASK> << 6))
+        return a[0] ^ b[0]
+    }
+
+    cur_node := ptr* ExtentChain64 (base_addr)
+    total_out = cur_node[0].exact_len
+    acc : u64 = 0
+
+    when for idx in 0..5 ; mask<cur_node[0].pieces[idx] | ADDR42_MASK> != 0 {
+        seg_off := mask<cur_node[0].pieces[idx] | ADDR42_MASK> << 6
+        seg_p   := ptr* u64 (arena + seg_off)
+        acc ^= seg_p[0]
+    }
+
+    when while next_raw := mask<cur_node[0].next_ext | ADDR42_MASK> ; !ZF {
+        cur_node = ptr* ExtentChain64 (arena + (next_raw << 6))
+        seg0 := ptr* u64 (arena + (mask<cur_node[0].pieces[0] | ADDR42_MASK> << 6))
+        acc ^= seg0[0]
+    }
+
+    return acc
+}
+
+fn await_dma_phase(doorbell_status: ptr* u32) u32 {
+    settled := mask<doorbell_status[0] | READY_PHASE | until !ZF ; max 65536>
+    when ZF => fail FAULT_CORRUPT
+    return settled
+}
+
+fn drain_reactor_wheel(
+    status_reg : ptr* u32,
+    start_seq  : u64,
+    batch_len  : u64,
+    active_key : u64,
+    completed  : ref& u64
+) u64 {
+    _ := await_dma_phase(status_reg)
+    arena_p : ptr* u8 = vault_arena.base
+    digest  : u64     = 0
+    done    : u64     = 0
+
+    when batch_len > 0 ; for slot, ticket in io_wheel @ring(start_seq .. batch_len) {
+        when mask<ticket.ext_word | PERM_BITS> == 0 => continue
+
+        when for lane in ticket.lane_mask @bits {
+            lane_out[lane] ^= ticket.seq + slot
+        }
+
+        seen_bytes : u64 = 0
+        with when mask<ticket.ext_word | CRYPT_BIT> ; !ZF {
+            val := unlock_secret_block(arena_p, ticket.ext_word, active_key, seen_bytes)
+            digest = @crc32c(digest, val ^ seen_bytes)
+        } else {
+            val := fold_extent_pieces(arena_p, ticket.ext_word, seen_bytes)
+            digest = @crc32c(digest, val ^ seen_bytes)
+        }
+
+        done += 1
+    }
+
+    completed = done
+    return digest
+}
+
+// =============================================================================
+// Stage-1 Extended Verification & Multi-Algorithm Stress Suite
+//   1. CF (`bt`) single-bit handoff + scattered `and` mask + `@oneshot` store
+//   2. 1-based Eytzinger branchless key probe + generational validator
+//   3. Robin-Hood / H2 bitmask bucket probe (`@bits` + `ref&` forwarding)
+// =============================================================================
+
+LOCK_CF_BIT    :: 1 << 63
+SCATTER_MASK   :: 0x0000_0000_0005_00A5
+EYTZ_CAP       :: 16
+
+struct PackedDiskTag @packed {
+    tag8  : u8
+    gen16 : u16
+    crc32 : u32
+}
+
+struct RobinBucket @cell64 {
+    occ_mask : u64
+    h2_pack  : u64
+    keys     : u64[3]
+    vals     : u64[3]
+}
+
+@slab doorbell_mem : u32[4]
+@slab eytz_tree    : u64[16]
+@slab eytz_extents : u64[16]
+@slab robin_tab    : RobinBucket[4]
+
+fn make_ext(scale: u64, len11: u64, pieces: u64, crypt: u64, perm: u64, cl_idx: u64) u64 {
+    return (scale << 61) | (len11 << 50) | (pieces << 46) | (crypt << 44) | (perm << 42) | cl_idx
+}
+
+fn test_cf_and_oneshot_store(arena: ptr* u8, word: u64, dst_cl: u64, secret_val: u64) u64 {
+    // Single-bit `; CF` handoff -> must lower to `bt` + `jnc`!
+    cf_tag : u64 = 10
+    with when mask<word | LOCK_CF_BIT> ; CF {
+        cf_tag = 99
+    } else {
+        cf_tag = 22
+    }
+
+    // Scattered mask -> must lower to `and` keeping exact bit positions!
+    scat := mask<word | SCATTER_MASK>
+
+    // `@oneshot` store + immediate `xor` wipe, followed by `@oneshot` relay + load!
+    wr_cap : ptr* @oneshot u64 = arena + (dst_cl << 6)
+    wr_cap[0] = secret_val ^ scat
+
+    rd_src : ptr* @oneshot u64 = arena + (dst_cl << 6)
+    rd_hop : ptr* @oneshot u64 = rd_src
+    loaded := rd_hop[0]
+    return loaded + cf_tag
+}
+
+fn forward_ref_bump(slot_ref: ref& u64, delta: u64) {
+    slot_ref += delta
+}
+
+fn eytz_lookup(keys: ptr* u64, count: u64, target: u64, found_idx: ref& u64) u64 {
+    idx : u64 = 1
+    hit : u64 = 0
+    loop <max: 8 | until: idx > count> {
+        k := keys[idx]
+        when k == target {
+            hit = idx
+            break
+        }
+        step : u64 = 0
+        when target > k => step = 1
+        idx = (idx << 1) + step
+    }
+    found_idx = hit
+    when hit == 0 => return 0
+    forward_ref_bump(found_idx, 100)
+    return eytz_extents[hit]
+}
+
+fn robin_probe_sum(b_ptr: ptr* RobinBucket, want_h2: u64, hits_out: ref& u64) u64 {
+    acc  : u64 = 0
+    hits : u64 = 0
+    when for slot in b_ptr[0].occ_mask @bits {
+        slot_h2 := (b_ptr[0].h2_pack >> (slot * 8)) & 0xFF
+        when slot_h2 == want_h2 {
+            acc  ^= b_ptr[0].keys[slot] + b_ptr[0].vals[slot]
+            hits += 1
+        }
+    }
+    hits_out = hits
+    return acc
+}
+
+fn main() i64 {
+    arena_p : ptr* u8 = vault_arena.base
+
+    // 1. Struct layout checks (`PieceHeader32` == 32B, `@cell64` == 64B, `@packed` == 7B)
+    print(@sizeof(PieceHeader32))
+    print(@sizeof(ExtentChain64))
+    print(@sizeof(IoTicket))
+    print(@sizeof(PackedDiskTag))
+
+    // 2. `decode_end` scale 0 vs scaled
+    e_s0 := make_ext(0, 777, 0, 0, 1, 1)
+    e_s2 := make_ext(2, 5,   0, 0, 1, 1) // 5 << (2*3 + 3) = 5 << 9 = 2560
+    print(decode_end(e_s0))
+    print(decode_end(e_s2))
+
+    // 3. Populate `vault_arena` cacheline blocks:
+    //   CL 2 (off 128): Contiguous `000` payload = 0x1122_3344_5566_7788
+    cl2 := ptr* u64 (arena_p + 128)
+    cl2[0] = 0x1122_3344_5566_7788
+
+    //   CL 4 (off 256): Encrypted `PieceHeader32` + CL 5 (off 320) ciphertext word
+    key_good : u64 = 0xCAFE_BABE_1234_5678
+    plain_secret : u64 = 0x0F0E_0D0C_0B0A_0908
+    hdr4 := ptr* PieceHeader32 (arena_p + 256)
+    hdr4[0].exact_len = 96
+    hdr4[0].key_tag   = key_good
+    hdr4[0].p0        = 0
+    hdr4[0].p1        = 0
+    sec5 := ptr* u64 (arena_p + 320)
+    sec5[0] = plain_secret ^ key_good
+
+    //   CL 8 (off 512): 2-piece `PieceHeader32` (`pcs = 2`), pointing to CL 10 & CL 11
+    cl10 := ptr* u64 (arena_p + 640)
+    cl11 := ptr* u64 (arena_p + 704)
+    cl10[0] = 0xAAAA_0000_1111_2222
+    cl11[0] = 0x0000_5555_1111_0000
+    hdr8 := ptr* PieceHeader32 (arena_p + 512)
+    hdr8[0].exact_len = 4096
+    hdr8[0].key_tag   = 0
+    hdr8[0].p0        = 10
+    hdr8[0].p1        = 11
+
+    //   CL 16, 18, 20: 3-node `ExtentChain64` (`pcs = 7`) with sparse pieces + `when while` chain!
+    cl22 := ptr* u64 (arena_p + (22 << 6))
+    cl23 := ptr* u64 (arena_p + (23 << 6))
+    cl24 := ptr* u64 (arena_p + (24 << 6))
+    cl25 := ptr* u64 (arena_p + (25 << 6))
+    cl26 := ptr* u64 (arena_p + (26 << 6))
+    cl22[0] = 0x1001
+    cl23[0] = 0x2002
+    cl24[0] = 0x4004
+    cl25[0] = 0x8008
+    cl26[0] = 0x0110
+
+    chain0 := ptr* ExtentChain64 (arena_p + (16 << 6))
+    chain0[0].exact_len = 12288
+    chain0[0].key_tag   = 0
+    chain0[0].pieces[0] = 22
+    chain0[0].pieces[1] = 0
+    chain0[0].pieces[2] = 23
+    chain0[0].pieces[3] = 0
+    chain0[0].pieces[4] = 24
+    chain0[0].next_ext  = 18
+
+    chain1 := ptr* ExtentChain64 (arena_p + (18 << 6))
+    chain1[0].exact_len = 0
+    chain1[0].pieces[0] = 25
+    chain1[0].next_ext  = 20
+
+    chain2 := ptr* ExtentChain64 (arena_p + (20 << 6))
+    chain2[0].exact_len = 0
+    chain2[0].pieces[0] = 26
+    chain2[0].next_ext  = 0
+
+    // 4. Test `unlock_secret_block` (valid `@oneshot`, plain, and `FAULT_DENIED` on bad key / perm 0)
+    ext_enc   := make_ext(1, 2, 0, 1, 1, 4)
+    ext_plain := make_ext(0, 64, 0, 0, 1, 2)
+    ext_deny  := make_ext(0, 64, 0, 0, 0, 2)
+
+    out_b : u64 = 0
+    unlocked := unlock_secret_block(arena_p, ext_enc, key_good, out_b)
+    print(unlocked == plain_secret)
+    print(out_b)
+
+    caught_bad_key : i64 = 0
+    {
+        _ := unlock_secret_block(arena_p, ext_enc, key_good ^ 1, out_b)
+    } recover err1 {
+        caught_bad_key = err1
+    }
+    print(caught_bad_key)
+
+    caught_no_perm : i64 = 0
+    {
+        _ := unlock_secret_block(arena_p, ext_deny, key_good, out_b)
+    } recover err2 {
+        caught_no_perm = err2
+    }
+    print(caught_no_perm)
+
+    // 5. Test `fold_extent_pieces` across `000`, `010`, and `111` 3-node chain
+    f_bytes : u64 = 0
+    f0 := fold_extent_pieces(arena_p, ext_plain, f_bytes)
+    print(f0 == 0x1122_3344_5566_7788)
+    print(f_bytes)
+
+    ext_2p := make_ext(3, 1, 2, 0, 1, 8)
+    f2 := fold_extent_pieces(arena_p, ext_2p, f_bytes)
+    print(f2 == (0xAAAA_0000_1111_2222 ^ 0x0000_5555_1111_0000))
+    print(f_bytes)
+
+    ext_chain := make_ext(3, 3, 7, 0, 1, 16)
+    fc := fold_extent_pieces(arena_p, ext_chain, f_bytes)
+    // 0x1001 ^ 0x2002 ^ 0x4004 ^ 0x8008 ^ 0x0110 = 0xF11F (61727)
+    print(fc)
+    print(f_bytes)
+
+    // 6. Test `await_dma_phase`: ready (`0x81` -> `1`) vs timeout (`0x80` -> `FAULT_CORRUPT == 5`)
+    db_p : ptr* u32 = doorbell_mem.base
+    db_p[0] = 0x81
+    print(await_dma_phase(db_p))
+
+    db_p[0] = 0x80
+    caught_timeout : i64 = 0
+    {
+        _ := await_dma_phase(db_p)
+    } recover err_t {
+        caught_timeout = err_t
+    }
+    print(caught_timeout)
+
+    // 7. Test `drain_reactor_wheel` wrapping `@ring` slots `14, 15, 0, 1, 2` (`batch_len = 5`)!
+    db_p[0] = 0x01
+    io_wheel[14] = IoTicket{ seq: 100, lane_mask: 0b0000_0101, ext_word: ext_plain, key_hash: 0, dst_off: 0, crc: 0, flags: 1 }
+    io_wheel[15] = IoTicket{ seq: 101, lane_mask: 0xFFFF,      ext_word: ext_deny,  key_hash: 0, dst_off: 0, crc: 0, flags: 0 }
+    io_wheel[0]  = IoTicket{ seq: 102, lane_mask: 0b0001_0001, ext_word: ext_enc,   key_hash: 0, dst_off: 0, crc: 0, flags: 1 }
+    io_wheel[1]  = IoTicket{ seq: 103, lane_mask: 0b0000_0100, ext_word: ext_2p,    key_hash: 0, dst_off: 0, crc: 0, flags: 1 }
+    io_wheel[2]  = IoTicket{ seq: 104, lane_mask: 0b1000_0000, ext_word: ext_chain, key_hash: 0, dst_off: 0, crc: 0, flags: 1 }
+
+    done_cnt : u64 = 0
+    wheel_crc := drain_reactor_wheel(db_p, 14, 5, key_good, done_cnt)
+    print(done_cnt)
+    // lane 0 touched by slot 14 (100+14=114) and slot 0 (102+0=102) -> 114 ^ 102 = 20
+    // lane 2 touched by slot 14 (114) and slot 1 (103+1=104)        -> 114 ^ 104 = 26
+    // lane 4 touched by slot 0  (102)                               -> 102
+    // lane 7 touched by slot 2  (104+2=106)                         -> 106
+    print(lane_out[0])
+    print(lane_out[2])
+    print(lane_out[4])
+    print(lane_out[7])
+    print(wheel_crc != 0)
+
+    // 8. Test `CF` (`bt`), scattered `and`, & `@oneshot` store + relay + load
+    cf_hi := test_cf_and_oneshot_store(arena_p, (1 << 63) | 0x0005_00A5, 30, 0x7700_0000)
+    cf_lo := test_cf_and_oneshot_store(arena_p, 0x0001_0005,             31, 0x7700_0000)
+    print(cf_hi == ((0x7700_0000 ^ 0x0005_00A5) + 99))
+    print(cf_lo == ((0x7700_0000 ^ 0x0001_0005) + 22))
+
+    // 9. Test 1-based Eytzinger tree lookup over `[10, 20, 30, 40, 50, 60, 70]` -> BFS `[0, 40, 20, 60, 10, 30, 50, 70]`
+    ek : ptr* u64 = eytz_tree.base
+    ek[1] = 40  eytz_extents[1] = 4000
+    ek[2] = 20  eytz_extents[2] = 2000
+    ek[3] = 60  eytz_extents[3] = 6000
+    ek[4] = 10  eytz_extents[4] = 1000
+    ek[5] = 30  eytz_extents[5] = 3000
+    ek[6] = 50  eytz_extents[6] = 5000
+    ek[7] = 70  eytz_extents[7] = 7000
+
+    e_hit : u64 = 0
+    e_val := eytz_lookup(ek, 7, 50, e_hit)
+    print(e_val)
+    print(e_hit) // index 6 + 100 forwarded ref& bump = 106
+
+    // 10. Test Robin-Hood H2 `@bits` probe over `@cell64` inline `u64[3]` arrays
+    rb : ptr* RobinBucket = robin_tab.base
+    rb[0].occ_mask = 0b101
+    rb[0].h2_pack  = (0x5A << 16) | (0x11 << 8) | 0x5A
+    rb[0].keys[0]  = 1000  rb[0].vals[0] = 23
+    rb[0].keys[1]  = 9999  rb[0].vals[1] = 99
+    rb[0].keys[2]  = 2000  rb[0].vals[2] = 45
+
+    r_hits : u64 = 0
+    r_sum  := robin_probe_sum(rb, 0x5A, r_hits)
+    print(r_hits)
+    print(r_sum) // (1023 ^ 2045) = 1026
+
+    return 0
+}

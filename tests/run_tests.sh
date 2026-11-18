@@ -32,7 +32,7 @@ echo "  [PASS] deterministic self-hosting fixed point proven: $ZERO2 == $BUILD/z
 grep -q "lex ok:" "$BUILD/lex_showcase_z2.log"
 echo "  [PASS] [zero2] --lex verified on tests/lex_showcase.zr"
 
-echo "=== [2/7] Full 8-Suite Golden Parity, Inline Silicon, & AVX-512 EVEX Verification (Self-Hosted zero2) ==="
+echo "=== [2/7] Full 9-Suite Golden Parity, Inline Silicon, AVX-512 EVEX, & Next-Gen Spine Verification (Self-Hosted zero2) ==="
 run_z2_golden() {
     local src="$1"
     local bin="$2"
@@ -57,6 +57,7 @@ run_z2_golden "tests/phase1_zero_lang.zr"      "$BUILD/z2_phase1_zero_lang"     
 run_z2_golden "tests/phase2_zero_power.zr"     "$BUILD/z2_phase2_zero_power"     "tests/phase2_zero_power.expected"
 run_z2_golden "tests/phase3_reactor_fabric.zr" "$BUILD/z2_phase3_reactor_fabric" "tests/phase3_reactor_fabric.expected"
 run_z2_golden "tests/phase4_avx512_simd.zr"    "$BUILD/z2_phase4_avx512_simd"    "tests/phase4_avx512_simd.expected"
+run_z2_golden "tests/phase5_nextgen_spine.zr"  "$BUILD/z2_phase5_nextgen_spine"  "tests/phase5_nextgen_spine.expected"
 
 # Verify literal silicon & AVX-512 EVEX opcodes emitted directly in zero2 guest `.text` (offset 176 = 64B Ehdr + 2*56B Phdr)
 DIS_Z2_POWER=$(objdump -D -b binary -m i386:x86-64 --start-address=176 "$BUILD/z2_phase2_zero_power")
@@ -85,6 +86,26 @@ if ! grep -Eq 'vmovdqu(32|64).*\{%k1\}$' <<< "$DIS_Z2_SIMD"; then
     exit 1
 fi
 echo "  [PASS] [zero2] verified inline silicon + 512-bit AVX-512 EVEX opcodes (movdir64b, movdiri, movnti, vmovntdq, {%k1}{z}/{%k1}, kmovw, bzhi, ZMM ALU, incq)"
+
+# Verify Stage-1 Next-Gen Spine machine instructions (`bextr`, `bt`, `blsr`, `tzcnt`, `pause`, `@oneshot` relay/wipe, & zero-`cmp` after `mask<...>`)
+DIS_Z2_SPINE=$(objdump -D -b binary -m i386:x86-64 -M intel --start-address=176 "$BUILD/z2_phase5_nextgen_spine")
+for op in "bextr" "bt " "blsr" "tzcnt" "pause" "crc32" "mov    r9,r10" "xor    r10d,r10d" "xor    r9d,r9d"; do
+    if ! grep -q "$op" <<< "$DIS_Z2_SPINE"; then
+        echo "  [FAIL] $BUILD/z2_phase5_nextgen_spine missing Stage-1 hardware instruction/sequence: $op" >&2
+        exit 1
+    fi
+done
+# Prove ZERO `cmp` sits between `pause; dec rcx; jne` spin timeout and `when ZF => fail` branch:
+if ! awk '/\tpause$/{p=1; c=0} p{c++; if (/\tcmp/) exit 1; if (c==6) { if ($0 ~ /\tjne/) ok=1; p=0 }} END{exit(ok?0:1)}' <<< "$DIS_Z2_SPINE"; then
+    echo "  [FAIL] $BUILD/z2_phase5_nextgen_spine emitted a redundant cmp after 3-part spin mask<...>!" >&2
+    exit 1
+fi
+# Prove ZERO `cmp` sits between fused `bextr` (`0x32e` = `PIECES_BITS >> 46`) and `when ZF` branch:
+if ! awk '/0x32e/{p=1; c=0} p{c++; if (/cmp/) exit 1; if (c==4) { if ($0 ~ /jne/) ok=1; p=0 }} END{exit(ok?0:1)}' <<< "$DIS_Z2_SPINE"; then
+    echo "  [FAIL] $BUILD/z2_phase5_nextgen_spine emitted a redundant cmp after fused bextr mask<...>!" >&2
+    exit 1
+fi
+echo "  [PASS] [zero2] verified Stage-1 Next-Gen Spine opcodes (bextr, bt, blsr, tzcnt, pause, @oneshot mov+xor register wipes, & zero-cmp RFLAGS fusion)"
 
 echo "=== [3/7] Adversarial Negative Rejection Probes on Self-Hosted zero2 (ELF64, EFI, & Capsule) ==="
 expect_compile_reject() {
@@ -354,6 +375,71 @@ expect_compile_reject "bad_simd_nonvec_call" \
     $'@slab s : <u64 | max: 16>\nfn foo(x: i64) u64 { return x }\nfn main() { for i in 0..8 <simd: 8> { s[i] = foo(i) } }' \
     "unimplemented or invalid loop lens"
 
+# Phase-5 / Stage-1 Next-Gen `Zero` Spine (`;`, `struct @cell64`, `ptr* @oneshot`, `ref&`, `mask<...>`, `RFLAGS` liveness, `@ring`)
+expect_compile_reject "semi_end_of_line" \
+    $'fn main() {\n    x := 1;\n    print(x)\n}' \
+    "';' at end of line is forbidden"
+
+expect_compile_reject "semi_stmt_separator" \
+    'fn main() { x := 1 ; y := 2 }' \
+    "';' is only legal as an inline stage-to-flag/loop handoff"
+
+expect_compile_reject "bad_struct_cell64_48b" \
+    $'struct BadTicket @cell64 {\n    a: u64\n    b: u64\n    c: u64\n    d: u64\n    e: u64\n    f: u64\n}\nfn main() {}' \
+    "struct @cell64 must be exactly 64 bytes"
+
+expect_compile_reject "oneshot_escape_plain_ptr" \
+    $'@slab s : u64[8]\nfn main() {\n    p : ptr* @oneshot u64 = s.base\n    q : ptr* u64 = p\n}' \
+    "@oneshot pointer cannot be copied"
+
+expect_compile_reject "oneshot_double_deref" \
+    $'@slab s : u64[8]\nfn main() {\n    p : ptr* @oneshot u64 = s.base\n    a := p[0]\n    b := p[0]\n}' \
+    "@oneshot pointer already consumed"
+
+expect_compile_reject "oneshot_use_after_relay" \
+    $'@slab s : u64[8]\nfn main() {\n    p : ptr* @oneshot u64 = s.base\n    q : ptr* @oneshot u64 = p\n    a := p[0]\n    b := q[0]\n}' \
+    "@oneshot pointer already consumed"
+
+expect_compile_reject "oneshot_across_call" \
+    $'@slab s : u64[8]\nfn helper() u64 => 1\nfn main() {\n    p : ptr* @oneshot u64 = s.base\n    _ := helper()\n    a := p[0]\n}' \
+    "@oneshot pointer cannot remain live across a function call"
+
+expect_compile_reject "oneshot_unconsumed_scope" \
+    $'@slab s : u64[8]\nfn main() {\n    p : ptr* @oneshot u64 = s.base\n}' \
+    "unconsumed @oneshot pointer"
+
+expect_compile_reject "oneshot_asymmetric_branch" \
+    $'@slab s : u64[8]\nfn f(c: u64) u64 {\n    p : ptr* @oneshot u64 = s.base\n    when c == 1 {\n        _ := p[0]\n    }\n    return 0\n}\nfn main() { _ := f(0) }' \
+    "@oneshot pointer consumed inside single-arm"
+
+expect_compile_reject "oneshot_in_struct" \
+    $'struct Leak { p : ptr* @oneshot u64 }\nfn main() {}' \
+    "@oneshot pointer cannot be stored in a struct"
+
+expect_compile_reject "ref_rvalue_literal" \
+    $'fn bump(x: ref& u64) { x += 1 }\nfn main() { bump(42) }' \
+    "ref& requires an addressable mutable variable"
+
+expect_compile_reject "ref_oneshot_target" \
+    $'@slab s : u64[8]\nfn main() {\n    p : ptr* @oneshot u64 = s.base\n    r : ref& u64 = p\n}' \
+    "cannot take ref& of register-only @oneshot"
+
+expect_compile_reject "dead_zf_clobbered" \
+    $'@slab db : u32[4]\nfn main() {\n    p : ptr* u32 = db.base\n    s := mask<p[0] | 1 | until !ZF ; max 8>\n    clobber := s + 1\n    when ZF => fail 5\n}' \
+    "CPU flag referenced in 'when' is dead, clobbered, or mismatched"
+
+expect_compile_reject "cf_multibit_mask" \
+    $'fn main() {\n    x : u64 = 3\n    with when mask<x | 0b11> ; CF {\n        print(1)\n    }\n}' \
+    "mask<...> ; CF requires a single-bit mask"
+
+expect_compile_reject "ring_loop_on_slab" \
+    $'@slab s : u64[16]\nfn main() {\n    for idx, v in s @ring(0 .. 4) { print(v) }\n}' \
+    "@ring(start .. len) loop requires an @ring space"
+
+expect_compile_reject "spin_mask_on_scalar_local" \
+    $'fn main() {\n    x : u32 = 0\n    _ := mask<x | 1 | until !ZF ; max 16>\n}' \
+    "3-part spin mask<...> requires a dereferenced memory/pointer/space target"
+
 echo "=== [4/7] Runtime Unhandled Fault Exit Check (Self-Hosted zero2) ==="
 printf 'fn main() { fail 99 }\n' > "$BUILD/neg/unhandled_fail.zr"
 "$ZERO2" "$BUILD/neg/unhandled_fail.zr" "$BUILD/neg/unhandled_fail_z2.bin" > /dev/null
@@ -393,6 +479,53 @@ for op in "crc32" "pext" "pdep" "rol"; do
     fi
 done
 echo "  [PASS] [zero2] emitted 3 CRC32C-signed --target=capsule extents (compute $(stat -c%s "$BUILD/capsule_z2.zcap")B, AVX-512 wave $(stat -c%s "$BUILD/cap_avx512_wave.zcap")B, matrix-CRC $(stat -c%s "$BUILD/cap_matrix_crc.zcap")B)"
+
+# Verify Stage-1 Next-Gen Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `mask<...>`, `when`, `@bits`) on bare-metal `--target=capsule` Reactor ABI (`%gs:0`, `r12`)
+cat > "$BUILD/neg/cap_spine_probe.zr" << 'EOF'
+CRYPT_BIT   :: 1 << 44
+PIECES_BITS :: 0b111 << 46
+ADDR42_MASK :: 0x0000_03FF_FFFF_FFFF
+
+struct CapNode @cell64 {
+    exact_len : u64
+    key_tag   : u64
+    pieces    : u64[5]
+    next_ext  : u64
+}
+
+fn cap_unlock(arena: ptr* u8, ext: u64, key: u64, out_len: ref& u64) u64 {
+    with pcs := mask<ext | PIECES_BITS> >> 46 ; when !ZF {
+        node := ptr* CapNode (arena + (mask<ext | ADDR42_MASK> << 6))
+        out_len = node[0].exact_len + pcs
+    }
+    with when mask<ext | CRYPT_BIT> ; !ZF {
+        s0 : ptr* @oneshot u64 = arena + 64
+        s1 : ptr* @oneshot u64 = s0
+        return s1[0] ^ key ^ @reactor_id()
+    }
+    fail 4
+    return 0
+}
+
+fn main(base_raw: u64, ext: u64) u64 {
+    p : ptr* u8 = base_raw
+    seen : u64 = 0
+    acc  : u64 = cap_unlock(p, ext, 0x5A, seen)
+    when for b in seen @bits {
+        acc = @crc32c(acc, b)
+    }
+    return acc
+}
+EOF
+"$ZERO2" --target=capsule "$BUILD/neg/cap_spine_probe.zr" "$BUILD/cap_spine_probe.zcap" > /dev/null
+DIS_CAP_SPINE=$(objdump -D -b binary -m i386:x86-64 -M intel --start-address=64 "$BUILD/cap_spine_probe.zcap")
+for op in "bextr" "mov    r9,r10" "xor    r10d,r10d" "xor    r9d,r9d" "blsr" "gs:0x0"; do
+    if ! grep -q "$op" <<< "$DIS_CAP_SPINE"; then
+        echo "  [FAIL] $BUILD/cap_spine_probe.zcap missing Ring-0 Next-Gen Spine instruction: $op" >&2
+        exit 1
+    fi
+done
+echo "  [PASS] [zero2] verified Stage-1 Next-Gen Spine on Ring-0 --target=capsule Reactor ABI (ZEROZCAP + gs:0 + r12 + @oneshot wipes + bextr)"
 
 "$ZERO2" --target=efi-os "examples/gate1_os.zr" "$BUILD/gate1_os_z2.efi" > /dev/null
 HDR_EFI=$(objdump -p "$BUILD/gate1_os_z2.efi")
@@ -748,4 +881,4 @@ print(f"  [PASS] USB image booted via OVMF xHCI usb-storage in {t_boot:.1f}s -> 
 PY
 
 echo "=== Binary Footprint Summary ==="
-ls -lh --block-size=1 "$ZERO0" "$BUILD/zero1" "$ZERO2" "$BUILD/zero3" "$BUILD/z2_first" "$BUILD/z2_phase2_zero_power" "$BUILD/z2_phase3_reactor_fabric" "$BUILD/z2_phase4_avx512_simd" "$BUILD/capsule_z2.zcap" "$BUILD/cap_avx512_wave.zcap" "$BUILD/cap_matrix_crc.zcap" "$BUILD/gate1_os_z2.efi" "$BUILD/gate1_laptop_z2.efi" "$BUILD/zeroos_usb.img"
+ls -lh --block-size=1 "$ZERO0" "$BUILD/zero1" "$ZERO2" "$BUILD/zero3" "$BUILD/z2_first" "$BUILD/z2_phase2_zero_power" "$BUILD/z2_phase3_reactor_fabric" "$BUILD/z2_phase4_avx512_simd" "$BUILD/z2_phase5_nextgen_spine" "$BUILD/capsule_z2.zcap" "$BUILD/cap_avx512_wave.zcap" "$BUILD/cap_matrix_crc.zcap" "$BUILD/cap_spine_probe.zcap" "$BUILD/gate1_os_z2.efi" "$BUILD/gate1_laptop_z2.efi" "$BUILD/zeroos_usb.img"

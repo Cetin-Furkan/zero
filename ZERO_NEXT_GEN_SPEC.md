@@ -1,12 +1,12 @@
 # `Zero` Next-Generation Language Spine & `ZeroFS` (`ZLEDGER1`) Specification
 
 > [!IMPORTANT]
-> **Document Status — Frozen Engineering Specification (Stages 1 & 2, Pre-Implementation):**
-> This document defines the **locked-in architectural contract** for the next two engineering stages of `Zero` and `ZeroOS`:
-> - **Stage 1 (`compiler/*.zr`):** The Next-Generation `Zero` Language Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `struct ... [@cell64 | @packed]` with `T[N]`, inline `;` flag-handoff, `mask<...>`, `when` / `with ... ; when` / `with when` / `when while` / `when for`, `@ring(start .. len)`, and `@bits`).
-> - **Stage 2 (`ZeroFS` + `ZeroOS` Hardware Domains):** Non-POSIX explicit hardware subsystem bindings (`nvme`, `gt`, `gna`, `kbd`) and the **`ZeroFS` (`ZLEDGER1`)** NVMe Copy-on-Write extent ledger.
+> **Document Status — Stage 1 Implemented & Verified (`97 PASS / 0 FAIL`); Stage 2 Frozen Specification:**
+> This document defines the architectural contract for Stages 1 and 2 of `Zero` and `ZeroOS`:
+> - **Stage 1 (`compiler/*.zr`) — IMPLEMENTED & VERIFIED (`build/zero2 == build/zero3` at `627,661 B`):** The Next-Generation `Zero` Language Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `struct ... [@cell64 | @packed]` with `T[N]`, inline `;` flag-handoff, `mask<...>`, `when` / `with ... ; when` / `with when` / `when while` / `when for`, `@ring(start .. len)`, and `@bits`), verified across host `ELF64` (`tests/phase5_nextgen_spine.zr`), Ring-0 `--target=capsule` (`cap_spine_probe.zcap`), `objdump` zero-`cmp` / `@oneshot` wipe checks, and `16` dedicated negative compile-rejection probes (`70` total).
+> - **Stage 2 (`ZeroFS` + `ZeroOS` Hardware Domains) — FROZEN SPEC (Pre-Implementation, Next Stage):** Non-POSIX explicit hardware subsystem bindings (`nvme`, `gt`, `gna`, `kbd`) and the **`ZeroFS` (`ZLEDGER1`)** NVMe Copy-on-Write extent ledger (§3 below).
 >
-> Per the **Zero Honesty Rule**, none of the constructs in this file are claimed to exist in the current `build/zero2` binary until lowered to machine instructions and verified by `make test`. For what is **already implemented and verified today** (`zero2 == zero3` fixed point, Ring-0 `AVX-512`, SMP Reactor Fabric, NVMe `@capsule` engine, and `IRQ1`/`MWAIT` Command Deck), see `README.md`, `ZERO_OS_ARCHITECTURE.md`, and `CHANGES_AND_VERIFICATION_REPORT.md`.
+> Per the **Zero Honesty Rule**, Stage 2 (`ZeroFS` `ZLEDGER1` + hardware domains) is explicitly marked unimplemented until lowered to machine instructions and verified by `make test`. See `README.md`, `ZERO_OS_ARCHITECTURE.md`, and `CHANGES_AND_VERIFICATION_REPORT.md` for full empirical verification metrics.
 
 ---
 
@@ -427,26 +427,30 @@ test  rsi, rdx                  ; sets ZF directly (0 cmp!)
 jz    .fault_denied
 
 ; base_off := mask<ext | ADDR42_MASK> << 6
-mov   edx, 42
-bzhi  rax, rsi, rdx             ; extract bits [41:0] in 1 cycle
+mov   edx, 0x2A00               ; len = 42 (0x2A << 8), start = 0
+bextr rax, rax, rdx             ; extract contiguous bits [41:0] in 1 BMI1 instruction
 shl   rax, 6
 
 ; with when mask<ext | CRYPT_BIT> ; !ZF { ... }
 mov   rdx, 0x0000100000000000   ; CRYPT_BIT (1 << 44)
-test  rsi, rdx                  ; sets ZF (0 cmp!)
+test  rax, rdx                  ; sets ZF (0 cmp!)
 jz    .plain_path               ; !ZF false -> skip encrypted block
 
 ; secret_p : ptr* @oneshot u64 = arena + base_off + 64
-lea   r10, [rdi + rax + 64]     ; secret_p born in GPR r10 (NO [rbp-disp] slot!)
+; (@oneshot GPR pool: slots 0..3 -> [r10, r9, rsi, rdi], 0 stack spill slots!)
+add   rax, rcx                  ; arena + base_off (spill-free local RHS add)
+add   rax, 64                   ; + 64 (spill-free immediate RHS add)
+mov   r10, rax                  ; secret_p born in GPR r10 (NO [rbp-disp] slot!)
+xor   eax, eax                  ; scrub staging GPR rax immediately!
 ; shown : ptr* @oneshot u64 = secret_p
-mov   r11, r10                  ; legal 1-hop @oneshot relay to r11
-xor   r10d, r10d                ; IMMEDIATE wipe of secret_p (r10 == 0)!
+mov   r9, r10                   ; legal 1-hop @oneshot relay from r10 -> r9
+xor   r10d, r10d                ; IMMEDIATE architectural wipe of secret_p (r10 == 0)!
 ; out_bytes = hdr[0].exact_len  (writes directly through ref& pointer)
 mov   rax, qword [r_hdr]
 mov   qword [r_out_bytes], rax
 ; plain_word := shown[0] ^ caller_key
-mov   rax, qword [r11]          ; single terminal dereference of shown
-xor   r11d, r11d                ; IMMEDIATE wipe of shown (r11 == 0)!
+mov   rax, qword [r9]           ; single terminal dereference of shown
+xor   r9d, r9d                  ; IMMEDIATE architectural wipe of shown (r9 == 0)!
 xor   rax, r_caller_key
 ```
 
