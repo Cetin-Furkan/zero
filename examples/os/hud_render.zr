@@ -2,6 +2,8 @@
 // ZeroOS Non-Temporal `movnti` / `vmovntdq` Scanout & Obsidian Command Deck (`os/hud_render.zr`)
 // =============================================================================
 use "hw_types.zr"
+use "hw_domains.zr"
+use "zerofs_ledger.zr"
 
 // Complete 5x7 binary bitmap font packed into 35-bit `u64` constants (`row 0` in `[34:30]`)
 GLYPH_A :: (0b01110 << 30) | (0b10001 << 25) | (0b10001 << 20) | (0b11111 << 15) | (0b10001 << 10) | (0b10001 << 5) | 0b10001
@@ -451,6 +453,87 @@ fn draw_command_deck(handoff: @BootHandoff, online_cores: u64, active_cap_slot: 
     // Footer Legend (`y = 300..330`)
     draw_rect_safe(handoff, 34, 300, 572, 30, hdr_fill)
     draw_rect_safe(handoff, 34, 300, 572, 1, bg_border)
-    draw_deck_text(handoff, 40, 309, "[1/2/3] EXEC CAPSULE  [B] SIMD BENCH  [Q] SHUTDOWN", fg_amber)
+    draw_deck_text(handoff, 40, 309, "[1/2/3] CAPSULE  [4] ZEROFS  [B] SIMD  [Q] HALT", fg_amber)
+    draw_zerofs_panel(handoff)
+    return 0
+}
+
+// Renders the Stage-2 `ZEROFS ZLEDGER1 // HW DOMAINS` cockpit panel at `x=624..1200, y=84..332`
+// (strictly above `(pw/2, ph/2) = (640, 400)` on `1280x800` GOP and clear of all existing HUD regions!)
+fn draw_zerofs_panel(handoff: @BootHandoff) i64 {
+    if handoff.gop_width < 1220 || handoff.gop_height < 680 {
+        return 0
+    }
+    fmt: u64  = handoff.gop_format
+    bg_border := pack_rgb(0x00, 0xE5, 0xFF, fmt)
+    bg_fill   := pack_rgb(0x0C, 0x10, 0x18, fmt)
+    hdr_fill  := pack_rgb(0x12, 0x1A, 0x2A, fmt)
+    div_col   := pack_rgb(0x1E, 0x32, 0x4A, fmt)
+    fg_cyan   := pack_rgb(0x00, 0xFF, 0xAA, fmt)
+    fg_amber  := pack_rgb(0xFF, 0xD6, 0x00, fmt)
+    fg_violet := pack_rgb(0xE0, 0x66, 0xFF, fmt)
+    fg_white  := pack_rgb(0xF0, 0xF4, 0xFF, fmt)
+    fg_sky    := pack_rgb(0x64, 0xD2, 0xFF, fmt)
+    fg_muted  := pack_rgb(0x78, 0x8A, 0xA4, fmt)
+
+    draw_rect_safe(handoff, 624, 84, 576, 248, bg_border)
+    draw_rect_safe(handoff, 626, 86, 572, 244, bg_fill)
+    draw_rect_safe(handoff, 626, 86, 572, 26, hdr_fill)
+    draw_rect_safe(handoff, 626, 112, 572, 2, bg_border)
+
+    cx: u64 = draw_deck_text(handoff, 636, 92, "ZEROFS ZLEDGER1 // PCI DOMAINS:", fg_white)
+    draw_deck_val(handoff, cx + 6, 92, hw_dom_summary[0], fg_cyan)
+
+    // Row 1 (`y = 122`): Non-POSIX Hardware Domains (`nvme`, `gt`, `gna`, `xhci`, `net`)
+    cx = draw_deck_text(handoff, 636, 122, "DOM:", fg_sky)
+    if dom_nvme.present != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "NVME:ON", fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "NVME:--", fg_muted) }
+    if dom_gt.present   != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "GT:ON",   fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "GT:--",   fg_muted) }
+    if dom_gna.present  != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "GNA:ON",  fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "GNA:--",  fg_muted) }
+    if dom_xhci.present != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "XHCI:ON", fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "XHCI:--", fg_muted) }
+
+    // Row 2 (`y = 148`): Mandatory `ZLEDGER1` Partition Guard Status
+    cx = draw_deck_text(handoff, 636, 148, "WRITE GUARD:", fg_white)
+    if zfs_is_write_armed() == 1 {
+        draw_deck_text(handoff, cx + 8, 148, "ZLEDGER1 ARMED [COW RW]", fg_cyan)
+    } else {
+        draw_deck_text(handoff, 636 + 13 * 11, 148, "SAFE_RO [FOREIGN LOCKED]", fg_amber)
+    }
+
+    // Row 3 (`y = 174`): CoW Superblock Epoch & Mirror (`A` / `B`)
+    cx = draw_deck_text(handoff, 636, 174, "SUPER EPOCH:", fg_sky)
+    cx = draw_deck_val(handoff, cx + 8, 174, zfs_state[2], fg_violet)
+    cx = draw_deck_text(handoff, cx + 14, 174, "MIRROR:", fg_sky)
+    if zfs_state[11] == 1 {
+        draw_deck_text(handoff, cx + 8, 174, "BUCKET_1 [A]", fg_cyan)
+    } else {
+        if zfs_state[11] == 2 {
+            draw_deck_text(handoff, cx + 8, 174, "BUCKET_2 [B]", fg_cyan)
+        } else {
+            draw_deck_text(handoff, cx + 8, 174, "NONE", fg_muted)
+        }
+    }
+
+    // Row 4 (`y = 200`): Descending Snapshot ID & Eytzinger B-Tree Key Count
+    cx = draw_deck_text(handoff, 636, 200, "EYTZ KEYS:", fg_sky)
+    cx = draw_deck_val(handoff, cx + 8, 200, zfs_state[6], fg_cyan)
+    cx = draw_deck_text(handoff, cx + 14, 200, "SNAP:", fg_sky)
+    draw_deck_val(handoff, cx + 8, 200, zfs_state[3], fg_amber)
+
+    // Row 5 (`y = 224`): Hardware Crypto & `@oneshot` Engine
+    draw_deck_text(handoff, 636, 224, "CRYPTO: AES-128-CTR + SHA-NI + ONESHOT", fg_violet)
+
+    draw_rect_safe(handoff, 634, 245, 556, 1, div_col)
+
+    // Row 6 (`y = 256`): Last Verified NVMe CoW Transaction Value
+    cx = draw_deck_text(handoff, 636, 256, "LAST COW TX:", fg_white)
+    if zfs_state[10] == 0 {
+        draw_deck_text(handoff, cx + 8, 256, "IDLE // PRESS [4]", fg_cyan)
+    } else {
+        draw_deck_val(handoff, cx + 8, 256, zfs_state[10], fg_amber)
+    }
+
+    draw_rect_safe(handoff, 626, 300, 572, 30, hdr_fill)
+    draw_rect_safe(handoff, 626, 300, 572, 1, bg_border)
+    draw_deck_text(handoff, 634, 309, "[4] COMMIT COW SNAP + AES-NI EXTENT TO NVME", fg_amber)
     return 0
 }

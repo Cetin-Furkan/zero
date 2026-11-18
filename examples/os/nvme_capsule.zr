@@ -12,6 +12,15 @@
 // =============================================================================
 use "hw_types.zr"
 use "paging_wx.zr"
+use "zerofs_ledger.zr"
+
+// Persistent NVMe controller state for post-boot `ZeroFS` (`ZLEDGER1`) DMA:
+//   [0]=ready, [1]=lbads, [2]=blks_per_4k, [3]=iosq_db, [4]=iocq_db, [5]=io_seq, [6]=ns_bytes
+@slab nvme_ctrl_state   : u64[8]
+@slab zfs_nvme_sba_page : u8[4096]
+@slab zfs_nvme_sbb_page : u8[4096]
+@slab zfs_nvme_root_page: u8[4096]
+@slab zfs_nvme_io_page  : u8[4096]
 
 fn get_loaded_capsule_entry(idx: u64) u64 {
     if idx >= CAPSULE_MAX_SLOTS {
@@ -172,6 +181,8 @@ fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
     for ci in 0..16 {
         cap_dir_entries[ci] = 0
     }
+    nvme_ctrl_state[0] = 0
+    zfs_disarm_safe_ro()
 
     bar0: u64 = find_nvme_bar0_via_mcfg(handoff)
     if bar0 == 0 {
@@ -259,16 +270,34 @@ fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
         return 0
     }
 
-    // 5. Lock-Free I/O Read (`Opcode = 0x02`) of Master Extent Table at LBA 0 (`4 KiB`)
+    // 5. Record initialized NVMe I/O `@dma_queue` state & read `MasterExtentSuper` at LBA 0 (`4 KiB`)
+    nsze_qwords := @view<u64>(nvme_meta_page.base, 2)
+    ns_bytes: u64 = nsze_qwords[0] << lbads
     blks_per_4k: u32 = (4096 >> lbads) - 1
     io_seq: u64 = 0
+
+    nvme_ctrl_state[0] = 1
+    nvme_ctrl_state[1] = lbads
+    nvme_ctrl_state[2] = blks_per_4k
+    nvme_ctrl_state[3] = iosq_db
+    nvme_ctrl_state[4] = iocq_db
+    nvme_ctrl_state[5] = 0
+    nvme_ctrl_state[6] = ns_bytes
+
     if nvme_io_read_4k(0, nvme_meta_page.base, blks_per_4k, iosq_db, iocq_db, io_seq) == 0 {
+        nvme_ctrl_state[0] = 0
         return 0
     }
     io_seq += 1
+    nvme_ctrl_state[5] = io_seq
 
     super := @view<MasterExtentSuper>(nvme_meta_page.base)
     if super.magic != ZEXT_MAGIC || super.version != 1 || super.extent_count == 0 {
+        // Seal unused capsule arena as `PTE_RO_NX` even when LBA 0 is not `ZEXTENT1` (e.g. foreign drive)!
+        for rem0 in 0..CAPSULE_MAX_SLOTS {
+            u_r0: u64 = rem0
+            seal_capsule_wx_rx(boot_capsule.base + u_r0 * CAPSULE_SLOT_BYTES, 0, CAPSULE_SLOT_BYTES)
+        }
         return 0
     }
 
@@ -327,6 +356,7 @@ fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
         u_rem: u64 = rem_idx
         seal_capsule_wx_rx(boot_capsule.base + u_rem * CAPSULE_SLOT_BYTES, 0, CAPSULE_SLOT_BYTES)
     }
+    nvme_ctrl_state[5] = io_seq
 
     // 7. Verify `Extent 0` per-core `gs:0` `fail 88` `recover` + boot compute (`777`)!
     ext0_entry: u64 = cap_dir_entries[0]
@@ -345,3 +375,255 @@ fn probe_and_exec_nvme_capsule(handoff: @BootHandoff) u64 {
 }
 
 fn load_and_run_nvme_capsule(handoff: @BootHandoff) u64 => probe_and_exec_nvme_capsule(handoff)
+
+// =============================================================================
+// Stage-2 Bare-Metal NVMe `ZeroFS` (`ZLEDGER1`) Driver & Mandatory Write Guard
+// =============================================================================
+
+fn nvme_dma_read_4k(byte_off: u64, dst_phys: u64) u64 {
+    if nvme_ctrl_state[0] != 1 || (byte_off & 4095) != 0 {
+        return 0
+    }
+    if byte_off + 4096 > nvme_ctrl_state[6] {
+        return 0
+    }
+    lbads:   u64 = nvme_ctrl_state[1]
+    blks_4k: u32 = nvme_ctrl_state[2]
+    iosq_db: u64 = nvme_ctrl_state[3]
+    iocq_db: u64 = nvme_ctrl_state[4]
+    seq:     u64 = nvme_ctrl_state[5]
+
+    ok: u64 = nvme_io_read_4k(byte_off >> lbads, dst_phys, blks_4k, iosq_db, iocq_db, seq)
+    if ok == 0 {
+        return 0
+    }
+    nvme_ctrl_state[5] = seq + 1
+    return 1
+}
+
+// HARD HARDWARE INTERLOCK (`ZERO_NEXT_GEN_SPEC.md` §3.2):
+// Refuses ANY NVMe Write (`Opcode = 0x01`) unless `zfs_is_write_armed() == 1` (verified `ZLEDGER1`
+// magic + `@crc32c` on target disk!) AND `byte_off >= 2 MiB` (Bucket 0 `ZEXTENT1` is immutable!).
+fn nvme_dma_write_4k_guarded(byte_off: u64, src_phys: u64) u64 {
+    if nvme_ctrl_state[0] != 1 || zfs_is_write_armed() != 1 {
+        return 0
+    }
+    if byte_off < ZFS_BUCKET_SUPER_A * ZFS_BUCKET_BYTES || (byte_off & 4095) != 0 {
+        return 0
+    }
+    if byte_off + 4096 > nvme_ctrl_state[6] {
+        return 0
+    }
+
+    lbads:      u64 = nvme_ctrl_state[1]
+    blks_4k:    u32 = nvme_ctrl_state[2]
+    iosq_db:    u64 = nvme_ctrl_state[3]
+    iocq_db:    u64 = nvme_ctrl_state[4]
+    seq:        u64 = nvme_ctrl_state[5]
+    lba_start:  u64 = byte_off >> lbads
+    next_tail:  u64 = (seq + 1) & 15
+    exp_phase:  u64 = ((seq >> 4) & 1) ^ 1
+    cid_v:      u32 = 0x100 + (seq & 0x7FFF)
+
+    wr_cmd := NvmeCmd{
+        cdw0: (cid_v << 16) | 0x01, nsid: 1, rsv0: 0, mptr: 0,
+        prp1: src_phys, prp2: 0,
+        cdw10: lba_start[31:0], cdw11: lba_start[63:32], cdw12: blks_4k,
+        cdw13: 0, cdw14: 0, cdw15: 0
+    }
+    ok: u64 = nvme_submit_and_poll(
+        nvme_io_sq1.slot_addr(seq),
+        nvme_io_cq1.slot_addr(seq),
+        wr_cmd,
+        iosq_db,
+        iocq_db,
+        (next_tail << 1) | exp_phase
+    )
+    if ok == 0 {
+        return 0
+    }
+    nvme_ctrl_state[5] = seq + 1
+    return 1
+}
+
+// HARD HARDWARE INTERLOCK: NVMe Flush (`Opcode = 0x00`) also requires `zfs_is_write_armed() == 1`!
+fn nvme_dma_flush_guarded() u64 {
+    if nvme_ctrl_state[0] != 1 || zfs_is_write_armed() != 1 {
+        return 0
+    }
+    iosq_db:   u64 = nvme_ctrl_state[3]
+    iocq_db:   u64 = nvme_ctrl_state[4]
+    seq:       u64 = nvme_ctrl_state[5]
+    next_tail: u64 = (seq + 1) & 15
+    exp_phase: u64 = ((seq >> 4) & 1) ^ 1
+    cid_v:     u32 = 0x200 + (seq & 0x7FFF)
+
+    fl_cmd := NvmeCmd{
+        cdw0: (cid_v << 16) | 0x00, nsid: 1, rsv0: 0, mptr: 0,
+        prp1: 0, prp2: 0,
+        cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0
+    }
+    ok: u64 = nvme_submit_and_poll(
+        nvme_io_sq1.slot_addr(seq),
+        nvme_io_cq1.slot_addr(seq),
+        fl_cmd,
+        iosq_db,
+        iocq_db,
+        (next_tail << 1) | exp_phase
+    )
+    if ok == 0 {
+        return 0
+    }
+    nvme_ctrl_state[5] = seq + 1
+    return 1
+}
+
+// Probes Buckets 1 & 2 (`0x20_0000` & `0x40_0000`) via Read ONLY:
+//   • Foreign / unformatted / `ZEXTENT1`-only drives stay locked in `SAFE_RO` (`0` writes ever issued!).
+//   • Genuine `ZLEDGER1` drives mount the highest-epoch valid superblock & Eytzinger `CRC32C` root!
+fn mount_nvme_zerofs() u64 {
+    zfs_disarm_safe_ro()
+    if nvme_ctrl_state[0] != 1 {
+        return 0
+    }
+    if nvme_dma_read_4k(ZFS_BUCKET_SUPER_A * ZFS_BUCKET_BYTES, zfs_nvme_sba_page.base) == 0 {
+        return 0
+    }
+    if nvme_dma_read_4k(ZFS_BUCKET_SUPER_B * ZFS_BUCKET_BYTES, zfs_nvme_sbb_page.base) == 0 {
+        return 0
+    }
+
+    sb_a := ptr* ZLedgerSuperblock (zfs_nvme_sba_page.base)
+    sb_b := ptr* ZLedgerSuperblock (zfs_nvme_sbb_page.base)
+    va: u64 = zfs_validate_super(sb_a)
+    vb: u64 = zfs_validate_super(sb_b)
+    if va == 0 && vb == 0 {
+        return 0
+    }
+
+    chosen : ptr* ZLedgerSuperblock = sb_a
+    if vb == 1 {
+        if va == 0 || sb_b[0].epoch >= sb_a[0].epoch {
+            chosen = sb_b
+        }
+    }
+
+    root_byte_off: u64 = mask<chosen[0].root_ext | ZFS_ADDR42_MASK> << 6
+    if nvme_dma_read_4k(root_byte_off, zfs_nvme_root_page.base) == 0 {
+        return 0
+    }
+
+    mounted_ep: u64 = 0
+    {
+        mounted_ep = zfs_mount_from_supers(sb_a, sb_b, ptr* u8 (zfs_nvme_root_page.base))
+    } recover _merr {
+        zfs_disarm_safe_ro()
+        mounted_ep = 0
+    }
+    return mounted_ep
+}
+
+// Executes a full crash-safe CoW `ZeroFS` (`ZLEDGER1`) transaction on bare-metal NVMe:
+//   1. $O(1)$ descending snapshot (`current_snap -= 1`)
+//   2. `AES-128-CTR` + `SHA-NI` locked extent write (`4 KiB` DMA page)
+//   3. CoW `4 KiB` Eytzinger `CRC32C` B-tree root write + NVMe `Flush`
+//   4. Alternating `ZLedgerSuperblock` (`Mirror A` <-> `Mirror B`) write + NVMe `Flush`
+//   5. Hardware DMA readback + `AES-NI`/`SHA-NI` decrypt + `ptr* @oneshot` register-wiped verification!
+fn exec_nvme_zerofs_cow_tx(online_cores: u64) u64 {
+    if zfs_is_write_armed() != 1 || nvme_ctrl_state[0] != 1 {
+        return 0
+    }
+
+    new_snap: u32   = zfs_create_snapshot()
+    next_ep:  u64   = zfs_state[2] + 1
+    id_hash:  u64   = 0x5A46_5300_0000_0000 | next_ep
+    user_key: u64   = 0x5A45_524F_2026_4B45
+    want_val: u64   = next_ep * 100000 + online_cores * 100 + zfs_state[6] + 1
+
+    data_bid: u64   = 0
+    data_off: u64   = zfs_alloc_cow_bytes(online_cores - 1, 4096, 4096, data_bid)
+
+    // Build `64B` `ZfsPieceHeader32` + `64B` `AES-128-CTR` encrypted cacheline in `zfs_nvme_io_page`
+    io_qw := ptr* u64 (zfs_nvme_io_page.base)
+    for z in 0..512 {
+        uz: u64 = z
+        io_qw[uz] = 0
+    }
+    ktag: u64 = @sha256_tag(user_key, id_hash)
+    hdr := ptr* ZfsPieceHeader32 (zfs_nvme_io_page.base)
+    hdr[0].exact_len = 64
+    hdr[0].key_tag   = ktag
+    hdr[0].p0        = 1
+    hdr[0].p1        = 0
+
+    io_qw[8] = want_val
+    io_qw[9] = new_snap
+    cipher_p := ptr* u8 (zfs_nvme_io_page.base + 64)
+    _ := @aes128_ctr64(cipher_p, cipher_p, user_key, id_hash)
+    ccrc: u32  = zfs_crc32c_bytes(cipher_p, 64)
+    ext_w: u64 = zfs_encode_extent_word(data_off, 64, ZFS_PERM_RW, ZFS_CRYPT_AES_SHA, 0, 1)
+
+    kp := ptr* LedgerKey (zfs_key_scratch.base)
+    kp[0].id_hash     = id_hash
+    kp[0].snap_id     = new_snap
+    kp[0].bucket_id   = data_bid
+    kp[0].bucket_gen  = zfs_bucket_gens[data_bid]
+    kp[0].ext_word    = ext_w
+    kp[0].key_tag     = ktag
+    kp[0].exact_len   = 64
+    kp[0].owner_rid   = online_cores - 1
+    kp[0].data_crc32c = ccrc
+    kp[0].meta_flags  = ((id_hash >> 56) & 0xFF) | (1 << 8)
+    kp[0].reserved    = 0
+    kp[0].entry_crc   = 0
+    zfs_stage_insert_key(kp)
+
+    root_bid: u64 = 0
+    root_off: u64 = zfs_alloc_cow_bytes(0, 4096, 4096, root_bid)
+    sbp := ptr* ZLedgerSuperblock (zfs_sb_scratch.base)
+    mirror_b: u64 = zfs_prepare_cow_commit(ptr* u8 (zfs_nvme_root_page.base), root_off, sbp)
+
+    // Ordered CoW NVMe persistence: Data + B-Tree Root -> Flush -> Alternating Superblock -> Flush!
+    if nvme_dma_write_4k_guarded(data_off, zfs_nvme_io_page.base) == 0 { @halt() }
+    if nvme_dma_write_4k_guarded(root_off, zfs_nvme_root_page.base) == 0 { @halt() }
+    if nvme_dma_flush_guarded() == 0 { @halt() }
+
+    sb_page_base: u64 = zfs_nvme_sba_page.base
+    if mirror_b == 2 {
+        sb_page_base = zfs_nvme_sbb_page.base
+    }
+    sb_qw := ptr* u64 (sb_page_base)
+    for z in 0..512 {
+        uz: u64 = z
+        sb_qw[uz] = 0
+    }
+    dst_sb := ptr* ZLedgerSuperblock (sb_page_base)
+    dst_sb[0] = sbp[0]
+    if nvme_dma_write_4k_guarded(mirror_b * ZFS_BUCKET_BYTES, sb_page_base) == 0 { @halt() }
+    if nvme_dma_flush_guarded() == 0 { @halt() }
+
+    // Clear RAM buffer, DMA back `data_off` from NVMe, decrypt via `AES-NI`, and read via `ptr* @oneshot`!
+    for z in 0..32 {
+        uz: u64 = z
+        io_qw[uz] = 0
+    }
+    if nvme_dma_read_4k(data_off, zfs_nvme_io_page.base) == 0 { @halt() }
+    if hdr[0].key_tag != @sha256_tag(user_key, id_hash) { @halt() }
+
+    pad_p := ptr* u8 (zfs_crypto_scratch.base)
+    _ := @aes128_ctr64(pad_p, cipher_p, user_key, id_hash)
+    secret_p : ptr* @oneshot u64 = pad_p + 0
+    shown    : ptr* @oneshot u64 = secret_p
+    got_val  : u64               = shown[0]
+
+    pad_qw := ptr* u64 (zfs_crypto_scratch.base)
+    for z in 0..8 {
+        uz: u64 = z
+        pad_qw[uz] = 0
+    }
+    if got_val != want_val {
+        @halt()
+    }
+    zfs_state[10] = got_val
+    return got_val
+}

@@ -9,6 +9,8 @@ use "os/debug_io.zr"
 use "os/paging_wx.zr"
 use "os/reactor_fabric.zr"
 use "os/smp_madt.zr"
+use "os/hw_domains.zr"
+use "os/zerofs_ledger.zr"
 use "os/nvme_capsule.zr"
 use "os/ioapic_kbd.zr"
 use "os/hud_render.zr"
@@ -141,7 +143,9 @@ fn main(handoff: @BootHandoff) i64 {
 
     online_cores:  u64 = bring_up_madt_cores(handoff)
     fabric_cycles: u64 = run_reactor_fabric(online_cores)
+    _dom_found:    u64 = discover_pci_domains(handoff)
     cap_val:       u64 = load_and_run_nvme_capsule(handoff)
+    _zfs_boot_ep:  u64 = mount_nvme_zerofs()
     init_ioapic_kbd(handoff)
 
     // Recheck hardware W^X page tables AFTER dynamic NVMe `@capsule` sealing & I/O APIC UC MMIO map!
@@ -235,6 +239,32 @@ fn main(handoff: @BootHandoff) i64 {
                 dbg_str("CAP3=")
                 dbg_u64_dec(v3)
                 dbg_str("\n")
+            }
+            continue
+        }
+
+        if sc == 0x05 {
+            if zfs_is_write_armed() == 0 {
+                draw_zerofs_panel(handoff)
+                @sfence()
+                if qemu_debug == 1 {
+                    dbg_str("ZFS=SAFE_RO\n")
+                }
+            } else {
+                tx_v: u64 = exec_nvme_zerofs_cow_tx(online_cores)
+                draw_zerofs_panel(handoff)
+                @sfence()
+                if qemu_debug == 1 {
+                    dbg_str("ZFS=OK EPOCH=")
+                    dbg_u64_dec(zfs_state[2])
+                    dbg_str(" SNAP=")
+                    dbg_u64_dec(zfs_state[3])
+                    dbg_str(" KEYS=")
+                    dbg_u64_dec(zfs_state[6])
+                    dbg_str(" VAL=")
+                    dbg_u64_dec(tx_v)
+                    dbg_str("\n")
+                }
             }
             continue
         }

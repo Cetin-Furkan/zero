@@ -1,0 +1,113 @@
+// =============================================================================
+// ZeroOS Stage-2 Non-POSIX Hardware `@domain` Discovery (`examples/os/hw_domains.zr`)
+// =============================================================================
+// Abolishes POSIX `/dev/*` VFS character/block illusions (`ZERO_NEXT_GEN_SPEC.md` §3.1):
+// binds physical Tiger Lake / Q35 PCIe subsystems directly via ACPI `MCFG`/`ECAM`
+// into compile-time separated `@domain` descriptors (`npu` is a hard compile error!).
+// =============================================================================
+use "hw_types.zr"
+use "paging_wx.zr"
+
+@domain dom_nvme : nvme
+@domain dom_gt   : gt
+@domain dom_gna  : gna
+@domain dom_xhci : xhci
+@domain dom_net  : net
+
+@slab hw_dom_summary : u64[4]
+
+fn stamp_hw_domain(base_addr: u64, bdf: u64, vdev: u64, bar0: u64, caps: u64) i64 {
+    qw := ptr* u64 (base_addr)
+    if qw[0] == 0 {
+        qw[0] = 1
+        qw[1] = bdf
+        qw[2] = vdev
+        qw[3] = bar0
+        qw[4] = 0x4000
+        qw[5] = caps
+    }
+    return 0
+}
+
+fn discover_pci_domains(handoff: @BootHandoff) u64 {
+    hw_dom_summary[0] = 0
+    if handoff.mcfg == 0 {
+        return 0
+    }
+    hdr := @view<AcpiSdtHeader>(handoff.mcfg)
+    if hdr.signature != MCFG_SIG || hdr.length < 60 {
+        return 0
+    }
+    ent := @view<AcpiMcfgEntry>(handoff.mcfg + 44)
+    if ent.ecam_base == 0 {
+        return 0
+    }
+
+    start_bus: u64 = ent.start_bus
+    end_bus:   u64 = ent.end_bus
+    if end_bus > start_bus + 7 {
+        end_bus = start_bus + 7
+    }
+    ensure_uc_mmio_mapped(ent.ecam_base + (start_bus << 20), (end_bus - start_bus + 1) << 20)
+
+    found: u64 = 0
+    for b in start_bus..(end_bus + 1) {
+        ub: u64 = b
+        for d in 0..32 {
+            ud: u64 = d
+            for f in 0..8 {
+                uf: u64 = f
+                cfg_addr: u64 = ent.ecam_base + (ub << 20) + (ud << 15) + (uf << 12)
+                cfg := @mmio<u32>(cfg_addr, 16)
+                vd: u32 = cfg[0]
+                if vd == 0xFFFF_FFFF {
+                    if uf == 0 { break }
+                    continue
+                }
+                cls: u32  = cfg[2]
+                bdf: u64  = (ub << 8) | (ud << 3) | uf
+                blo: u64  = cfg[4]
+                bar0: u64 = blo & 0xFFFF_FFF0
+                if (blo & 0x06) == 0x04 {
+                    bhi: u64 = cfg[5]
+                    bar0 |= (bhi << 32)
+                }
+
+                // `nvme` (`01h:08h:02h` — SK hynix BC511 `1c5c:1339` / QEMU NVMe)
+                if cls[31:8] == 0x010802 {
+                    stamp_hw_domain(dom_nvme.base, bdf, vd, bar0, 1)
+                    found += 1
+                }
+                // `gt` (`03h:xxh:xxh` — Intel Iris Xe GT2 `8086:9a49` / GOP display engine)
+                if cls[31:24] == 0x03 {
+                    stamp_hw_domain(dom_gt.base, bdf, vd, bar0, 2)
+                    found += 1
+                }
+                // `gna` (`8086:9a11` — Intel GNA 2.0 Scoring Accelerator at `00:08.0` on Tiger Lake)
+                if vd == 0x9A118086 {
+                    stamp_hw_domain(dom_gna.base, bdf, vd, bar0, 3)
+                    found += 1
+                }
+                // `xhci` (`0Ch:03h:30h` — USB 3.2 xHCI `8086:a0ed` / `qemu-xhci`)
+                if cls[31:8] == 0x0C0330 {
+                    stamp_hw_domain(dom_xhci.base, bdf, vd, bar0, 4)
+                    found += 1
+                }
+                // `net` (`02h:xxh:xxh` — Intel Wi-Fi 7 `8086:272b` / PCIe NIC)
+                if cls[31:24] == 0x02 {
+                    stamp_hw_domain(dom_net.base, bdf, vd, bar0, 5)
+                    found += 1
+                }
+
+                if uf == 0 {
+                    hdr_t: u32 = cfg[3]
+                    if hdr_t[23:23] == 0 {
+                        break
+                    }
+                }
+            }
+        }
+    }
+    hw_dom_summary[0] = found
+    return found
+}

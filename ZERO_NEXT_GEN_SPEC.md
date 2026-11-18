@@ -1,12 +1,12 @@
 # `Zero` Next-Generation Language Spine & `ZeroFS` (`ZLEDGER1`) Specification
 
 > [!IMPORTANT]
-> **Document Status — Stage 1 Implemented & Verified (`97 PASS / 0 FAIL`); Stage 2 Frozen Specification:**
-> This document defines the architectural contract for Stages 1 and 2 of `Zero` and `ZeroOS`:
-> - **Stage 1 (`compiler/*.zr`) — IMPLEMENTED & VERIFIED (`build/zero2 == build/zero3` at `627,661 B`):** The Next-Generation `Zero` Language Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `struct ... [@cell64 | @packed]` with `T[N]`, inline `;` flag-handoff, `mask<...>`, `when` / `with ... ; when` / `with when` / `when while` / `when for`, `@ring(start .. len)`, and `@bits`), verified across host `ELF64` (`tests/phase5_nextgen_spine.zr`), Ring-0 `--target=capsule` (`cap_spine_probe.zcap`), `objdump` zero-`cmp` / `@oneshot` wipe checks, and `16` dedicated negative compile-rejection probes (`70` total).
-> - **Stage 2 (`ZeroFS` + `ZeroOS` Hardware Domains) — FROZEN SPEC (Pre-Implementation, Next Stage):** Non-POSIX explicit hardware subsystem bindings (`nvme`, `gt`, `gna`, `kbd`) and the **`ZeroFS` (`ZLEDGER1`)** NVMe Copy-on-Write extent ledger (§3 below).
+> **Document Status — Stages 1 & 2 BOTH Implemented & Verified (`107 PASS / 0 FAIL`):**
+> Both stages defined in this specification are now **100% lowered, self-hosted, and verified** (`build/zero2 == build/zero3` at `653,982 B`, `make clean && make test && make usb-img`):
+> - **Stage 1 (`compiler/*.zr`) — IMPLEMENTED & VERIFIED:** The Next-Generation `Zero` Language Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `struct ... [@cell64 | @packed]` with `T[N]`, inline `;` flag-handoff, `mask<...>`, `when` / `with ... ; when` / `with when` / `when while` / `when for`, `@ring(start .. len)`, and `@bits`), verified in `tests/phase5_nextgen_spine.zr` and Ring-0 `cap_spine_probe.zcap`.
+> - **Stage 2 (`compiler/*.zr` + `examples/os/zerofs_ledger.zr` + `examples/os/hw_domains.zr` + `examples/os/nvme_capsule.zr`) — IMPLEMENTED & VERIFIED:** Non-POSIX hardware `@domain` bindings (`nvme`, `gt`, `gna`, `xhci`, `net`; `npu` rejected at compile time on Tiger Lake), `128-bit XMM` `@sha256_tag` (`SHA-NI`) & `@aes128_ctr64` (`AES-NI`) with immediate `pxor` XMM wipes, and the **`ZeroFS` (`ZLEDGER1`)** Copy-on-Write NVMe storage engine, verified in `tests/phase6_zerofs_ledger.zr` AND live 4-core QEMU/KVM + OVMF + NVMe `ZeroOS` (including cold-reboot persistence and foreign GPT/LUKS/ext4 `SAFE_RO` `0`-write protection).
 >
-> Per the **Zero Honesty Rule**, Stage 2 (`ZeroFS` `ZLEDGER1` + hardware domains) is explicitly marked unimplemented until lowered to machine instructions and verified by `make test`. See `README.md`, `ZERO_OS_ARCHITECTURE.md`, and `CHANGES_AND_VERIFICATION_REPORT.md` for full empirical verification metrics.
+> Per the **Zero Honesty Rule**, future Gate-4 items (`<tile: Size>`, `@cold` struct splitting, and `Iris Xe` `CCS0` GPU walker) remain explicitly marked unimplemented until lowered and verified.
 
 ---
 

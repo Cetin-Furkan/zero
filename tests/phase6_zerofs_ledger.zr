@@ -1,0 +1,366 @@
+// =============================================================================
+// Golden Suite #10 — Stage-2 Non-POSIX `@domain`s & `ZeroFS` (`ZLEDGER1`) Stress Test
+// =============================================================================
+use "../examples/os/zerofs_ledger.zr"
+
+// Non-POSIX Hardware `@domain` Declarations (`ZERO_NEXT_GEN_SPEC.md` §3.1 — `npu` is rejected!)
+@domain dom_nvme : nvme
+@domain dom_gt   : gt
+@domain dom_gna  : gna
+@domain dom_xhci : xhci
+@domain dom_net  : net
+
+// 16 MiB (`8` x `2 MiB` buckets) in-RAM NVMe namespace simulation + test buffers (`.bss`, `0` disk bytes)
+@slab sim_nvme_media : u8[16777216]
+@slab large_plain    : u8[1048704]
+@slab read_out_buf   : u8[4096]
+@slab root_snap_old  : u8[4096]
+@slab seg_buf_pool   : u8[1024]
+@slab seg_ptr_arr    : u64[16]
+@slab seg_len_arr    : u64[16]
+@slab dec_ch         : u8[32]
+@slab out_ch         : u8[32]
+
+fn bind_mock_domain(base_addr: u64, bdf: u64, vdev: u64, bar0: u64, bsz: u64, caps: u64) i64 {
+    qw := ptr* u64 (base_addr)
+    qw[0] = 1
+    qw[1] = bdf
+    qw[2] = vdev
+    qw[3] = bar0
+    qw[4] = bsz
+    qw[5] = caps
+    return 0
+}
+
+fn print_u64_line(tag: str, v: u64) i64 {
+    @syscall(1, 1, tag.ptr, tag.len)
+    if v == 0 {
+        print("0")
+        return 0
+    }
+    cur: u64 = v
+    n: u64   = 0
+    loop <max: 24 | until: cur == 0> {
+        dec_ch[n] = 48 + (cur % 10)
+        cur /= 10
+        n += 1
+    }
+    for i in 0..n {
+        ui: u64 = i
+        out_ch[ui] = dec_ch[n - 1 - ui]
+    }
+    out_ch[n] = 10
+    s := out_ch[0..(n + 1)]
+    @syscall(1, 1, s.ptr, s.len)
+    return 0
+}
+
+fn main() i64 {
+    // -------------------------------------------------------------------------
+    // 1. Non-POSIX Hardware `@domain` Identity Binding (`i7-1165G7` Silicon Map)
+    // -------------------------------------------------------------------------
+    if dom_nvme.kind != 1 || dom_gt.kind != 2 || dom_gna.kind != 3 || dom_xhci.kind != 4 || dom_net.kind != 5 {
+        return 11
+    }
+    bind_mock_domain(dom_nvme.base, 0x0200, 0x13391C5C, 0x82400000, 0x4000, 16)
+    bind_mock_domain(dom_gt.base,   0x0010, 0x9A498086, 0x6000000000, 0x1000000, 12)
+    bind_mock_domain(dom_gna.base,  0x0040, 0x9A118086, 0x6001100000, 0x1000, 2)
+    bind_mock_domain(dom_xhci.base, 0x00A0, 0xA0ED8086, 0x6001000000, 0x10000, 32)
+    bind_mock_domain(dom_net.base,  0x0100, 0x272B8086, 0x82200000, 0x4000, 7)
+
+    if dom_nvme.present != 1 || dom_nvme.vendor_dev != 0x13391C5C || dom_gna.vendor_dev != 0x9A118086 {
+        return 12
+    }
+    print("DOMAINS_OK nvme=1c5c:1339 gt=8086:9a49 gna=8086:9a11 xhci=8086:a0ed net=8086:272b")
+
+    media := ptr* u8 (sim_nvme_media.base)
+
+    // -------------------------------------------------------------------------
+    // 2. Mandatory `ZLEDGER1` Partition Safety Guard (Foreign `LUKS`/`ext4` Disk!)
+    // -------------------------------------------------------------------------
+    luks_p := ptr* u64 (media + ZFS_BUCKET_SUPER_A * ZFS_BUCKET_BYTES)
+    ext4_p := ptr* u64 (media + ZFS_BUCKET_SUPER_B * ZFS_BUCKET_BYTES)
+    luks_p[0] = 0xBABE_0002_534B_554C // "LUKS..."
+    ext4_p[0] = 0x0000_EF53_3454_5845 // "EXT4..."
+
+    sb_a := ptr* ZLedgerSuperblock (media + ZFS_BUCKET_SUPER_A * ZFS_BUCKET_BYTES)
+    sb_b := ptr* ZLedgerSuperblock (media + ZFS_BUCKET_SUPER_B * ZFS_BUCKET_BYTES)
+    root_p := media + ZFS_BUCKET_COW0 * ZFS_BUCKET_BYTES
+
+    m_foreign: u64 = zfs_mount_from_supers(sb_a, sb_b, root_p)
+    if m_foreign != 0 || zfs_is_write_armed() != 0 {
+        return 21
+    }
+
+    // Attempting to write on an unarmed foreign drive MUST raise `ZFS_FAULT_DENIED` (4) with 0 bytes modified!
+    foreign_fault: u64 = 0
+    {
+        _ := zfs_put_contiguous(media, 0, 0x999, ptr* u8 (seg_buf_pool.base), 64, ZFS_PERM_RW | (1 << 8))
+    } recover ferr {
+        foreign_fault = ferr
+    }
+    if foreign_fault != ZFS_FAULT_DENIED || luks_p[0] != 0xBABE_0002_534B_554C {
+        return 22
+    }
+    print("FOREIGN_GUARD_OK safe_ro=1 fault=4")
+
+    // Format genuine `ZLEDGER1` (`8` x `2 MiB` buckets), then verify single-bit superblock CRC32C tamper fails safe!
+    _ := zfs_format_memory_ledger(media, 8)
+    sb_a[0].crc32c ^= 1
+    if zfs_mount_from_supers(sb_a, sb_b, root_p) != 0 || zfs_is_write_armed() != 0 {
+        return 23
+    }
+    sb_a[0].crc32c ^= 1
+    if zfs_mount_from_supers(sb_a, sb_b, root_p) != 1 || zfs_is_write_armed() != 1 {
+        return 24
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Adaptive `000..111` Piece Topology (`000`, `010`, `100`, `111` Chain)
+    // -------------------------------------------------------------------------
+    for i in 0..1024 {
+        ui: u64 = i
+        seg_buf_pool[ui] = ((ui * 29 + 7) ^ (ui >> 2)) & 0xFF
+    }
+    pool_p := ptr* u8 (seg_buf_pool.base)
+
+    // `000` contiguous (`192 B` on Reactor 0)
+    id_c0 : u64 = 0x1100_0000_0000_0001
+    ew_c0 : u64 = zfs_put_contiguous(media, 0, id_c0, pool_p, 192, ZFS_PERM_RW | (1 << 8))
+    if (mask<ew_c0 | ZFS_PIECES_BITS> >> 46) != 0 {
+        return 31
+    }
+
+    // `010` `PieceHeader32` (`2` pieces: `128 B + 96 B = 224 B` on Reactor 1)
+    seg_ptr_arr[0] = seg_buf_pool.base
+    seg_ptr_arr[1] = seg_buf_pool.base + 128
+    seg_len_arr[0] = 128
+    seg_len_arr[1] = 96
+    id_p2 : u64 = 0x2200_0000_0000_0002
+    ew_p2 : u64 = zfs_put_pieces(media, 1, id_p2, ptr* u64 (seg_ptr_arr.base), ptr* u64 (seg_len_arr.base), 2 | (ZFS_PERM_RO << 16))
+    if (mask<ew_p2 | ZFS_PIECES_BITS> >> 46) != 2 {
+        return 32
+    }
+
+    // `100` single `ExtentChain64` (`4` pieces: `4 x 64 B = 256 B` on Reactor 2)
+    for s in 0..4 {
+        us: u64 = s
+        seg_ptr_arr[us] = seg_buf_pool.base + 256 + us * 64
+        seg_len_arr[us] = 64
+    }
+    id_p4 : u64 = 0x3300_0000_0000_0003
+    ew_p4 : u64 = zfs_put_pieces(media, 2, id_p4, ptr* u64 (seg_ptr_arr.base), ptr* u64 (seg_len_arr.base), 4 | (ZFS_PERM_RO << 16))
+    if (mask<ew_p4 | ZFS_PIECES_BITS> >> 46) != 4 {
+        return 33
+    }
+
+    // `111` multi-node `ExtentChain64` chain (`8` pieces: `8 x 64 B = 512 B` on Reactor 3, 2 linked chain nodes!)
+    for s in 0..8 {
+        us: u64 = s
+        seg_ptr_arr[us] = seg_buf_pool.base + 512 + us * 64
+        seg_len_arr[us] = 64
+    }
+    id_p8 : u64 = 0x4400_0000_0000_0004
+    ew_p8 : u64 = zfs_put_pieces(media, 3, id_p8, ptr* u64 (seg_ptr_arr.base), ptr* u64 (seg_len_arr.base), 8 | (ZFS_PERM_RO << 16))
+    if (mask<ew_p8 | ZFS_PIECES_BITS> >> 46) != 7 {
+        return 34
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Descending `u32` Snapshots (`S0 -> S1 -> S2`) & Eytzinger B-Tree Lookup
+    // -------------------------------------------------------------------------
+    id_ver : u64 = 0x5500_0000_0000_0005
+    id_s2only : u64 = 0x5500_0000_0000_0099
+    snap0 : u32 = zfs_state[3] // 0xFFFF_FFFE
+
+    vbuf := ptr* u64 (read_out_buf.base)
+    vbuf[0] = 0xAAAA_1111_0000_0001
+    _ := zfs_put_contiguous(media, 0, id_ver, ptr* u8 (read_out_buf.base), 64, ZFS_PERM_RW | (2 << 8))
+
+    snap1 : u32 = zfs_create_snapshot() // 0xFFFF_FFFD
+    vbuf[0] = 0xBBBB_2222_0000_0002
+    _ := zfs_put_contiguous(media, 0, id_ver, ptr* u8 (read_out_buf.base), 64, ZFS_PERM_RW | (2 << 8))
+
+    snap2 : u32 = zfs_create_snapshot() // 0xFFFF_FFFC
+    vbuf[0] = 0xCCCC_3333_0000_0003
+    _ := zfs_put_contiguous(media, 0, id_ver, ptr* u8 (read_out_buf.base), 64, ZFS_PERM_RW | (2 << 8))
+    vbuf[0] = 0x9999_8888_7777_6666
+    _ := zfs_put_contiguous(media, 0, id_s2only, ptr* u8 (read_out_buf.base), 64, ZFS_PERM_RW | (2 << 8))
+
+    // -------------------------------------------------------------------------
+    // 5. Seekable `1.06 MiB` `AES-NI` + `SHA-NI` Locked Extent (`[1_048_576 .. 1_048_640]`)
+    // -------------------------------------------------------------------------
+    lp_qw := ptr* u64 (large_plain.base)
+    for q in 0..(1048704 / 8) {
+        uq: u64 = q
+        lp_qw[uq] = 0x5A00_0000_0000_0000 ^ (uq * 0x9E37_79B9_7F4A_7C15)
+    }
+    lp_qw[0]                = 0x1111_2222_3333_4444
+    lp_qw[1048576 / 8]      = 0xDEAD_C0DE_1048_5760 // byte 1,048,576 (`blk_idx = 16384`, qw 0)
+    lp_qw[1048576 / 8 + 5]  = 0xCAFE_F00D_ABCD_9876 // byte 1,048,616 (`blk_idx = 16384`, qw 5)
+
+    id_secret  : u64 = 0x7700_0000_0000_0777
+    secret_key : u64 = 0x5A45_524F_CAFE_BEEF
+    ew_sec     : u64 = zfs_put_locked(media, 1, id_secret, ptr* u8 (large_plain.base), 1048704, secret_key)
+
+    // Verify on-disk ciphertext at `[1_048_576]` is genuinely encrypted (not plaintext!)
+    sec_disk_off: u64 = (mask<ew_sec | ZFS_ADDR42_MASK> << 6) + 64 + 1048576
+    cipher_check := ptr* u64 (media + sec_disk_off)
+    if cipher_check[0] == 0xDEAD_C0DE_1048_5760 {
+        return 51
+    }
+
+    // Commit CoW root (`epoch = 2`, Mirror B) and remount cleanly from Superblocks A & B!
+    ep2: u64 = zfs_commit_to_memory_arena(media, 0)
+    cur_root_off: u64 = mask<zfs_state[7] | ZFS_ADDR42_MASK> << 6
+    if ep2 != 2 || zfs_mount_from_supers(sb_a, sb_b, media + cur_root_off) != 2 {
+        return 52
+    }
+    cur_root := media + cur_root_off
+    out_p    := ptr* u8 (read_out_buf.base)
+    got_len  : u64 = 0
+
+    // Verify all 4 piece topologies (`000`, `010`, `100`, `111`) reassemble byte-identically!
+    _ := zfs_read_open_extent(media, cur_root, id_c0, snap2, out_p, got_len)
+    if got_len != 192 || out_p[0] != pool_p[0] || out_p[191] != pool_p[191] { return 35 }
+
+    _ := zfs_read_open_extent(media, cur_root, id_p2, snap2, out_p, got_len)
+    if got_len != 224 || out_p[127] != pool_p[127] || out_p[223] != pool_p[223] { return 36 }
+
+    _ := zfs_read_open_extent(media, cur_root, id_p4, snap2, out_p, got_len)
+    if got_len != 256 || out_p[0] != pool_p[256] || out_p[255] != pool_p[511] { return 37 }
+
+    _ := zfs_read_open_extent(media, cur_root, id_p8, snap2, out_p, got_len)
+    if got_len != 512 || out_p[0] != pool_p[512] || out_p[511] != pool_p[1023] { return 38 }
+    print("PIECES_OK p0=192 p2=224 p4=256 p8_chain=512")
+
+    // Verify silent bit-rot detection on `000` payload (`ZFS_FAULT_CORRUPT == 5`)!
+    c0_off: u64 = mask<ew_c0 | ZFS_ADDR42_MASK> << 6
+    media[c0_off + 17] ^= 0x80
+    rot_fault: u64 = 0
+    {
+        _ := zfs_read_open_extent(media, cur_root, id_c0, snap2, out_p, got_len)
+    } recover rerr {
+        rot_fault = rerr
+    }
+    media[c0_off + 17] ^= 0x80
+    if rot_fault != ZFS_FAULT_CORRUPT { return 39 }
+
+    // Verify point-in-time descending snapshots (`S2`, `S1`, `S0`)!
+    _ := zfs_read_open_extent(media, cur_root, id_ver, snap2, out_p, got_len)
+    if vbuf[0] != 0xCCCC_3333_0000_0003 { return 41 }
+    _ := zfs_read_open_extent(media, cur_root, id_ver, snap1, out_p, got_len)
+    if vbuf[0] != 0xBBBB_2222_0000_0002 { return 42 }
+    _ := zfs_read_open_extent(media, cur_root, id_ver, snap0, out_p, got_len)
+    if vbuf[0] != 0xAAAA_1111_0000_0001 { return 43 }
+
+    s0_miss: u64 = 0
+    {
+        _ := zfs_read_open_extent(media, cur_root, id_s2only, snap0, out_p, got_len)
+    } recover merr {
+        s0_miss = merr
+    }
+    if s0_miss != ZFS_FAULT_NOENT { return 44 }
+    print("SNAPSHOTS_OK s2=3 s1=2 s0=1 historical_isolation=1")
+
+    // Verify locked extent protection + single-cacheline random seek at `1,048,576` (`1 MiB`)!
+    unauth_fault: u64 = 0
+    {
+        _ := zfs_read_open_extent(media, cur_root, id_secret, snap2, out_p, got_len)
+    } recover uerr {
+        unauth_fault = uerr
+    }
+    badkey_fault: u64 = 0
+    {
+        _ := zfs_seek_locked_qword(media, cur_root, id_secret, snap2, 1048576, 0xBAD0_1234)
+    } recover berr {
+        badkey_fault = berr
+    }
+    if unauth_fault != ZFS_FAULT_DENIED || badkey_fault != ZFS_FAULT_DENIED {
+        return 53
+    }
+
+    dec_1m_a: u64 = zfs_seek_locked_qword(media, cur_root, id_secret, snap2, 1048576, secret_key)
+    dec_1m_b: u64 = zfs_seek_locked_qword(media, cur_root, id_secret, snap2, 1048616, secret_key)
+    dec_0:    u64 = zfs_seek_locked_qword(media, cur_root, id_secret, snap2, 0, secret_key)
+    if zfs_state[10] != 1048704 || dec_1m_a != 0xDEAD_C0DE_1048_5760 || dec_1m_b != 0xCAFE_F00D_ABCD_9876 || dec_0 != 0x1111_2222_3333_4444 {
+        return 54
+    }
+    // Verify transient crypto scratch pad was scrubbed to 0!
+    for z in 0..64 {
+        uz: u64 = z
+        if zfs_crypto_scratch[uz] != 0 { return 55 }
+    }
+    print("AES_SHA_ONESHOT_SEEK_OK off=1048576 wipe=1")
+
+    // Verify $O(1)$ `@bits` open-extent fingerprint scan skips the locked extent (`8` open versions, `0` locked)!
+    open_hits: u64 = 0
+    _ := zfs_scan_open_domain(0, open_hits)
+    if open_hits != 8 {
+        return 56
+    }
+    print_u64_line("OPEN_SCAN_HITS=", open_hits)
+
+    // -------------------------------------------------------------------------
+    // 6. Backpointer Bucket Evacuation (`Bucket 3 -> Bucket 6`), `gen++` & Torn-Super Recovery
+    // -------------------------------------------------------------------------
+    // Save a copy of `epoch=2` Eytzinger root before evacuating Bucket 3
+    for c in 0..4096 {
+        uc: u64 = c
+        root_snap_old[uc] = cur_root[uc]
+    }
+    // Re-populate Bucket 3 backpointers in RAM (simulating live session before compaction) & evacuate `3 -> 6`
+    _ := zfs_format_memory_ledger(media, 8)
+    vbuf[0] = 0x7777_6666_5555_4444
+    _ := zfs_put_contiguous(media, 0, 0x8800_0000_0000_0001, ptr* u8 (read_out_buf.base), 64, ZFS_PERM_RW | (1 << 8))
+    ep_pre: u64 = zfs_commit_to_memory_arena(media, 0)
+    old_root_off: u64 = mask<zfs_state[7] | ZFS_ADDR42_MASK> << 6
+    for c in 0..4096 {
+        uc: u64 = c
+        root_snap_old[uc] = media[old_root_off + uc]
+    }
+
+    moved_cnt: u64 = zfs_evacuate_bucket(media, 3, 6)
+    if moved_cnt != 1 || zfs_bucket_gens[3] != 2 {
+        return 61
+    }
+
+    // Stale `LedgerKey` in `root_snap_old` has `bucket_id=3, bucket_gen=1 != 2` -> MUST fail `ZFS_FAULT_CORRUPT`!
+    stale_fault: u64 = 0
+    {
+        _ := zfs_read_open_extent(media, ptr* u8 (root_snap_old.base), 0x8800_0000_0000_0001, ZFS_SNAP_INIT, out_p, got_len)
+    } recover serr {
+        stale_fault = serr
+    }
+    if stale_fault != ZFS_FAULT_CORRUPT {
+        return 62
+    }
+
+    // Commit new CoW root (`epoch = 3`, Mirror A) and simulate a crashed torn write on Mirror B (`epoch = 99`, bad CRC)!
+    ep3: u64 = zfs_commit_to_memory_arena(media, 3)
+    sb_b[0].epoch  = 99
+    sb_b[0].crc32c = 0xDEAD_BEEF
+    new_root_off: u64 = mask<sb_a[0].root_ext | ZFS_ADDR42_MASK> << 6
+    recovered_ep: u64 = zfs_mount_from_supers(sb_a, sb_b, media + new_root_off)
+    if ep_pre != 2 || ep3 != 3 || recovered_ep != 3 {
+        return 63
+    }
+    _ := zfs_read_open_extent(media, media + new_root_off, 0x8800_0000_0000_0001, ZFS_SNAP_INIT, out_p, got_len)
+    if vbuf[0] != 0x7777_6666_5555_4444 {
+        return 64
+    }
+
+    // Drain MOVDIR64B commit ring via `@ring(0 .. 1)`
+    ring_seen: u64 = 0
+    when zfs_state[8] > 0 ; for slot, ev in zfs_commit_ring @ring(0 .. 1) {
+        if ev.seq >= 1 && slot == 0 {
+            ring_seen = 1
+        }
+    }
+    if ring_seen != 1 {
+        return 65
+    }
+
+    print("GC_AND_FAILOVER_OK moved=1 gen3=2 recovered_epoch=3")
+    return 0
+}

@@ -208,6 +208,24 @@ fn lexer_init() {
     g[G_SYM_WHILE]         = sym_intern_str("while")
     g[G_SYM_ZF]            = sym_intern_str("ZF")
     g[G_SYM_CF]            = sym_intern_str("CF")
+
+    // Stage-2 Hardware `@domain` & `128-Bit XMM` `AES-NI`/`SHA-NI` Contextual Symbols
+    g[G_SYM_DOMAIN]        = sym_intern_str("domain")
+    g[G_SYM_NVME]          = sym_intern_str("nvme")
+    g[G_SYM_GT]            = sym_intern_str("gt")
+    g[G_SYM_GNA]           = sym_intern_str("gna")
+    g[G_SYM_XHCI]          = sym_intern_str("xhci")
+    g[G_SYM_NET]           = sym_intern_str("net")
+    g[G_SYM_NPU]           = sym_intern_str("npu")
+    g[G_SYM_SHA256_TAG]    = sym_intern_str("sha256_tag")
+    g[G_SYM_AES128_CTR64]  = sym_intern_str("aes128_ctr64")
+    g[G_SYM_KIND]          = sym_intern_str("kind")
+    g[G_SYM_PRESENT]       = sym_intern_str("present")
+    g[G_SYM_BDF]           = sym_intern_str("bdf")
+    g[G_SYM_VENDOR_DEV]    = sym_intern_str("vendor_dev")
+    g[G_SYM_BAR0]          = sym_intern_str("bar0")
+    g[G_SYM_BAR_SIZE]      = sym_intern_str("bar_size")
+    g[G_SYM_CAPS]          = sym_intern_str("caps")
 }
 
 // Canonicalizes `path_scratch[0..raw_len)` into `canon_buf[0..out_len)` (NUL-terminated)

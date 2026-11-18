@@ -2256,8 +2256,8 @@ fn parse_stmt_for() {
     }
 
     if sp_i >= 0 {
-        if sp_kind[sp_i] == SKIND_PORT {
-            die_cur("error: parse fault (cannot iterate @port)")
+        if sp_kind[sp_i] == SKIND_PORT || sp_kind[sp_i] == SKIND_DOMAIN {
+            die_cur("error: parse fault (cannot iterate @port or @domain)")
         }
         g[G_TOK_IDX] += 1
 

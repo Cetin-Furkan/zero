@@ -32,7 +32,7 @@ echo "  [PASS] deterministic self-hosting fixed point proven: $ZERO2 == $BUILD/z
 grep -q "lex ok:" "$BUILD/lex_showcase_z2.log"
 echo "  [PASS] [zero2] --lex verified on tests/lex_showcase.zr"
 
-echo "=== [2/7] Full 9-Suite Golden Parity, Inline Silicon, AVX-512 EVEX, & Next-Gen Spine Verification (Self-Hosted zero2) ==="
+echo "=== [2/7] Full 10-Suite Golden Parity, Inline Silicon, AVX-512 EVEX, Next-Gen Spine, & ZeroFS Verification ==="
 run_z2_golden() {
     local src="$1"
     local bin="$2"
@@ -58,6 +58,7 @@ run_z2_golden "tests/phase2_zero_power.zr"     "$BUILD/z2_phase2_zero_power"    
 run_z2_golden "tests/phase3_reactor_fabric.zr" "$BUILD/z2_phase3_reactor_fabric" "tests/phase3_reactor_fabric.expected"
 run_z2_golden "tests/phase4_avx512_simd.zr"    "$BUILD/z2_phase4_avx512_simd"    "tests/phase4_avx512_simd.expected"
 run_z2_golden "tests/phase5_nextgen_spine.zr"  "$BUILD/z2_phase5_nextgen_spine"  "tests/phase5_nextgen_spine.expected"
+run_z2_golden "tests/phase6_zerofs_ledger.zr"  "$BUILD/z2_phase6_zerofs_ledger"  "tests/phase6_zerofs_ledger.expected"
 
 # Verify literal silicon & AVX-512 EVEX opcodes emitted directly in zero2 guest `.text` (offset 176 = 64B Ehdr + 2*56B Phdr)
 DIS_Z2_POWER=$(objdump -D -b binary -m i386:x86-64 --start-address=176 "$BUILD/z2_phase2_zero_power")
@@ -107,6 +108,16 @@ if ! awk '/0x32e/{p=1; c=0} p{c++; if (/cmp/) exit 1; if (c==4) { if ($0 ~ /jne/
 fi
 echo "  [PASS] [zero2] verified Stage-1 Next-Gen Spine opcodes (bextr, bt, blsr, tzcnt, pause, @oneshot mov+xor register wipes, & zero-cmp RFLAGS fusion)"
 
+# Verify Stage-2 ZeroFS (`ZLEDGER1`) 128-bit XMM SHA-NI + AES-NI + XMM key-wipe + MOVDIR64B + @oneshot opcodes
+DIS_Z2_ZFS=$(objdump -D -b binary -m i386:x86-64 -M intel --start-address=176 "$BUILD/z2_phase6_zerofs_ledger")
+for op in "sha256rnds2" "sha256msg1" "sha256msg2" "aeskeygenassist" "aesenc " "aesenclast" "pxor   xmm4,xmm4" "pxor   xmm5,xmm5" "movdir64b" "bextr" "blsr" "mov    r9,r10" "xor    r10d,r10d" "xor    r9d,r9d"; do
+    if ! grep -q "$op" <<< "$DIS_Z2_ZFS"; then
+        echo "  [FAIL] $BUILD/z2_phase6_zerofs_ledger missing Stage-2 ZeroFS hardware instruction: $op" >&2
+        exit 1
+    fi
+done
+echo "  [PASS] [zero2] verified Stage-2 ZeroFS opcodes (sha256rnds2/msg1/msg2, aeskeygenassist/aesenc/aesenclast, pxor XMM wipes, movdir64b, @oneshot)"
+
 echo "=== [3/7] Adversarial Negative Rejection Probes on Self-Hosted zero2 (ELF64, EFI, & Capsule) ==="
 expect_compile_reject() {
     local name="$1"
@@ -120,7 +131,7 @@ expect_compile_reject() {
         echo "  [FAIL] $name unexpectedly compiled under $ZERO2!" >&2
         exit 1
     fi
-    grep -q "$expected_err" "$err_log"
+    grep -q -- "$expected_err" "$err_log"
     echo "  [PASS] [zero2] rejected $name ($(cat "$err_log"))"
 }
 
@@ -136,7 +147,7 @@ expect_efi_reject() {
         echo "  [FAIL] $name unexpectedly compiled under $ZERO2 --target=efi-os!" >&2
         exit 1
     fi
-    grep -q "$expected_err" "$err_log"
+    grep -q -- "$expected_err" "$err_log"
     echo "  [PASS] [zero2] rejected $name ($(cat "$err_log"))"
 }
 
@@ -152,7 +163,7 @@ expect_capsule_reject() {
         echo "  [FAIL] $name unexpectedly compiled under $ZERO2 --target=capsule!" >&2
         exit 1
     fi
-    grep -q "$expected_err" "$err_log"
+    grep -q -- "$expected_err" "$err_log"
     echo "  [PASS] [zero2] rejected $name ($(cat "$err_log"))"
 }
 
@@ -440,6 +451,35 @@ expect_compile_reject "spin_mask_on_scalar_local" \
     $'fn main() {\n    x : u32 = 0\n    _ := mask<x | 1 | until !ZF ; max 16>\n}' \
     "3-part spin mask<...> requires a dereferenced memory/pointer/space target"
 
+# --- Stage-2 Hardware `@domain` & `128-Bit XMM` Crypto Negative Probes ---
+expect_compile_reject "tigerlake_npu_domain_rejected" \
+    $'@domain bad_accel : npu\nfn main() { }' \
+    "Tiger Lake (i7-1165G7) has no NPU silicon block; use 'gna' domain"
+
+expect_compile_reject "unknown_hw_domain_kind" \
+    $'@domain bad_dev : quantum_tpu\nfn main() { }' \
+    "unknown hardware @domain kind"
+
+expect_compile_reject "domain_indexed_as_dram" \
+    $'@domain d : nvme\nfn main() {\n    x := d[0]\n    print(x)\n}' \
+    "hardware @domain is not DRAM"
+
+expect_capsule_reject "domain_in_capsule_target" \
+    $'@domain d : gna\nfn main(a: u64, b: u64) u64 { return a + b }' \
+    "--target=capsule forbids mutable"
+
+expect_efi_reject "sha256_in_isr_rejected" \
+    $'@isr fn bad_isr() {\n    _ := @sha256_tag(1, 2)\n}\nfn main() i64 => 0' \
+    "@isr/@isr_ok forbids 128-bit XMM crypto intrinsics"
+
+expect_efi_reject "aes128_in_isr_ok_rejected" \
+    $'@slab b : u8[64]\n@isr_ok fn bad_leaf() u64 {\n    p := ptr* u8 (b.base)\n    return @aes128_ctr64(p, p, 1, 2)\n}\nfn main() i64 => 0' \
+    "@isr/@isr_ok forbids 128-bit XMM crypto intrinsics"
+
+expect_compile_reject "extent_word_indexed_without_staging" \
+    $'fn main() {\n    ext_word : u64 = 0x18000\n    v := ext_word[0]\n    print(v)\n}' \
+    "parse fault"
+
 echo "=== [4/7] Runtime Unhandled Fault Exit Check (Self-Hosted zero2) ==="
 printf 'fn main() { fail 99 }\n' > "$BUILD/neg/unhandled_fail.zr"
 "$ZERO2" "$BUILD/neg/unhandled_fail.zr" "$BUILD/neg/unhandled_fail_z2.bin" > /dev/null
@@ -535,7 +575,7 @@ if objdump -x "$BUILD/gate1_os_z2.efi" | grep -E "^\s*[0-9]+\s+\." -A1 | paste -
     echo "  [FAIL] $BUILD/gate1_os_z2.efi contains a writable+executable PE32+ section!" >&2
     exit 1
 fi
-for efi_op in "movdir64b" "monitor" "mwait" "iretq" "vmovntdq" "vzeroupper" "{%k1}{z}" "kmovw" "sfence" "crc32" "%gs:0x0" "%gs:0x8"; do
+for efi_op in "movdir64b" "monitor" "mwait" "iretq" "vmovntdq" "vzeroupper" "{%k1}{z}" "kmovw" "sfence" "crc32" "sha256rnds2" "aesenc" "aesenclast" "%gs:0x0" "%gs:0x8"; do
     if ! grep -q "$efi_op" <<< "$DIS_EFI"; then
         echo "  [FAIL] $BUILD/gate1_os_z2.efi missing hardware instruction/prefix: $efi_op" >&2
         exit 1
@@ -561,7 +601,7 @@ echo "  [PASS] [zero2] laptop variant (qemu_debug :: 0) compiled -> $BUILD/gate1
 
 echo "=== [6/7] Interactive Tickless ZeroOS Command Deck: IRQ1/MWAIT + 3 NVMe @capsule Extents on 4 Reactors (QEMU Q35 + OVMF) ==="
 python3 - <<'PY'
-import os, re, shutil, socket, struct, subprocess, sys, time
+import hashlib, os, re, shutil, socket, struct, subprocess, sys, time
 
 ovmf = "/usr/share/edk2/x64/OVMF_CODE.4m.fd"
 if not os.path.exists(ovmf):
@@ -571,7 +611,25 @@ if not os.path.exists(ovmf):
 os.makedirs("build/esp/EFI/BOOT", exist_ok=True)
 shutil.copyfile("build/gate1_os_z2.efi", "build/esp/EFI/BOOT/BOOTX64.EFI")
 
-# 16 MiB raw NVMe disk: `ZEXTENT1` Master Extent Table (3 entries) + 3 zero2-compiled `.zcap` extents (4 KiB aligned)
+def crc32c_u64(crc, val64):
+    crc &= 0xFFFFFFFF
+    for i in range(8):
+        crc ^= (val64 >> (8 * i)) & 0xFF
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if (crc & 1) else 0)
+    return crc
+
+def crc32c_seq_u64(words):
+    acc = 0xFFFFFFFF
+    for w in words:
+        acc = crc32c_u64(acc, w & 0xFFFFFFFFFFFFFFFF)
+    return (~acc) & 0xFFFFFFFF
+
+# 16 MiB Unified NVMe disk (`ZERO_NEXT_GEN_SPEC.md` §3.2):
+#   • Bucket 0 (`0x0000_0000`): `ZEXTENT1` Master Extent Table + 3 CRC32C-signed `.zcap` boot capsules
+#   • Bucket 1 (`0x0020_0000`): `ZLEDGER1` Superblock Mirror A (`epoch=1`, `snap=0xFFFFFFFE`)
+#   • Bucket 2 (`0x0040_0000`): `ZLEDGER1` Superblock Mirror B (initially 0; populated on first CoW commit!)
+#   • Bucket 3 (`0x0060_0000`): Initial `4 KiB` Eytzinger `CRC32C` B-Tree Root (`ZEYTZND1`, `count=0`)
 CAPS = [("build/capsule_z2.zcap",      0x5A32434150, 4096),
         ("build/cap_avx512_wave.zcap", 0x5A32574156, 8192),
         ("build/cap_matrix_crc.zcap",  0x5A324D5458, 12288)]
@@ -583,6 +641,24 @@ for i, (path, id_hash, off) in enumerate(CAPS):
     crc = struct.unpack_from("<I", cap, 20)[0]
     struct.pack_into("<QQQII", disk, 64 + i * 32, id_hash, off, len(cap), crc, 1)
     disk[off:off + len(cap)] = cap
+
+BUCKET_BYTES = 2 * 1024 * 1024
+ZLEDGER_MAGIC = 0x3152454744454C5A
+ZEYTZ_MAGIC   = 0x31444E5A5459455A
+
+# Stamp initial Eytzinger root at `0x0060_0000` (`Bucket 3`, `epoch=1`, `count=0`)
+root_off = 3 * BUCKET_BYTES
+eytz_qwords = [ZEYTZ_MAGIC, 1, 0, 0, 0, 0, 0]
+eytz_crc = crc32c_seq_u64([*eytz_qwords, 0])
+struct.pack_into("<7QII", disk, root_off, *eytz_qwords, 0, eytz_crc)
+
+# Encode `root_ext` for `(byte_off=0x600000, byte_len=4096, perm=1[RO], crypt=2[CRC_SEAL], pieces=0, hdr=0)`
+root_ext = (root_off >> 6) | (1 << 42) | (2 << 44) | (64 << 50) | (1 << 61)
+gen_pack = 0x0001000100010001
+sb_hdr_bytes = struct.pack("<QIIQQIIQQ", ZLEDGER_MAGIC, 1, 1, 1, root_ext, 0xFFFFFFFE, 8, (1 << 3), gen_pack)
+sb_qwords = list(struct.unpack("<7Q", sb_hdr_bytes))
+sb_crc = crc32c_seq_u64([*sb_qwords, 0])
+disk[1 * BUCKET_BYTES : 1 * BUCKET_BYTES + 64] = sb_hdr_bytes + struct.pack("<II", 0, sb_crc)
 open("build/nvme_disk.img", "wb").write(disk)
 
 kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
@@ -611,7 +687,7 @@ def run_deck(tag, qemu_args, keys, dump_after=None, boot_tmo=12.0):
                 return True
             time.sleep(0.03)
         return False
-    marker = {"1": "CAP1=", "2": "CAP2=", "3": "CAP3=", "b": "BENCH=OK", "a": "GATE1B_OK", "q": "SHUTDOWN_OK"}
+    marker = {"1": "CAP1=", "2": "CAP2=", "3": "CAP3=", "4": "ZFS=", "b": "BENCH=OK", "a": "GATE1B_OK", "q": "SHUTDOWN_OK"}
     try:
         if not wait_for(lambda l: "KBD\n" in l, boot_tmo):
             print(f"  [FAIL] {tag}: no ZEROHAND ... KBD banner:\n" + rd(), file=sys.stderr)
@@ -638,24 +714,26 @@ def run_deck(tag, qemu_args, keys, dump_after=None, boot_tmo=12.0):
             proc.kill()
     return rd(), ppm_p
 
-# 1. 4-core Q35 + NVMe: `1` -> `2` -> `3` -> `b` -> `a` -> screendump -> `q`
+# 1. 4-core Q35 + NVMe (`ZEXTENT1` + `ZLEDGER1`): `1` -> `2` -> `3` -> `4` (CoW TX -> EPOCH=2!) -> `b` -> `a` -> screendump -> `q`
 q35_nvme = ["-machine", "q35", *accel, *pm_flags, "-m", "512M",
             "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
             "-drive", "format=raw,file=fat:rw:build/esp",
             "-drive", "file=build/nvme_disk.img,if=none,id=nvm0,format=raw",
             "-device", "nvme,serial=ZEROZCAP,drive=nvm0"]
-log, ppm = run_deck("gate1_debugcon", [*q35_nvme, "-smp", "4"], ["1", "2", "3", "b", "a", "q"], dump_after="a")
+log, ppm = run_deck("gate1_debugcon", [*q35_nvme, "-smp", "4"], ["1", "2", "3", "4", "b", "a", "q"], dump_after="a")
 c1, c2, c3 = EXPECT[4]
 m = re.search(r"^ZEROHAND W=(\d+) H=(\d+) S=(\d+) F=0 C=4 M=(\d+) PT=(\d+) WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=(\d+)/(\d+) CYC=(\d+) CAP=777 KBD\n"
-              rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\nBENCH=OK\nSCAN=0x0000001E GATE1B_OK\nSHUTDOWN_OK\n$", log)
+              rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\n"
+              r"ZFS=OK EPOCH=2 SNAP=4294967293 KEYS=1 VAL=200401\n"
+              r"BENCH=OK\nSCAN=0x0000001E GATE1B_OK\nSHUTDOWN_OK\n$", log)
 if not m:
-    print("  [FAIL] unexpected 4-core Command Deck debugcon log:\n" + log, file=sys.stderr)
+    print("  [FAIL] unexpected 4-core Command Deck + ZeroFS debugcon log:\n" + log, file=sys.stderr)
     sys.exit(1)
 gw, gh, gs, mc, pt, vec_cyc, sc_cyc, cyc = map(int, m.groups())
 assert gs >= gw * 4, f"stride {gs} < width*4 ({gw*4})"
 assert vec_cyc > 0 and sc_cyc > 0 and cyc > 0
 print(f"  [PASS] [zero2] Q35+OVMF -smp 4 + NVMe: C=4 WX=0({pt} PT) SIMD=1 VEC={vec_cyc}/{sc_cyc} CYC={cyc} CAP=777")
-print(f"  [PASS] [zero2] IRQ1/MWAIT Command Deck: [1] CAP1={c1} [2] AVX-512 CAP2={c2} [3] MATRIX_CRC CAP3={c3} [B] BENCH=OK [A] GATE1B_OK [Q] SHUTDOWN_OK")
+print(f"  [PASS] [zero2] Command Deck + ZeroFS CoW TX: [1..3] CAP={c1}/{c2}/{c3} [4] ZFS=OK EPOCH=2 SNAP=0xFFFFFFFD KEYS=1 VAL=200401 [B] BENCH=OK [A] GATE1B_OK [Q] SHUTDOWN_OK")
 
 with open(ppm, "rb") as f:
     assert f.readline().strip() == b"P6"
@@ -684,35 +762,59 @@ assert get_px(204 + 4 * 16, 12) == exp_px(204 + 4 * 16, 12), "unexpected 5th cor
 assert get_px(420, 6)  == (0x00, 0xE5, 0xFF), f"HUD cyan border mismatch: {get_px(420, 6)}"
 assert get_px(425, 10) == (0x0C, 0x10, 0x18), f"HUD obsidian fill mismatch: {get_px(425, 10)}"
 assert get_px(434, 12) == (0xF0, 0xF4, 0xFF), f"HUD glyph 'Z' mismatch: {get_px(434, 12)}"
-# Obsidian Command Deck (x=32..608, y=84..332): border, header bar, body, and `> [3]` active-slot highlight
+# Obsidian Command Deck (x=32..608, y=84..332) + Twin ZeroFS ZLEDGER1 / PCI Domains Panel (x=624..1200, y=84..332)
 assert get_px(32, 84)   == (0x00, 0xE5, 0xFF), f"deck cyan border mismatch: {get_px(32, 84)}"
 assert get_px(560, 100) == (0x12, 0x1A, 0x2A), f"deck header bar mismatch: {get_px(560, 100)}"
 assert get_px(36, 120)  == (0x0C, 0x10, 0x18), f"deck obsidian body mismatch: {get_px(36, 120)}"
 assert get_px(560, 180) == (0x0C, 0x10, 0x18) and get_px(560, 200) == (0x0C, 0x10, 0x18), "slots [1]/[2] wrongly highlighted"
 assert get_px(560, 225) == (0x16, 0x26, 0x3D), f"active slot [3] highlight missing: {get_px(560, 225)}"
 assert get_px(44, 218)  == (0xFF, 0xD6, 0x00), f"active slot '>' marker missing: {get_px(44, 218)}"
+if pw >= 1220 and ph >= 680:
+    assert get_px(624, 84)  == (0x00, 0xE5, 0xFF), f"ZeroFS panel cyan border mismatch: {get_px(624, 84)}"
+    assert get_px(630, 120) == (0x0C, 0x10, 0x18), f"ZeroFS panel obsidian body mismatch: {get_px(630, 120)}"
 try:
     from PIL import Image
     Image.open(ppm).save("build/gate4_live_os_hud.png")
     png_note = " -> build/gate4_live_os_hud.png"
 except Exception:
     png_note = ""
-print(f"  [PASS] [zero2] GOP {pw}x{ph} stride={gs}B: AVX-512 scanout, 6 LEDs, 4 core pips, HUD, Command Deck + '> [3] EXT2 MATRIX_CRC' highlight{png_note}")
+print(f"  [PASS] [zero2] GOP {pw}x{ph} stride={gs}B: AVX-512 scanout, 6 LEDs, 4 core pips, HUD, Command Deck + ZeroFS ZLEDGER1 Panel{png_note}")
 
-# 2. Single-core Q35 + NVMe: BSP executes all 3 capsules directly (`rid 0`)
+# 2. Cold-Reboot NVMe Persistence + Single-Core Q35 Path (`build/nvme_disk.img` NOT reformatted -> mounts Mirror B EPOCH=2 -> commits EPOCH=3!)
 c1, c2, c3 = EXPECT[1]
-log1n, _ = run_deck("gate1_smp1_nvme", [*q35_nvme, "-smp", "1"], ["1", "2", "3", "q"])
+log1n, _ = run_deck("gate1_smp1_nvme", [*q35_nvme, "-smp", "1"], ["1", "2", "3", "4", "q"])
 assert re.search(r"^ZEROHAND W=\d+ H=\d+ S=\d+ F=0 C=1 M=\d+ PT=\d+ WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=\d+/\d+ CYC=\d+ CAP=777 KBD\n"
-                 rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\nSHUTDOWN_OK\n$", log1n), f"unexpected -smp 1 NVMe log: {log1n}"
-print(f"  [PASS] [zero2] single-core Q35 + NVMe BSP capsule path: CAP1={c1} CAP2={c2} CAP3={c3} SHUTDOWN_OK")
+                 rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\n"
+                 r"ZFS=OK EPOCH=3 SNAP=4294967292 KEYS=2 VAL=300102\n"
+                 r"SHUTDOWN_OK\n$", log1n), f"unexpected -smp 1 cold-reboot ZeroFS NVMe log: {log1n}"
+print(f"  [PASS] [zero2] cold-reboot NVMe persistence verified: mounted EPOCH=2 from Mirror B -> committed EPOCH=3 SNAP=0xFFFFFFFC KEYS=2 VAL=300102")
 
-# 3. Single-core i440FX without NVMe: degrades cleanly (`C=1`, `CAP=0`, capsule keys return `0`)
+# 3. Adversarial Foreign NVMe Drive Protection Test (`GPT` + `LUKS` + `ext4`, NO `ZLEDGER1` -> `ZFS=SAFE_RO`, SHA-256 100% unchanged!)
+foreign_disk = bytearray(8 * 1024 * 1024)
+foreign_disk[510:512] = b"\x55\xAA"
+foreign_disk[1 * BUCKET_BYTES : 1 * BUCKET_BYTES + 6] = b"LUKS\xba\xbe"
+foreign_disk[2 * BUCKET_BYTES + 0x438 : 2 * BUCKET_BYTES + 0x43A] = b"\x53\xEF" # ext4 s_magic
+open("build/nvme_foreign.img", "wb").write(foreign_disk)
+sha_before = hashlib.sha256(foreign_disk).hexdigest()
+q35_foreign = ["-machine", "q35", *accel, *pm_flags, "-smp", "4", "-m", "512M",
+               "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
+               "-drive", "format=raw,file=fat:rw:build/esp",
+               "-drive", "file=build/nvme_foreign.img,if=none,id=nvmf,format=raw",
+               "-device", "nvme,serial=FOREIGN0,drive=nvmf"]
+log_fg, _ = run_deck("gate1_foreign_nvme", q35_foreign, ["4", "q"])
+sha_after = hashlib.sha256(open("build/nvme_foreign.img", "rb").read()).hexdigest()
+assert sha_before == sha_after, f"CRITICAL: foreign NVMe image modified! {sha_before} != {sha_after}"
+assert re.search(r"^ZEROHAND W=\d+ H=\d+ S=\d+ F=0 C=4 M=\d+ PT=\d+ WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=\d+/\d+ CYC=\d+ CAP=0 KBD\n"
+                 r"ZFS=SAFE_RO\nSHUTDOWN_OK\n$", log_fg), f"unexpected foreign-drive log: {log_fg}"
+print(f"  [PASS] [zero2] foreign GPT/LUKS/ext4 NVMe drive guard: ZFS=SAFE_RO, 0 sectors written (SHA-256={sha_after[:16]}... identical)")
+
+# 4. Single-core i440FX without NVMe: degrades cleanly (`C=1`, `CAP=0`, `ZFS=SAFE_RO`, capsule keys return `0`)
 log1, _ = run_deck("gate1_smp1", [*accel, "-smp", "1", "-m", "512M",
                                    "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
-                                   "-drive", "format=raw,file=fat:rw:build/esp"], ["2", "a", "q"])
+                                   "-drive", "format=raw,file=fat:rw:build/esp"], ["2", "4", "a", "q"])
 assert re.search(r"^ZEROHAND W=\d+ H=\d+ S=\d+ F=0 C=1 M=\d+ PT=\d+ WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=\d+/\d+ CYC=\d+ CAP=0 KBD\n"
-                 r"CAP2=0\nSCAN=0x0000001E GATE1B_OK\nSHUTDOWN_OK\n$", log1), f"unexpected -smp 1 no-NVMe log: {log1}"
-print("  [PASS] [zero2] single-core no-NVMe (-smp 1) fallback: C=1 WX=0 SIMD=1 CAP=0, CAP2=0 (no extent), GATE1B_OK, SHUTDOWN_OK")
+                 r"CAP2=0\nZFS=SAFE_RO\nSCAN=0x0000001E GATE1B_OK\nSHUTDOWN_OK\n$", log1), f"unexpected -smp 1 no-NVMe log: {log1}"
+print("  [PASS] [zero2] single-core no-NVMe (-smp 1) fallback: C=1 WX=0 SIMD=1 CAP=0, CAP2=0, ZFS=SAFE_RO, GATE1B_OK, SHUTDOWN_OK")
 
 # 4. Missing GOP (`-vga none`) returns cleanly to firmware without guessing a framebuffer (§8.5)
 if os.path.exists("build/gate1_nogop.log"):
@@ -881,4 +983,4 @@ print(f"  [PASS] USB image booted via OVMF xHCI usb-storage in {t_boot:.1f}s -> 
 PY
 
 echo "=== Binary Footprint Summary ==="
-ls -lh --block-size=1 "$ZERO0" "$BUILD/zero1" "$ZERO2" "$BUILD/zero3" "$BUILD/z2_first" "$BUILD/z2_phase2_zero_power" "$BUILD/z2_phase3_reactor_fabric" "$BUILD/z2_phase4_avx512_simd" "$BUILD/z2_phase5_nextgen_spine" "$BUILD/capsule_z2.zcap" "$BUILD/cap_avx512_wave.zcap" "$BUILD/cap_matrix_crc.zcap" "$BUILD/cap_spine_probe.zcap" "$BUILD/gate1_os_z2.efi" "$BUILD/gate1_laptop_z2.efi" "$BUILD/zeroos_usb.img"
+ls -lh --block-size=1 "$ZERO0" "$BUILD/zero1" "$ZERO2" "$BUILD/zero3" "$BUILD/z2_first" "$BUILD/z2_phase2_zero_power" "$BUILD/z2_phase3_reactor_fabric" "$BUILD/z2_phase4_avx512_simd" "$BUILD/z2_phase5_nextgen_spine" "$BUILD/z2_phase6_zerofs_ledger" "$BUILD/capsule_z2.zcap" "$BUILD/cap_avx512_wave.zcap" "$BUILD/cap_matrix_crc.zcap" "$BUILD/cap_spine_probe.zcap" "$BUILD/gate1_os_z2.efi" "$BUILD/gate1_laptop_z2.efi" "$BUILD/zeroos_usb.img"

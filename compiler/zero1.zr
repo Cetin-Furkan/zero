@@ -1012,6 +1012,9 @@ fn parse_ident_stmt() {
             z1_parse_port_write_stmt(si)
             return
         }
+        if sk == SKIND_DOMAIN {
+            die_cur("error: hardware @domain is not DRAM and cannot be indexed or mutated directly")
+        }
         expect_kind(TOK_LBRACK)
         parse_expr(1)
         expect_kind(TOK_RBRACK)

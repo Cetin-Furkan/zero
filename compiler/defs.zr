@@ -139,6 +139,14 @@ SKIND_CAPSULE   :: 3
 SKIND_RING      :: 4
 SKIND_DMA_QUEUE :: 5
 SKIND_PORT      :: 6
+SKIND_DOMAIN    :: 7
+
+// --- Non-POSIX Hardware `@domain` Silicon Kinds (`sp_port_num[si]` on `SKIND_DOMAIN`) ---
+DOM_NVME        :: 1
+DOM_GT          :: 2
+DOM_GNA         :: 3
+DOM_XHCI        :: 4
+DOM_NET         :: 5
 
 // --- Type Tags & Modifiers ---
 TY_VOID         :: 0
@@ -371,6 +379,24 @@ G_SYM_WITH            :: 196
 G_SYM_WHILE           :: 197
 G_SYM_ZF              :: 198
 G_SYM_CF              :: 199
+
+// Stage-2 Hardware `@domain` & `128-Bit XMM` `AES-NI`/`SHA-NI` Contextual Symbols
+G_SYM_DOMAIN          :: 200
+G_SYM_NVME            :: 201
+G_SYM_GT              :: 202
+G_SYM_GNA             :: 203
+G_SYM_XHCI            :: 204
+G_SYM_NET             :: 205
+G_SYM_NPU             :: 206
+G_SYM_SHA256_TAG      :: 207
+G_SYM_AES128_CTR64    :: 208
+G_SYM_KIND            :: 209
+G_SYM_PRESENT         :: 210
+G_SYM_BDF             :: 211
+G_SYM_VENDOR_DEV      :: 212
+G_SYM_BAR0            :: 213
+G_SYM_BAR_SIZE        :: 214
+G_SYM_CAPS            :: 215
 
 // --- Static `@slab` Arenas (Zero-Initialized in `Phdr[1]` `.bss`, 0 disk bytes) ---
 @slab g             : <i64 | max: 512>

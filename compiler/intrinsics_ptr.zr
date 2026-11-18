@@ -149,7 +149,7 @@ fn parse_ref_lval_addr(want_ty: i64, err_line: i64) {
         }
     } else {
         si := find_space(sym)
-        if si < 0 || sp_kind[si] == SKIND_PORT || peek_kind() != TOK_LBRACK {
+        if si < 0 || sp_kind[si] == SKIND_PORT || sp_kind[si] == SKIND_DOMAIN || peek_kind() != TOK_LBRACK {
             die_line("error: ref& requires an addressable mutable variable or lvalue", err_line)
         }
         g[G_TOK_IDX] += 1
@@ -401,7 +401,7 @@ fn eval_mask_spin_target_addr_r8(c0_start: i64, c0_end: i64, err_line: i64) i64 
             }
         } else {
             si := find_space(sym)
-            if si >= 0 && sp_kind[si] != SKIND_PORT && peek_kind() == TOK_LBRACK {
+            if si >= 0 && sp_kind[si] != SKIND_PORT && sp_kind[si] != SKIND_DOMAIN && peek_kind() == TOK_LBRACK {
                 g[G_TOK_IDX] += 1
                 parse_expr(1)
                 expect_kind(TOK_RBRACK)
@@ -1101,6 +1101,40 @@ fn parse_space_rval_expr(si: i64) {
     sk: i64 = sp_kind[si]
     if sk == SKIND_PORT {
         parse_port_space_expr(si)
+        return
+    }
+    if sk == SKIND_DOMAIN {
+        if peek_kind() != TOK_DOT {
+            die_cur("error: hardware @domain is not DRAM and cannot be indexed or dereferenced as ptr*")
+        }
+        g[G_TOK_IDX] += 1
+        dsym := expect_ident()
+        if dsym == g[G_SYM_KIND] {
+            emit_mov_rax_imm64(sp_port_num[si])
+            g[G_LAST_EXPR_TY] = TY_U64
+            return
+        }
+        if dsym == g[G_SYM_BASE] {
+            emit_load_space_base_rax(si)
+            g[G_LAST_EXPR_TY] = TY_U64
+            return
+        }
+        qoff: i64 = -1
+        if dsym == g[G_SYM_PRESENT]    { qoff = 0 }
+        if dsym == g[G_SYM_BDF]        { qoff = 8 }
+        if dsym == g[G_SYM_VENDOR_DEV] { qoff = 16 }
+        if dsym == g[G_SYM_BAR0]       { qoff = 24 }
+        if dsym == g[G_SYM_BAR_SIZE]   { qoff = 32 }
+        if dsym == g[G_SYM_CAPS]       { qoff = 40 }
+        if qoff < 0 {
+            die_cur("error: unknown @domain property (expected kind, base, present, bdf, vendor_dev, bar0, bar_size, or caps)")
+        }
+        emit_load_space_base_rax(si)
+        if qoff > 0 {
+            emit_add_rax_imm(qoff)
+        }
+        emit_load_mem_typed(TY_U64)
+        g[G_LAST_EXPR_TY] = TY_U64
         return
     }
 
@@ -1982,6 +2016,59 @@ fn parse_at_expr() {
         }
         emit_u8(0x5B)                               // pop rbx
         g[G_LAST_EXPR_TY] = TY_U32
+        return
+    }
+
+    // 3b. Stage-2 `128-Bit XMM` `SHA-NI` + `AES-NI` Seekable Block Crypto Intrinsics
+    if sym == g[G_SYM_SHA256_TAG] {
+        if g[G_IN_ISR_MODE] != 0 {
+            die_line("error: @isr/@isr_ok forbids 128-bit XMM crypto intrinsics", at_line)
+        }
+        ip_eval_2_args_rcx_rax()
+        emit_sha256_tag_xmm()
+        g[G_LAST_EXPR_TY]  = TY_U64
+        g[G_EXPR_SET_FLAG] = 0
+        return
+    }
+    if sym == g[G_SYM_AES128_CTR64] {
+        if g[G_IN_ISR_MODE] != 0 {
+            die_line("error: @isr/@isr_ok forbids 128-bit XMM crypto intrinsics", at_line)
+        }
+        expect_kind(TOK_LPAREN)
+        parse_expr(1)
+        if (g[G_LAST_EXPR_TY] & TY_FLAG_ONESHOT) != 0 {
+            die_line("error: @oneshot pointer cannot be passed as raw buffer argument", at_line)
+        }
+        s_dst := alloc_temp_qword()
+        emit_store_local(s_dst)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        if (g[G_LAST_EXPR_TY] & TY_FLAG_ONESHOT) != 0 {
+            die_line("error: @oneshot pointer cannot be passed as raw buffer argument", at_line)
+        }
+        s_src := alloc_temp_qword()
+        emit_store_local(s_src)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        s_key := alloc_temp_qword()
+        emit_store_local(s_key)
+        expect_kind(TOK_COMMA)
+        parse_expr(1)
+        expect_kind(TOK_RPAREN)
+        // `rax` holds `nonce` -> move to `rdx`; load `key`->`rcx`, `src`->`r8`, `dst`->`r11`
+        emit_u8(0x48)  emit_u8(0x89)  emit_u8(0xC2) // mov rdx, rax
+        emit_load_local(s_src)
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC0) // mov r8, rax
+        emit_load_local(s_dst)
+        emit_u8(0x49)  emit_u8(0x89)  emit_u8(0xC3) // mov r11, rax
+        emit_load_local_rcx(s_key)
+        // Scrub temporary key stack slot immediately (`mov qword [rbp - s_key], 0`)
+        emit_mov_rax_imm64(0)
+        emit_store_local(s_key)
+        free_temp_qwords(3)
+        emit_aes128_ctr64_xmm()
+        g[G_LAST_EXPR_TY]  = TY_U64
+        g[G_EXPR_SET_FLAG] = 0
         return
     }
 

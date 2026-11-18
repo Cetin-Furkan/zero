@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > **`ZeroOS`** (`examples/gate1_os.zr` + `examples/os/*.zr`) is a single-image, reactor-driven, strictly `W^X` Ring-0 monolithic operating system co-designed with the self-hosted **`Zero` (`.zr`)** compiler (`compiler/zero1.zr`, `--target=efi-os` and `--target=capsule`).
 >
-> Every hardware address, MSR, page-table flag, descriptor table, interrupt gate, and DMA ring documented below is **implemented and verified today** in `build/gate1_os_z2.efi` (`99,328 B`) and `build/gate1_laptop_z2.efi` (`95,232 B`, `0` port-`0xE9` instructions), except Section 9 which explicitly marks the Stage-2 `ZeroFS` (`ZLEDGER1`) and Gate-4 `Iris Xe` `CCS0` targets.
+> Every hardware address, MSR, page-table flag, descriptor table, interrupt gate, PCIe `@domain` descriptor, NVMe `@dma_queue`, and `ZeroFS` (`ZLEDGER1`) CoW storage path documented below is **implemented and verified today** in `build/gate1_os_z2.efi` (`159,744 B`) and `build/gate1_laptop_z2.efi` (`155,136 B`, `0` port-`0xE9` instructions), except Section 10 which explicitly marks the future Gate-4 `Iris Xe` `CCS0` GPU compute walker.
 
 ---
 
@@ -17,7 +17,8 @@
 6. [Cross-Core `MOVDIR64B` + Race-Free `MONITOR`/`MWAIT` Reactor Fabric](#6-cross-core-movdir64b--race-free-monitormwait-reactor-fabric)
 7. [Tickless `I/O APIC` `IRQ1` Keyboard & `@isr` Verification](#7-tickless-io-apic-irq1-keyboard--isr-verification)
 8. [PCIe `MCFG` + Lock-Free NVMe `@dma_queue` + `.zcap` Capsule Engine](#8-pcie-mcfg--lock-free-nvme-dma_queue--zcap-capsule-engine)
-9. [Next-Stage Kernel Extensions (`ZeroFS` `ZLEDGER1` & `Iris Xe` `CCS0`)](#9-next-stage-kernel-extensions-zerofs-zledger1--iris-xe-ccs0)
+9. [Non-POSIX Hardware `@domain`s & `ZeroFS` (`ZLEDGER1`) CoW NVMe Engine](#9-non-posix-hardware-domains--zerofs-zledger1-cow-nvme-engine)
+10. [Next-Stage Kernel Extension (Gate 4: `Iris Xe` `CCS0` GPU Compute)](#10-next-stage-kernel-extension-gate-4-iris-xe-ccs0-gpu-compute)
 
 ---
 
@@ -46,8 +47,8 @@ flowchart TD
     UEFI["1. UEFI PE32+ Entry (efi_main on BSP)\ncompiler/efi_pe32.zr Prelude"] --> PRE["2. Pre-Exit Firmware Harvest\n• Query GOP (BGRX8888 / RGBX8888)\n• Walk RSDP -> XSDT/RSDT -> MADT & MCFG\n• Calibrate tsc_per_ms\n• Allocate <0xA0000 AP Trampoline + AP Stacks\n• GetMemoryMap + ExitBootServices()"]
     PRE --> WX["3. Post-Exit Ring-0 Takeover (gate1_os.zr)\n• Unlock CR4.OSXSAVE + XCR0=0xE7 + PKRU=0\n• Program IA32_PAT (PA1=WC) & IA32_EFER.NXE\n• Build 4-Level W^X CR3 (verify WX==0)\n• Install Per-Core GDT + Tss64 + 256-Gate IDT"]
     WX --> SMP["4. MADT + x2APIC SMP Bring-Up (smp_madt.zr)\n• Parse MADT Type 0 / Type 9 APIC IDs\n• Enable x2APIC (MSR 0x1B | 0xC00)\n• Wake APs via <1 MiB PTE_RX Bridge -> ap_main(slot)\n• Pin r12..r15 + IA32_GS_BASE per Reactor"]
-    SMP --> NVME["5. PCIe MCFG + NVMe Capsule Engine (nvme_capsule.zr)\n• Scan ECAM -> Map NVMe BAR0 UC+NX\n• Bind Admin & I/O @dma_queue Rings\n• DMA ZEXTENT1 + Extents 0..2 into boot_capsule\n• Hardware @crc32c Check -> seal_capsule_wx_rx (PTE_RX)"]
-    NVME --> DECK["6. Tickless IRQ1 + Obsidian Command Deck\n• Mask 8259 PICs; Route I/O APIC IRQ1 -> Vec 0x21 (@isr)\n• Render HUD via AVX-512 vmovntdq\n• Sleep in Race-Free MONITOR/MWAIT\n• Keys 1/2/3 Fan Out MOVDIR64B Tasks to Workers"]
+    SMP --> NVME["5. PCIe @domains + NVMe Capsules + ZeroFS (ZLEDGER1)\n• Bind @domain nvme/gt/gna/xhci/net via MCFG\n• DMA ZEXTENT1 + Extents 0..2 -> PTE_RX\n• Verify ZLEDGER1 + CRC32C (or lock SAFE_RO on foreign disk!)\n• Mount Eytzinger CRC32C B-Tree Root"]
+    NVME --> DECK["6. Tickless IRQ1 + Dual-Panel Command Deck\n• Route I/O APIC IRQ1 -> Vec 0x21 (@isr)\n• Render Command Deck + ZeroFS Panel via vmovntdq\n• Keys [1/2/3] Dispatch Capsules; Key [4] Commits CoW Snap + AES-NI"]
 ```
 
 ---
@@ -218,9 +219,19 @@ LBA 0: MasterExtentSuper (24 B) + MasterExtentEntry[0..3] (32 B each)
 
 ---
 
-## 9. Next-Stage Kernel Extensions (`ZeroFS` `ZLEDGER1` & `Iris Xe` `CCS0`)
+## 9. Non-POSIX Hardware `@domain`s & `ZeroFS` (`ZLEDGER1`) CoW NVMe Engine
 
-1. **Stage 2 — `ZeroFS` (`ZLEDGER1`) Persistent CoW Ledger (Specified in `ZERO_NEXT_GEN_SPEC.md`, Not Yet Lowered):**
-   - Preserves LBA `0` (`Bucket 0`, `0..2 MiB`) for `ZEXTENT1` immutable early-boot capsules (`CAP1..CAP3`) while formatting `Bucket 1..M` (`>= 2 MiB`) as the Bcachefs-inspired **`ZLEDGER1`** generational-bucket CoW store with Eytzinger `@crc32c` B-trees, lockless per-reactor NVMe `@dma_queue` sharding, and opt-in seekable `128-bit XMM` `AES-NI`/`SHA-NI` 64B block encryption — protected by the mandatory `ZLEDGER1` magic write guard.
-2. **Gate 4 — `Iris Xe` (`8086:9a49`) Direct `CCS0` Compute Engine (Future Target):**
+1. **Compile-Time Separated Hardware `@domain` Descriptors (`examples/os/hw_domains.zr`):**
+   - `ZeroOS` abolishes `/dev/*` VFS device files: `@domain dom_nvme : nvme`, `dom_gt : gt`, `dom_gna : gna`, `dom_xhci : xhci`, and `dom_net : net` allocate `64 B`-aligned hardware descriptors bound directly via `MCFG`/`ECAM` (`discover_pci_domains`).
+   - Naming `@domain ... : npu` on Tiger Lake (`i7-1165G7`) or indexing `@domain` as DRAM (`dom[0]`) is a **hard compile-time error**.
+2. **`ZeroFS` (`ZLEDGER1`) Crash-Safe CoW Storage & Hardware Write Guard (`examples/os/zerofs_ledger.zr` + `examples/os/nvme_capsule.zr`):**
+   - **Unified Disk Layout:** `Bucket 0` (`0..2 MiB`) holds immutable `ZEXTENT1` boot capsules; `Buckets 1..2` (`0x20_0000` / `0x40_0000`) hold alternating `ZLedgerSuperblock @cell64` mirrors; `Buckets 3..M` (`>= 0x60_0000`) hold `2 MiB` append-only generational CoW buckets (`EytzNodeHdr` + `63` `LedgerKey`s per `4 KiB` page, `000`/`010`/`100`/`111` extents, `Backpointer32` GC tables, and `AES-128-CTR` + `SHA-NI` locked cachelines).
+   - **Double Hardware NVMe Write Interlock:** `nvme_dma_write_4k_guarded` (`Opcode 0x01`) and `nvme_dma_flush_guarded` (`Opcode 0x00`) refuse all submissions unless `zfs_is_write_armed() == 1` (proven by reading a valid `ZLEDGER1` magic + `@crc32c` superblock off target media) **and** `byte_off >= 0x20_0000`. Foreign `GPT`/`LUKS`/`ext4` drives stay strictly in `SAFE_RO` (`0` sectors written, verified by SHA-256 disk hashing).
+   - **Ordered CoW Commit (`Key [4]`):** Advances descending snapshot (`current_snap -= 1`), encrypts payload via `@aes128_ctr64` + `@sha256_tag`, writes data + `4 KiB` Eytzinger `CRC32C` root, issues NVMe `Flush`, writes the alternating `ZLedgerSuperblock` mirror (`epoch + 1`), issues NVMe `Flush`, and verifies DMA readback through a register-wiped `ptr* @oneshot u64` capability.
+
+---
+
+## 10. Next-Stage Kernel Extension (Gate 4: `Iris Xe` `CCS0` GPU Compute)
+
+1. **Gate 4 — `Iris Xe` (`8086:9a49`) Direct `CCS0` Compute Engine (Future Target, Not Yet Lowered):**
    - `FORCEWAKE_RENDER` / `FORCEWAKE_GT`, 48-bit `PPGTT` binding, and `CCS0` `COMPUTE_WALKER` ring submission writing directly into shared DRAM / GOP scanout apertures without userland Mesa/OpenCL layers.

@@ -692,12 +692,20 @@ fn ts_skip_space_spec() {
     }
 }
 
-// Skips any top-level `@space name : <...> | Type[Cap]` declaration (`@` NOT yet consumed)
+// Skips any top-level `@space name : <...> | Type[Cap]` or `@domain name : kind` declaration (`@` NOT yet consumed)
 fn skip_top_space_decl() {
     expect_kind(TOK_AT)
+    is_dom := 0
+    if peek_kind() == TOK_IDENT && peek_val() == g[G_SYM_DOMAIN] {
+        is_dom = 1
+    }
     g[G_TOK_IDX] += 1
     expect_ident()
     expect_kind(TOK_COLON)
+    if is_dom == 1 {
+        expect_ident()
+        return
+    }
     ts_skip_space_spec()
 }
 
@@ -1149,6 +1157,32 @@ fn resolve_all_spaces() {
         sline: i64   = sp_line[si]
         sk: i64      = sp_kind[si]
 
+        if sk == SKIND_DOMAIN {
+            dom_sym := expect_ident()
+            if dom_sym == g[G_SYM_NPU] {
+                die_line("error: Tiger Lake (i7-1165G7) has no NPU silicon block; use 'gna' domain", sline)
+            }
+            dom_id: i64 = 0
+            if dom_sym == g[G_SYM_NVME] { dom_id = DOM_NVME }
+            if dom_sym == g[G_SYM_GT]   { dom_id = DOM_GT }
+            if dom_sym == g[G_SYM_GNA]  { dom_id = DOM_GNA }
+            if dom_sym == g[G_SYM_XHCI] { dom_id = DOM_XHCI }
+            if dom_sym == g[G_SYM_NET]  { dom_id = DOM_NET }
+            if dom_id == 0 {
+                die_line("error: unknown hardware @domain kind (expected nvme, gt, gna, xhci, or net)", sline)
+            }
+            aligned_dom := (g[G_BSS_OFF] + 63) & (~63)
+            sp_elem_ty[si]  = TY_U64
+            sp_elem_sz[si]  = 8
+            sp_cap[si]      = 8
+            sp_port_num[si] = dom_id
+            sp_bss_off[si]  = aligned_dom
+            sp_vaddr[si]    = ELF_DATA_BASE + aligned_dom
+            sp_align[si]    = 64
+            g[G_BSS_OFF]    = aligned_dom + 64
+            continue
+        }
+
         ety: i64 = TY_U8
         esz: i64 = 1
         cap: i64 = 0
@@ -1522,6 +1556,9 @@ fn prescan_all() {
                         }
                         skind = SKIND_PORT
                     }
+                    if tv == g[G_SYM_DOMAIN] {
+                        skind = SKIND_DOMAIN
+                    }
                 }
             }
 
@@ -1546,7 +1583,11 @@ fn prescan_all() {
             sp_line[si] = sline
             g[G_SP_CNT] = si + 1
 
-            ts_skip_space_spec()
+            if skind == SKIND_DOMAIN {
+                expect_ident()
+            } else {
+                ts_skip_space_spec()
+            }
             continue
         }
 
