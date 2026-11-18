@@ -1,12 +1,15 @@
 # `Zero` Next-Generation Language Spine & `ZeroFS` (`ZLEDGER1`) Specification
 
 > [!IMPORTANT]
-> **Document Status — Stages 1 & 2 BOTH Implemented & Verified (`107 PASS / 0 FAIL`):**
-> Both stages defined in this specification are now **100% lowered, self-hosted, and verified** (`build/zero2 == build/zero3` at `653,982 B`, `make clean && make test && make usb-img`):
+> **Document Status — Stages 1, 2A & 2B Scale-Out ALL Implemented & Verified (`108 PASS / 0 FAIL`):**
+> Every subsystem defined in this specification is **100% lowered, self-hosted, and verified** (`build/zero2 == build/zero3` at `653,982 B`, `make clean && make test && make usb-img`):
 > - **Stage 1 (`compiler/*.zr`) — IMPLEMENTED & VERIFIED:** The Next-Generation `Zero` Language Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `struct ... [@cell64 | @packed]` with `T[N]`, inline `;` flag-handoff, `mask<...>`, `when` / `with ... ; when` / `with when` / `when while` / `when for`, `@ring(start .. len)`, and `@bits`), verified in `tests/phase5_nextgen_spine.zr` and Ring-0 `cap_spine_probe.zcap`.
-> - **Stage 2 (`compiler/*.zr` + `examples/os/zerofs_ledger.zr` + `examples/os/hw_domains.zr` + `examples/os/nvme_capsule.zr`) — IMPLEMENTED & VERIFIED:** Non-POSIX hardware `@domain` bindings (`nvme`, `gt`, `gna`, `xhci`, `net`; `npu` rejected at compile time on Tiger Lake), `128-bit XMM` `@sha256_tag` (`SHA-NI`) & `@aes128_ctr64` (`AES-NI`) with immediate `pxor` XMM wipes, and the **`ZeroFS` (`ZLEDGER1`)** Copy-on-Write NVMe storage engine, verified in `tests/phase6_zerofs_ledger.zr` AND live 4-core QEMU/KVM + OVMF + NVMe `ZeroOS` (including cold-reboot persistence and foreign GPT/LUKS/ext4 `SAFE_RO` `0`-write protection).
+> - **Stage 2A & 2B Scale-Out (`compiler/*.zr` + `examples/os/zerofs_ledger.zr` + `examples/os/hw_domains.zr` + `examples/os/nvme_capsule.zr`) — IMPLEMENTED & VERIFIED:** Non-POSIX hardware `@domain` bindings (`nvme`, `gt`, `gna`, `xhci`, `net`; `npu` rejected at compile time on Tiger Lake), `128-bit XMM` `@sha256_tag` (`SHA-NI`) & `@aes128_ctr64` (`AES-NI`) with immediate `pxor` XMM wipes, and the **Scale-Out `ZeroFS` (`ZLEDGER1`) Copy-on-Write NVMe Engine**:
+>   - **Multi-Level (`level 0..2`) 1-Based Eytzinger Merkle-`CRC32C` B+Tree (`63 -> 3,969 -> 250,047` keys)** with inclusive `(max_id, max_snap)` `EytzPivot @cell64` routing and parent-held `child_crc` Merkle verification.
+>   - **Cold-Reboot Persistent Generational GC:** On-disk `4 KiB` `ZfsGenHdr @cell64` (`ZGENTBL1`, `u16[2016]` bucket generations) + per-bucket `+0x1FF000` `ZfsBucketFooterHdr @cell64` (`ZBPFOOT1`, `126` × `ZfsBackpointer32`) surviving full RAM/power cycles.
+>   - **Lockless Multi-Queue (`SQ1..SQ4`) + `PRP-List` Scatter-Gather NVMe DMA:** Up to `4` per-reactor NVMe I/O `@dma_queue` pairs (`64 B`-isolated `NvmeQueueSeq[4]`) + `MDTS`-aware `PRP1` / `PRP1+PRP2` / `PRP1 + 4 KiB PRP-List` multi-page bursts, strictly guarded by the double `ZLEDGER1` + `@crc32c` + `byte_off >= 2 MiB` write interlock (`0` writes to foreign drives).
 >
-> Per the **Zero Honesty Rule**, future Gate-4 items (`<tile: Size>`, `@cold` struct splitting, and `Iris Xe` `CCS0` GPU walker) remain explicitly marked unimplemented until lowered and verified.
+> Per the **Zero Honesty Rule**, future Gate-4 items (`<tile: Size>`, `@cold` struct splitting, and `Iris Xe` `8086:9a49` Gen12LP EU compute execution) remain explicitly marked unimplemented until lowered and verified.
 
 ---
 
@@ -608,33 +611,63 @@ Every extent handle in `ZeroFS` fits inside **one 64-bit CPU register (`ExtentWo
 
 ---
 
-### 3.4 2 MiB Append-Only Generational Buckets & Backpointers
+### 3.4 2 MiB Append-Only Generational Buckets, `ZfsGenHdr`, & `+0x1FF000` `ZfsBucketFooterHdr` Footers
 
-Inspired directly by **Bcachefs**, `ZeroFS` eliminates slow per-4K block free-space bitmaps and write-in-place journaling:
+Inspired by **Bcachefs** while eliminating its locking and background-scan overhead, `ZeroFS` (`examples/os/zerofs_ledger.zr`) replaces per-4K block free-space bitmaps and write-in-place journals with `2 MiB` generational CoW buckets whose GC metadata persists across cold power cycles:
 
-1. **2 MiB Allocation Buckets (`BUCKET_BYTES = 2_097_152`, matching `x86-64` `PDE_PS` 2 MiB hugepages):**
-   - Writes inside an active bucket are strictly **append-only** bump allocations (`cursor += aligned_64b_len`).
-   - Once full, a bucket is sealed immutable until invalidated/evacuated.
-2. **$O(1)$ Generational Invalidation (`bucket_gens : u16[N]`):**
-   - Every 2 MiB bucket owns a monotonically increasing `u16` generation number stored in a compact DRAM/superblock table (`2` bytes per `2 MiB` $\rightarrow$ **`1 MiB` of RAM tracks `1 TiB` of NVMe!**).
-   - Every `LedgerKey` in the B-tree records `bucket_gen : u16`. Reclaiming an obsolete bucket simply increments `bucket_gens[b_id] += 1`, invalidating stale pointers in $O(1)$ without zeroing disk blocks.
-3. **Inline Backpointers (Zero Full-Tree GC Scans):**
-   - Each sealed bucket appends a compact `Backpointer` footer listing `(id_hash, snap_id, offset)` for live extents inside that bucket. When copy-compacting a sparse bucket (<25% live bytes), `ZeroFS` relocates only live extents straight from the bucket's own backpointers in milliseconds — **never** scanning the entire B-tree.
+```text
+Within Every Active CoW Bucket b (b >= 3, Size = 2 MiB = 0x20_0000 B):
+┌─────────────────────────────────────────────────────────────┬──────────────────────────┐
+│ [0x00_0000 .. 0x1F_EFFF]  2,093,056 B Append-Only Payload   │ [0x1F_F000 .. 0x1F_FFFF] │
+│ • Data Extents (000 contiguous, PieceHeader32, Chain64)     │ 4 KiB ZfsBucketFooterHdr │
+│ • 4 KiB Eytzinger Leaf (level=0) & Branch (level>=1) Pages  │ ("ZBPFOOT1", used_bytes, │
+│ • 4 KiB ZfsGenHdr ("ZGENTBL1", u16[2016] bucket_gens)       │ Backpointer32[0..125])   │
+└─────────────────────────────────────────────────────────────┴──────────────────────────┘
+```
+
+1. **2 MiB Allocation Buckets (`ZFS_BUCKET_BYTES = 2_097_152`, matching `x86-64` `PDE_PS` 2 MiB hugepages):**
+   - Writes inside an active bucket bump `zfs_bucket_cursors[b]` strictly forward (`<= ZFS_BUCKET_FOOTER_OFF = 0x1F_F000`), reserving the final `4 KiB` page (`+0x1F_F000`) exclusively for that bucket's sealed backpointer footer.
+   - Once full or evacuated, a bucket is never overwritten in place until its generation increments.
+2. **Dual-Tier Persistent `u16` Bucket Generations (`gen_pack` + `4 KiB` `ZfsGenHdr` `ZGENTBL1`):**
+   - Hot buckets `3..6` are packed inline into `ZLedgerSuperblock.gen_pack : u64` (`4 x u16`) for zero-extra-I/O early checks, while the full `u16[2016]` generation array (`4,032 B` payload + `64 B` `ZfsGenHdr @cell64` header = `4,096 B` exact page, tracking up to **`4 GiB`–`4 TiB`** of buckets) is persisted in a `@crc32c`-sealed `ZGENTBL1` page referenced by `EytzNodeHdr.gen_ext`.
+   - Every `LedgerKey` records `bucket_gen : u16`. Reclaiming an evacuated bucket (`zfs_evacuate_bucket`) increments `zfs_bucket_gens[victim] += 1`, resets its cursor and backpointer count to `0`, and invalidates any stale historical pointer in **$O(1)$** (`when bgen != zfs_bucket_gens[bid] => fail ZFS_FAULT_CORRUPT`) with zero disk zeroing!
+3. **Cold-Reboot Persistent `+0x1FF000` `ZfsBucketFooterHdr` (`ZBPFOOT1`) Backpointer Pages:**
+   - Every dirty CoW bucket touched in an epoch (`when for bid in dirty_m @bits`) seals its `+0x1FF000` `4 KiB` footer (`64 B` `ZfsBucketFooterHdr @cell64` + `126` × `32 B` `ZfsBackpointer32` = `4,096 B` exact, verified by `zfs_bucket_footer_crc32c`) before the superblock commit.
+   - On cold reboot (`zfs_mount_arena_cold` on host / `mount_nvme_zerofs` on bare metal), `ZeroFS` restores `ZfsGenHdr` and reads `+0x1FF000` across `active_mask @bits`, reconstructing exact `zfs_bucket_cursors[]` and `ZfsBackpointer32[]` tables so $O(\text{live})$ copy-compaction GC works immediately after a power cycle with **zero full-tree scans**.
 
 ---
 
-### 3.5 Eytzinger `CRC32C` B-Tree, Snapshots & Lockless Per-Reactor Sharding
+### 3.5 Multi-Level (`level 0..2`) Eytzinger Merkle-`CRC32C` B+Tree & Multi-Queue `PRP-List` NVMe
 
-#### Eliminating Bcachefs's Primary Bottleneck (`SIX` B-Tree Lock Contention on Fast NVMe)
+#### Eliminating Both B-Tree `SIX` Lock Contention and Single-Page Index Limits
 
-On modern NVMe SSDs (`hundreds of thousands of IOPS` at `<10 us` latency), traditional multi-threaded filesystems — including Bcachefs's Shared/Intent/Exclusive (`SIX`) node locks — bottleneck on cross-core cacheline bouncing at upper B-tree nodes. `ZeroFS` eliminates this completely via `ZeroOS`'s pinned Reactor architecture:
+```mermaid
+flowchart TD
+    SB["Alternating ZLedgerSuperblock @cell64\nBucket 1 [A] / Bucket 2 [B] (64 B, ZLEDGER1)\nepoch | root_ext | current_snap | active_mask | key_count | crc32c"]
+    GEN["4 KiB ZfsGenHdr @cell64 (ZGENTBL1)\nu16[2016] Persistent Bucket Generations + gen_crc"]
+    BR["4 KiB Eytzinger Branch Root (ZEYTZND1, level = 1..2)\nSlot 0: EytzNodeHdr @cell64 (gen_ext, count <= 63, node_crc)\nSlots 1..63: 1-Based BFS EytzPivot @cell64\n(max_id, max_snap, child_ext, child_crc, pivot_crc)"]
+    L0["4 KiB Eytzinger Leaf 0 (level = 0)\nSlots 1..63: LedgerKey @cell64"]
+    L1["4 KiB Eytzinger Leaf 1..62 (level = 0)\nSlots 1..63: LedgerKey @cell64"]
+    EXT["Per-Reactor 2 MiB CoW Buckets + 4Q PRP-List NVMe DMA\nSQ1..SQ4 / CQ1..CQ4 | 16 KiB+ Scatter-Gather Bursts | +0x1FF000 ZBPFOOT1"]
 
-| Bottleneck in POSIX / Bcachefs | `ZeroFS` (`ZLEDGER1`) Hardware Solution on `ZeroOS` |
-| :--- | :--- |
-| **Multi-core `SIX` lock contention on shared B-tree nodes** | **Per-Reactor Sharded Write Buckets & NVMe Queues:** Each pinned reactor (`@reactor_id() == r12`) owns its private open 2 MiB append bucket and dedicated NVMe I/O `@dma_queue` (`SQ`/`CQ`). Zero locks during extent writes! Cross-reactor index batch publication uses single-instruction `64 B` `publish` (`MOVDIR64B`) to the index coordinator ring. |
-| **Branch mispredictions in sorted binary B-tree search** | **1-Based Eytzinger (BFS) Cacheline Node Layout (`64` keys/node):** Keys are laid out breadth-first (`idx = 2 * idx + (target >= key[idx])`), lowered to branchless `cmp` + `adc`/`lea` + `@prefetch` of grandchild cachelines (`4x` fewer branch misses). |
-| **Expensive snapshot cloning** | **Descending `u32` Snapshot IDs (`0xFFFF_FFFE` downward):** Composite B-tree sort key `(id_hash: u64, snap_id: u32)`. Looking up `(id_hash, current_snap)` lands on the newest version `<= current_snap` on the **very first B-tree probe** (`O(1)` snapshot creation = 1 integer decrement!). |
-| **Silent NVMe bit-rot / torn writes** | **Hardware SSE4.2 `@crc32c` on Every Node & Extent:** Every B-tree node header and `LedgerKey` carries a 32-bit hardware `CRC32C` verified at line rate (`~32 GB/s/core`); mismatch raises `fail FAULT_CORRUPT` (`5`) caught cleanly by `gs:0` `recover`. |
+    SB -->|"root_ext"| BR
+    BR -->|"hdr.gen_ext"| GEN
+    BR -->|"child_ext + Merkle child_crc"| L0
+    BR -->|"child_ext + Merkle child_crc"| L1
+    L0 -->|"ext_word"| EXT
+    L1 -->|"ext_word"| EXT
+```
+
+1. **Multi-Level `4 KiB` (`64 x 64 B`) 1-Based Eytzinger (`BFS`) Merkle-`CRC32C` Geometry (`63 -> 3,969 -> 250,047` Keys):**
+   - Every tree node — whether a `level == 0` leaf (`LedgerKey @cell64` in slots `1..63`) or a `level >= 1` internal branch (`EytzPivot @cell64` in slots `1..63`) — is an exact **`4,096 B` (`64` cachelines)** page headed by `EytzNodeHdr @cell64` in slot `0`:
+     - **`level = 0` (Single-Page Root):** `0..63` keys (`1` `4 KiB` NVMe read).
+     - **`level = 1` (2-Level B+Tree):** `64..3,969` keys (`63` × `63`, `2` `4 KiB` NVMe reads).
+     - **`level = 2` (3-Level B+Tree):** up to **`250,047` keys** (`63^3`, `3` `4 KiB` NVMe reads).
+   - **The Inclusive Upper-Fence `(max_id, max_snap)` Separator Law:** Because snapshots sort `(id_hash ASC, snap_id ASC)` where newer snapshots carry **smaller** `u32` IDs (`0xFFFF_FFFE -> 0xFFFF_FFFD -> ...`), multiple snapshots of the same `id_hash` can straddle a 63-key leaf boundary. Storing each child's **inclusive maximum `(max_id, max_snap)`** in `EytzPivot` makes branch `lower_bound` (`zfs_branch_find_child`) mathematically identical to leaf `lower_bound` (`zfs_lookup_eytz`): probing `(target_id, query_snap)` goes left (`idx * 2`) while `(target_id < max_id) || (target_id == max_id && query_snap <= max_snap)` (saving `cand = idx`), and right (`idx * 2 + 1`) otherwise — landing on the **exact** target child in one top-down pass with **zero sibling leaf pointers**!
+   - **True Cryptographic/Hardware Merkle Tree (`EytzPivot.child_crc`):** Every `EytzPivot` stores both its own `pivot_crc` and `child_crc : u32` (`== child_hdr.node_crc`). Corrupting even 1 bit inside any child leaf or internal pivot triggers `when hdr[0].node_crc != want_ccrc => fail ZFS_FAULT_CORRUPT` (`5`) during `zfs_lookup_tree_arena` / `nvme_lookup_zerofs_ext`.
+2. **Per-Reactor Lockless NVMe I/O Queues (`SQ1..SQ4` / `CQ1..CQ4`) & `MDTS`-Aware `PRP-List` Bulk DMA (`examples/os/nvme_capsule.zr`):**
+   - During controller bring-up, `ZeroOS` issues `Identify Controller` (`CNS = 0x01`) to read hardware `MDTS` (`max_pages_per_cmd = 1..64`), requests `min(core_count, 4)` I/O queue pairs via `Set Features (FID = 0x07)`, and binds 4 KiB-aligned `@dma_queue nvme_io_sq1..4` / `nvme_io_cq1..4` with `64 B` cacheline-isolated `NvmeQueueSeq[4]` sequence counters (`0` false sharing across cores).
+   - Multi-page transfers (`nvme_io_submit_chunk_q`) automatically construct **`PRP1`** (`1` page), **`PRP1 + PRP2`** (`2` pages), or **`PRP1 + 4 KiB PRP-List`** (`3..64` pages using per-queue `@slab nvme_prp_lists`), streaming `16 KiB+` multi-page `ZeroFS` bursts in a single NVMe doorbell write while enforcing `zfs_is_write_armed() == 1 && byte_off >= 2 MiB` on every write/flush queue.
 
 ---
 

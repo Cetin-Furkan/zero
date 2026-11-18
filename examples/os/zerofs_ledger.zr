@@ -1,73 +1,80 @@
 // =============================================================================
-// ZeroFS (`ZLEDGER1`) — Next-Gen Copy-on-Write Extent Ledger (`examples/os/zerofs_ledger.zr`)
+// ZeroFS (`ZLEDGER1`) — Scale-Out Copy-on-Write Extent Ledger (`examples/os/zerofs_ledger.zr`)
 // =============================================================================
-// Implements `ZERO_NEXT_GEN_SPEC.md` §3 in the Next-Generation `Zero` Spine:
+// Implements `ZERO_NEXT_GEN_SPEC.md` §3 (Full Stage 2A + 2B Scale-Out):
 //   1. Mandatory `ZLEDGER1` (`0x3152_4547_4445_4C5A`) + SSE4.2 `@crc32c` Partition Guard
 //      (foreign `ext4`/`btrfs`/`LUKS`/`FAT32`/unformatted media stay strictly `SAFE_RO`!)
 //   2. 64-bit `ExtentWord` (`[Scale:3|Len11:11|Hdr:1|Pieces:3|Crypt:2|Perm:2|Base42:42]`)
 //      with adaptive `000` contiguous, `001..011` `PieceHeader32`, `100..110` `ExtentChain64`,
 //      and `111` multi-cacheline `ExtentChain64` chains (`0` `cmp` after `mask<...>`)
-//   3. `4 KiB` (`64 x 64 B`) 1-Based Eytzinger (`BFS`) `CRC32C` B-Tree with `@prefetch`
-//      and $O(1)$ descending `u32` snapshots (`0xFFFF_FFFE` downward)
-//   4. `2 MiB` append-only generational buckets (`bucket_gens : u16`) + `Backpointer32`
-//      $O(\text{live})$ copy-compaction GC (`bucket_gens[victim] += 1` $O(1)$ reclaim)
+//   3. Multi-Level `4 KiB` (`64 x 64 B`) 1-Based Eytzinger (`BFS`) Merkle-`CRC32C` B+Tree
+//      (`level = 0` leaves + `level >= 1` `EytzPivot` branches, `63 -> 3,969 -> 250,047` keys)
+//      with `@prefetch` and $O(1)$ descending `u32` snapshots (`0xFFFF_FFFE` downward)
+//   4. `2 MiB` append-only generational buckets (`ZfsGenHdr` `4 KiB` on-disk `u16` table) +
+//      persistent `+0x1FF000` `ZfsBucketFooterHdr` `Backpointer32[126]` footers enabling
+//      cold-reboot $O(\text{live})$ copy-compaction GC (`bucket_gens[victim] += 1` $O(1)$ reclaim)
 //   5. Seekable `128-bit XMM` `AES-128-CTR` (`@aes128_ctr64`) + `SHA-NI` (`@sha256_tag`)
 //      per-64B cacheline locking with `ptr* @oneshot` register-wiped secret reads &
 //      $O(1)$ `@bits` open-extent fingerprint scanning (`0` I/O on locked extents)
 // =============================================================================
 
-ZLEDGER_MAGIC       :: 0x3152_4547_4445_4C5A // "ZLEDGER1" little-endian ASCII
-ZEYTZ_MAGIC         :: 0x3144_4E5A_5459_455A // "ZEYTZND1" little-endian ASCII
-ZLEDGER_ARMED_TOKEN :: 0x5A4C_4544_4152_4D31 // "ZLEDARM1" hardware write interlock
+ZLEDGER_MAGIC         :: 0x3152_4547_4445_4C5A // "ZLEDGER1" little-endian ASCII
+ZEYTZ_MAGIC           :: 0x3144_4E5A_5459_455A // "ZEYTZND1" little-endian ASCII
+ZGEN_MAGIC            :: 0x314C_4254_4E45_475A // "ZGENTBL1" little-endian ASCII
+ZBPF_MAGIC            :: 0x3154_4F4F_4650_425A // "ZBPFOOT1" little-endian ASCII
+ZLEDGER_ARMED_TOKEN   :: 0x5A4C_4544_4152_4D31 // "ZLEDARM1" hardware write interlock
 
-ZFS_BUCKET_BYTES    :: 2097152               // 2 MiB (`PDE_PS` hugepage-aligned)
-ZFS_BUCKET_BOOT     :: 0                     // Bucket 0: immutable `ZEXTENT1` capsules
-ZFS_BUCKET_SUPER_A  :: 1                     // Bucket 1 (`0x20_0000`): Superblock Mirror A
-ZFS_BUCKET_SUPER_B  :: 2                     // Bucket 2 (`0x40_0000`): Superblock Mirror B
-ZFS_BUCKET_COW0     :: 3                     // Bucket 3 (`0x60_0000`): first CoW data/tree bucket
+ZFS_BUCKET_BYTES      :: 2097152               // 2 MiB (`PDE_PS` hugepage-aligned)
+ZFS_BUCKET_FOOTER_OFF :: 2093056               // `0x1F_F000`: final `4 KiB` of each `2 MiB` bucket!
+ZFS_BUCKET_BOOT       :: 0                     // Bucket 0: immutable `ZEXTENT1` capsules
+ZFS_BUCKET_SUPER_A    :: 1                     // Bucket 1 (`0x20_0000`): Superblock Mirror A
+ZFS_BUCKET_SUPER_B    :: 2                     // Bucket 2 (`0x40_0000`): Superblock Mirror B
+ZFS_BUCKET_COW0       :: 3                     // Bucket 3 (`0x60_0000`): first CoW data/tree bucket
 
-ZFS_SNAP_INIT       :: 0xFFFF_FFFE           // Descending snapshot head (`newer = snap - 1`)
-ZFS_MAX_KEYS        :: 63                    // 1 header + 63 keys = 64 * 64B = 4096B page!
-ZFS_MAX_BUCKETS     :: 32
-ZFS_BP_PER_BUCKET   :: 64
+ZFS_SNAP_INIT         :: 0xFFFF_FFFE           // Descending snapshot head (`newer = snap - 1`)
+ZFS_NODE_FANOUT       :: 63                    // `1` 64B header + `63` 64B slots = `4096 B` page!
+ZFS_MAX_KEYS          :: 63                    // per-node fanout alias
+ZFS_MAX_TOTAL_KEYS    :: 512                   // in-DRAM working-set capacity (`8` leaves; format scales to `63^3`)
+ZFS_MAX_BUCKETS       :: 64
+ZFS_BP_PER_BUCKET     :: 126                   // `64B` hdr + `126 * 32B` = `4096 B` exact footer page!
 
 // --- `ExtentWord` Bit Masks (`ZERO_NEXT_GEN_SPEC.md` §3.3) ---
-ZFS_ADDR42_MASK     :: 0x0000_03FF_FFFF_FFFF
-ZFS_PERM_BITS       :: 0b11 << 42
-ZFS_WRITE_BIT       :: 1 << 43
-ZFS_CRYPT_BIT       :: 1 << 44
-ZFS_SEALED_BIT      :: 1 << 45
-ZFS_CRYPT_MASK      :: 0b11 << 44
-ZFS_PIECES_BITS     :: 0b111 << 46
-ZFS_HDR_BIT         :: 1 << 49
+ZFS_ADDR42_MASK       :: 0x0000_03FF_FFFF_FFFF
+ZFS_PERM_BITS         :: 0b11 << 42
+ZFS_WRITE_BIT         :: 1 << 43
+ZFS_CRYPT_BIT         :: 1 << 44
+ZFS_SEALED_BIT        :: 1 << 45
+ZFS_CRYPT_MASK        :: 0b11 << 44
+ZFS_PIECES_BITS       :: 0b111 << 46
+ZFS_HDR_BIT           :: 1 << 49
 
-ZFS_PERM_NONE       :: 0
-ZFS_PERM_RO         :: 1
-ZFS_PERM_RX         :: 2
-ZFS_PERM_RW         :: 3
+ZFS_PERM_NONE         :: 0
+ZFS_PERM_RO           :: 1
+ZFS_PERM_RX           :: 2
+ZFS_PERM_RW           :: 3
 
-ZFS_CRYPT_OPEN      :: 0
-ZFS_CRYPT_AES_SHA   :: 1
-ZFS_CRYPT_CRC_SEAL  :: 2
+ZFS_CRYPT_OPEN        :: 0
+ZFS_CRYPT_AES_SHA     :: 1
+ZFS_CRYPT_CRC_SEAL    :: 2
 
-ZFS_FAULT_DENIED    :: 4
-ZFS_FAULT_CORRUPT   :: 5
-ZFS_FAULT_NOENT     :: 6
-ZFS_FAULT_NOSPC     :: 7
+ZFS_FAULT_DENIED      :: 4
+ZFS_FAULT_CORRUPT     :: 5
+ZFS_FAULT_NOENT       :: 6
+ZFS_FAULT_NOSPC       :: 7
 
 // --- On-Disk & In-DRAM Cacheline-Aligned `ZeroFS` Structures (`== 64B` verified) ---
 
 struct ZLedgerSuperblock @cell64 {
     magic        : u64    // MUST equal `ZLEDGER_MAGIC`
     version      : u32    // 1
-    sb_flags     : u32    // active feature mask
+    sb_flags     : u32    // bit 0 = base, bit 1 = multi-level + persistent footers/gen-page
     epoch        : u64    // monotonic CoW commit generation (higher valid wins)
-    root_ext     : u64    // `ExtentWord` of 4 KiB Eytzinger root page
+    root_ext     : u64    // `ExtentWord` of `4 KiB` Eytzinger root (`level = 0, 1, 2`)
     current_snap : u32    // descending snapshot ID (`0xFFFF_FFFE` downward)
     bucket_count : u32    // total 2 MiB buckets in namespace
     active_mask  : u64    // bitmask of allocated CoW buckets
-    gen_pack     : u64    // packed `u16[4]` generations for buckets `3..6`
-    key_count    : u32    // live `LedgerKey` count in Eytzinger root (`0..63`)
+    gen_pack     : u64    // fast-path packed `u16[4]` generations for buckets `3..6`
+    key_count    : u32    // total live `LedgerKey`s across the entire Eytzinger B+Tree!
     crc32c       : u32    // hardware SSE4.2 `@crc32c` of bytes `[0..59]`
 }
 
@@ -91,11 +98,46 @@ struct EytzNodeHdr @cell64 {
     epoch      : u64
     min_id     : u64
     max_id     : u64
-    pad0       : u64
-    pad1       : u64
-    pad2       : u64
-    count      : u32      // `0..63` active `LedgerKey`s in slots `1..count`
+    level      : u64      // `0` = Leaf (`LedgerKey`), `1+` = Internal Branch (`EytzPivot`)
+    total_keys : u64      // Total live `LedgerKey`s in this subtree
+    gen_ext    : u64      // `ExtentWord` of `4 KiB` `ZfsGenHdr` page (`0` if inline-only)
+    count      : u32      // `0..63` active entries in slots `1..count`
     node_crc   : u32      // SSE4.2 `@crc32c` over header + slots `1..count`
+}
+
+struct EytzPivot @cell64 {
+    max_id      : u64     // Inclusive upper fence `id_hash` of child subtree
+    max_snap    : u32     // Inclusive upper fence `snap_id` for `max_id`
+    child_count : u16     // Entries inside child (`1..63`)
+    child_level : u16     // `level - 1`
+    child_ext   : u64     // `ExtentWord` of child `4 KiB` Eytzinger node
+    min_id      : u64
+    min_snap    : u64
+    pad0        : u64
+    child_crc   : u32     // Merkle `CRC32C` of child `4 KiB` node!
+    flags       : u32
+    reserved    : u32
+    pivot_crc   : u32     // `@crc32c` of bytes `[0..59]`
+}
+
+struct ZfsGenHdr @cell64 {
+    magic        : u64    // `ZGEN_MAGIC` ("ZGENTBL1")
+    epoch        : u64
+    bucket_count : u64
+    pad          : u64[4]
+    reserved     : u32
+    gen_crc      : u32    // `@crc32c` over header `[0..59]` + `4032 B` `u16[2016]` array
+}
+
+struct ZfsBucketFooterHdr @cell64 {
+    magic      : u64      // `ZBPF_MAGIC` ("ZBPFOOT1")
+    epoch      : u64
+    bucket_id  : u32
+    bucket_gen : u32
+    used_bytes : u64      // `zfs_bucket_cursors[bucket_id]` (`<= 0x1FF000`)
+    pad        : u64[3]
+    bp_count   : u32      // `0..126` `ZfsBackpointer32` records at `[64..4095]`
+    footer_crc : u32      // `@crc32c` over header `[0..59]` + `bp_count * 32 B`
 }
 
 struct ZfsPieceHeader32 {
@@ -133,29 +175,35 @@ struct ZfsCommitCell @cell64 {
 
 // --- Static `ZeroFS` Coordinator & Per-Reactor Sharded State (`.bss`, `0` disk bytes) ---
 // `zfs_state`:
-//   [0] = write_armed_token (`ZLEDGER_ARMED_TOKEN` iff valid `ZLEDGER1` mounted, else `0`!)
-//   [1] = mounted_magic     (`ZLEDGER_MAGIC` iff mounted, else `0`)
-//   [2] = epoch
-//   [3] = current_snap
-//   [4] = bucket_count
-//   [5] = active_mask
-//   [6] = key_count
-//   [7] = root_ext
-//   [8] = commit_seq
-//   [9] = open_slot_mask    (`1 << idx` for each open `Crypt==00` key in `zfs_staging_keys`)
+//   [0]  = write_armed_token (`ZLEDGER_ARMED_TOKEN` iff valid `ZLEDGER1` mounted, else `0`!)
+//   [1]  = mounted_magic     (`ZLEDGER_MAGIC` iff mounted, else `0`)
+//   [2]  = epoch
+//   [3]  = current_snap
+//   [4]  = bucket_count
+//   [5]  = active_mask
+//   [6]  = key_count         (total live keys across multi-level B+tree)
+//   [7]  = root_ext
+//   [8]  = commit_seq
+//   [9]  = open_mask_low64   (first 64-bit word of `zfs_open_masks`)
 //   [10] = last_digest
-//   [11] = mounted_mirror   (`1` = Super A, `2` = Super B, `0` = unmounted/SAFE_RO)
+//   [11] = mounted_mirror    (`1` = Super A, `2` = Super B, `0` = unmounted/SAFE_RO)
+//   [12] = tree_level        (`0` = single-leaf root, `1` = 2-level B+tree, `2` = 3-level B+tree)
+//   [13] = gen_ext           (`ExtentWord` of `4 KiB` `ZfsGenHdr` page)
+//   [14] = dirty_bucket_mask (CoW buckets modified since last footer seal)
 @slab zfs_state          : u64[16]
-@slab zfs_bucket_gens    : u16[32]
-@slab zfs_bucket_cursors : u64[32]      // byte offset within each 2 MiB bucket (`0 .. 2097152`)
-@slab zfs_bp_counts      : u32[32]
-@slab zfs_bp_table       : ZfsBackpointer32[2048] // `32` buckets * `64` backpointers
-@slab zfs_staging_keys   : LedgerKey[64]          // sorted working set (`0 .. key_count-1`)
-@slab zfs_crypto_scratch : u8[128]                // 64B-aligned transient decrypt pad (wiped immediately)
-@slab zfs_piece_scratch  : u64[16]                // multi-piece builder scratch
-@slab zfs_key_scratch    : LedgerKey[2]           // 64B-aligned staging slot
-@slab zfs_sb_scratch     : ZLedgerSuperblock[2]   // 64B-aligned superblock builder slot
-@slab zfs_ev_scratch     : ZfsCommitCell[2]       // 64B-aligned MOVDIR64B publish cell
+@slab zfs_open_masks     : u64[8]                  // `8 * 64 = 512` open-key bitmap words
+@slab zfs_bucket_gens    : u16[64]
+@slab zfs_bucket_cursors : u64[64]                 // byte offset within each 2 MiB bucket (`0 .. 2093056`)
+@slab zfs_bp_counts      : u32[64]
+@slab zfs_bp_table       : ZfsBackpointer32[8064]  // `64` buckets * `126` backpointers
+@slab zfs_staging_keys   : LedgerKey[512]          // sorted working set (`0 .. key_count-1`)
+@slab zfs_staging_pivots : EytzPivot[64]           // branch separator builder (`0 .. leaf_cnt-1`)
+@slab zfs_leaf_scratch   : u8[4096]                // transient leaflookup scratch page
+@slab zfs_crypto_scratch : u8[128]                 // 64B-aligned transient decrypt pad (wiped immediately)
+@slab zfs_piece_scratch  : u64[16]
+@slab zfs_key_scratch    : LedgerKey[2]
+@slab zfs_sb_scratch     : ZLedgerSuperblock[2]
+@slab zfs_ev_scratch     : ZfsCommitCell[2]
 @ring zfs_commit_ring    : ZfsCommitCell[16]
 
 // --- Hardware SSE4.2 `@crc32c` Verifiers ---
@@ -206,11 +254,23 @@ fn zfs_ledger_key_crc32c(k: ptr* LedgerKey) u32 {
     return (~acc)[31:0]
 }
 
+fn zfs_pivot_crc32c(p: ptr* EytzPivot) u32 {
+    qw := ptr* u64 (p)
+    acc: u64 = 0xFFFF_FFFF
+    for i in 0..7 {
+        ui: u64 = i
+        acc = @crc32c(acc, qw[ui])
+    }
+    rsv: u64 = p[0].reserved
+    acc = @crc32c(acc, rsv)
+    return (~acc)[31:0]
+}
+
 fn zfs_eytz_node_crc32c(node_buf: ptr* u8) u32 {
     hdr  := ptr* EytzNodeHdr (node_buf)
     hqw  := ptr* u64 (node_buf)
     cnt  : u64 = hdr[0].count
-    when cnt > ZFS_MAX_KEYS => fail ZFS_FAULT_CORRUPT
+    when cnt > ZFS_NODE_FANOUT => fail ZFS_FAULT_CORRUPT
 
     acc: u64 = 0xFFFF_FFFF
     for i in 0..7 {
@@ -219,7 +279,6 @@ fn zfs_eytz_node_crc32c(node_buf: ptr* u8) u32 {
     }
     acc = @crc32c(acc, cnt)
 
-    keys := ptr* LedgerKey (node_buf)
     for idx in 1..(cnt + 1) {
         uidx: u64 = idx
         kqw := ptr* u64 (node_buf + uidx * 64)
@@ -227,6 +286,48 @@ fn zfs_eytz_node_crc32c(node_buf: ptr* u8) u32 {
             uqi: u64 = qi
             acc = @crc32c(acc, kqw[uqi])
         }
+    }
+    return (~acc)[31:0]
+}
+
+fn zfs_gen_page_crc32c(gen_buf: ptr* u8) u32 {
+    ghdr := ptr* ZfsGenHdr (gen_buf)
+    hqw  := ptr* u64 (gen_buf)
+    acc  : u64 = 0xFFFF_FFFF
+    for i in 0..7 {
+        ui: u64 = i
+        acc = @crc32c(acc, hqw[ui])
+    }
+    rsv: u64 = ghdr[0].reserved
+    acc = @crc32c(acc, rsv)
+
+    // Hash all `504` payload qwords (`4,032 B` = `2,016` `u16` generations)
+    pqw := ptr* u64 (gen_buf + 64)
+    for q in 0..504 {
+        uq: u64 = q
+        acc = @crc32c(acc, pqw[uq])
+    }
+    return (~acc)[31:0]
+}
+
+fn zfs_bucket_footer_crc32c(fbuf: ptr* u8) u32 {
+    fhdr := ptr* ZfsBucketFooterHdr (fbuf)
+    hqw  := ptr* u64 (fbuf)
+    bpc  : u64 = fhdr[0].bp_count
+    when bpc > ZFS_BP_PER_BUCKET => fail ZFS_FAULT_CORRUPT
+
+    acc: u64 = 0xFFFF_FFFF
+    for i in 0..7 {
+        ui: u64 = i
+        acc = @crc32c(acc, hqw[ui])
+    }
+    acc = @crc32c(acc, bpc)
+
+    bp_qwords: u64 = bpc * 4 // `32 B` per `ZfsBackpointer32` = `4` qwords
+    pqw := ptr* u64 (fbuf + 64)
+    for q in 0..bp_qwords {
+        uq: u64 = q
+        acc = @crc32c(acc, pqw[uq])
     }
     return (~acc)[31:0]
 }
@@ -299,6 +400,102 @@ fn zfs_unpack_gens_3_to_6(gen_pack: u64) i64 {
     return 0
 }
 
+// Materializes full `zfs_bucket_gens[0..bucket_count)` into a `4 KiB` `ZfsGenHdr` page!
+fn zfs_write_gen_page(gen_buf: ptr* u8, epoch: u64) u64 {
+    qw := ptr* u64 (gen_buf)
+    for z in 0..512 {
+        uz: u64 = z
+        qw[uz] = 0
+    }
+    bcnt: u64 = zfs_state[4]
+    if bcnt > ZFS_MAX_BUCKETS { bcnt = ZFS_MAX_BUCKETS }
+    g16 := ptr* u16 (gen_buf + 64)
+    for b in 0..bcnt {
+        ub: u64 = b
+        g16[ub] = zfs_bucket_gens[ub]
+    }
+    ghdr := ptr* ZfsGenHdr (gen_buf)
+    ghdr[0].magic        = ZGEN_MAGIC
+    ghdr[0].epoch        = epoch
+    ghdr[0].bucket_count = bcnt
+    ghdr[0].reserved     = 0
+    ghdr[0].gen_crc      = zfs_gen_page_crc32c(gen_buf)
+    return 4096
+}
+
+// Restores `zfs_bucket_gens[0..bucket_count)` from an on-disk `4 KiB` `ZfsGenHdr` page!
+fn zfs_load_gen_page(gen_buf: ptr* u8) i64 {
+    ghdr := ptr* ZfsGenHdr (gen_buf)
+    when ghdr[0].magic != ZGEN_MAGIC => fail ZFS_FAULT_CORRUPT
+    when zfs_gen_page_crc32c(gen_buf) != ghdr[0].gen_crc => fail ZFS_FAULT_CORRUPT
+
+    bcnt: u64 = ghdr[0].bucket_count
+    if bcnt > ZFS_MAX_BUCKETS { bcnt = ZFS_MAX_BUCKETS }
+    g16 := ptr* u16 (gen_buf + 64)
+    for b in 0..bcnt {
+        ub: u64 = b
+        v: u16  = g16[ub]
+        if v == 0 { v = 1 }
+        zfs_bucket_gens[ub] = v
+    }
+    return 0
+}
+
+// Materializes bucket `bid`'s `4 KiB` `ZfsBucketFooterHdr` + `ZfsBackpointer32[bp_count]` page!
+fn zfs_write_bucket_footer_page(fbuf: ptr* u8, bid: u64, epoch: u64) u64 {
+    qw := ptr* u64 (fbuf)
+    for z in 0..512 {
+        uz: u64 = z
+        qw[uz] = 0
+    }
+    bpc: u64 = zfs_bp_counts[bid]
+    if bpc > ZFS_BP_PER_BUCKET { bpc = ZFS_BP_PER_BUCKET }
+
+    dst_bps := ptr* ZfsBackpointer32 (fbuf + 64)
+    base_s: u64 = bid * ZFS_BP_PER_BUCKET
+    for i in 0..bpc {
+        ui: u64 = i
+        dst_bps[ui] = zfs_bp_table[base_s + ui]
+    }
+
+    fhdr := ptr* ZfsBucketFooterHdr (fbuf)
+    fhdr[0].magic      = ZBPF_MAGIC
+    fhdr[0].epoch      = epoch
+    fhdr[0].bucket_id  = bid
+    fhdr[0].bucket_gen = zfs_bucket_gens[bid]
+    fhdr[0].used_bytes = zfs_bucket_cursors[bid]
+    fhdr[0].bp_count   = bpc
+    fhdr[0].footer_crc = zfs_bucket_footer_crc32c(fbuf)
+    return 4096
+}
+
+// Restores bucket `bid`'s cursor & `ZfsBackpointer32[]` table from its `+0x1FF000` footer page!
+// Ignores unsealed/older-generation footers cleanly (e.g. freshly bumped `bucket_gens[bid]`).
+fn zfs_load_bucket_footer_page(fbuf: ptr* u8, bid: u64) u64 {
+    fhdr := ptr* ZfsBucketFooterHdr (fbuf)
+    if fhdr[0].magic != ZBPF_MAGIC {
+        return 0
+    }
+    when zfs_bucket_footer_crc32c(fbuf) != fhdr[0].footer_crc => fail ZFS_FAULT_CORRUPT
+    if fhdr[0].bucket_id != bid || fhdr[0].bucket_gen != zfs_bucket_gens[bid] {
+        return 0
+    }
+    bpc: u64 = fhdr[0].bp_count
+    when bpc > ZFS_BP_PER_BUCKET || fhdr[0].used_bytes > ZFS_BUCKET_FOOTER_OFF => fail ZFS_FAULT_CORRUPT
+
+    if fhdr[0].used_bytes > zfs_bucket_cursors[bid] {
+        zfs_bucket_cursors[bid] = fhdr[0].used_bytes
+    }
+    src_bps := ptr* ZfsBackpointer32 (fbuf + 64)
+    base_s: u64 = bid * ZFS_BP_PER_BUCKET
+    for i in 0..bpc {
+        ui: u64 = i
+        zfs_bp_table[base_s + ui] = src_bps[ui]
+    }
+    zfs_bp_counts[bid] = bpc
+    return bpc
+}
+
 // --- Mandatory `ZLEDGER1` Write Interlock & Superblock Validator (§3.2) ---
 
 fn zfs_disarm_safe_ro() i64 {
@@ -324,7 +521,7 @@ fn zfs_validate_super(sb: ptr* ZLedgerSuperblock) u64 {
     if sb[0].magic != ZLEDGER_MAGIC || sb[0].version != 1 {
         return 0
     }
-    if sb[0].epoch == 0 || sb[0].key_count > ZFS_MAX_KEYS || sb[0].bucket_count < 4 {
+    if sb[0].epoch == 0 || sb[0].key_count > ZFS_MAX_TOTAL_KEYS || sb[0].bucket_count < 4 {
         return 0
     }
     root_byte_off: u64 = mask<sb[0].root_ext | ZFS_ADDR42_MASK> << 6
@@ -337,20 +534,25 @@ fn zfs_validate_super(sb: ptr* ZLedgerSuperblock) u64 {
     return 1
 }
 
-// Rebuilds `zfs_open_mask` (`zfs_state[9]`) over `zfs_staging_keys[0..key_count)`
+// Rebuilds `zfs_open_masks[0..7]` (`512` bits) over `zfs_staging_keys[0..key_count)`
 fn zfs_rebuild_open_mask() i64 {
+    for w in 0..8 {
+        uw: u64 = w
+        zfs_open_masks[uw] = 0
+    }
     cnt: u64 = zfs_state[6]
-    omask: u64 = 0
     for i in 0..cnt {
-        ui: u64 = i
+        ui: u64    = i
         ext_w: u64 = zfs_staging_keys[ui].ext_word
         with when mask<ext_w | ZFS_CRYPT_BIT> ; ZF {
             if mask<ext_w | ZFS_PERM_BITS> != 0 {
-                omask |= (1 << ui)
+                wi: u64 = ui >> 6
+                bi: u64 = ui & 63
+                zfs_open_masks[wi] |= (1 << bi)
             }
         }
     }
-    zfs_state[9] = omask
+    zfs_state[9] = zfs_open_masks[0]
     return 0
 }
 
@@ -360,11 +562,10 @@ fn zfs_stage_insert_key(entry: ptr* LedgerKey) i64 {
     entry[0].reserved  = 0
     entry[0].entry_crc = zfs_ledger_key_crc32c(entry)
 
-    cnt: u64  = zfs_state[6]
-    tid: u64  = entry[0].id_hash
-    tsn: u32  = entry[0].snap_id
+    cnt: u64 = zfs_state[6]
+    tid: u64 = entry[0].id_hash
+    tsn: u32 = entry[0].snap_id
 
-    // Replace in-place if exact `(id_hash, snap_id)` already exists in current snapshot
     for i in 0..cnt {
         ui: u64 = i
         if zfs_staging_keys[ui].id_hash == tid && zfs_staging_keys[ui].snap_id == tsn {
@@ -374,7 +575,7 @@ fn zfs_stage_insert_key(entry: ptr* LedgerKey) i64 {
         }
     }
 
-    when cnt >= ZFS_MAX_KEYS => fail ZFS_FAULT_NOSPC
+    when cnt >= ZFS_MAX_TOTAL_KEYS => fail ZFS_FAULT_NOSPC
 
     ins_pos: u64 = cnt
     for i in 0..cnt {
@@ -387,9 +588,8 @@ fn zfs_stage_insert_key(entry: ptr* LedgerKey) i64 {
         }
     }
 
-    // Shift `[ins_pos .. cnt)` right by 1
     j: u64 = cnt
-    loop <max: 64 | until: j <= ins_pos> {
+    loop <max: 512 | until: j <= ins_pos> {
         zfs_staging_keys[j] = zfs_staging_keys[j - 1]
         j -= 1
     }
@@ -399,50 +599,93 @@ fn zfs_stage_insert_key(entry: ptr* LedgerKey) i64 {
     return 0
 }
 
-// --- 1-Based Eytzinger (`BFS`) `4 KiB` Node Materializer & Branchless Lookup (§3.5) ---
+// --- Multi-Level 1-Based Eytzinger (`BFS`) `4 KiB` Leaf & Branch Materializers (§3.5) ---
 
-fn zfs_eytz_fill_rec(dst_keys: ptr* LedgerKey, n: u64, k: u64, src_idx: ref& u64) u64 {
+fn zfs_eytz_fill_leaf_rec(dst_keys: ptr* LedgerKey, n: u64, k: u64, src_idx: ref& u64) u64 {
     when k <= n {
-        _ := zfs_eytz_fill_rec(dst_keys, n, k * 2, src_idx)
+        _ := zfs_eytz_fill_leaf_rec(dst_keys, n, k * 2, src_idx)
         dst_keys[k] = zfs_staging_keys[src_idx]
         src_idx += 1
-        _ := zfs_eytz_fill_rec(dst_keys, n, k * 2 + 1, src_idx)
+        _ := zfs_eytz_fill_leaf_rec(dst_keys, n, k * 2 + 1, src_idx)
     }
     return 0
 }
 
-fn zfs_materialize_eytz_root(node_buf: ptr* u8, epoch: u64) u64 {
+fn zfs_materialize_eytz_leaf_slice(node_buf: ptr* u8, epoch: u64, start_idx: u64, leaf_cnt: u64, gen_ext: u64) u64 {
+    when leaf_cnt > ZFS_NODE_FANOUT => fail ZFS_FAULT_NOSPC
     qw := ptr* u64 (node_buf)
     for z in 0..512 {
         uz: u64 = z
         qw[uz] = 0
     }
 
-    cnt: u64 = zfs_state[6]
     dst_keys := ptr* LedgerKey (node_buf)
-    when cnt > 0 {
-        cur_src: u64 = 0
-        _ := zfs_eytz_fill_rec(dst_keys, cnt, 1, cur_src)
+    when leaf_cnt > 0 {
+        cur_src: u64 = start_idx
+        _ := zfs_eytz_fill_leaf_rec(dst_keys, leaf_cnt, 1, cur_src)
     }
 
     hdr := ptr* EytzNodeHdr (node_buf)
-    hdr[0].magic = ZEYTZ_MAGIC
-    hdr[0].epoch = epoch
-    if cnt > 0 {
-        hdr[0].min_id = zfs_staging_keys[0].id_hash
-        hdr[0].max_id = zfs_staging_keys[cnt - 1].id_hash
+    hdr[0].magic      = ZEYTZ_MAGIC
+    hdr[0].epoch      = epoch
+    if leaf_cnt > 0 {
+        hdr[0].min_id = zfs_staging_keys[start_idx].id_hash
+        hdr[0].max_id = zfs_staging_keys[start_idx + leaf_cnt - 1].id_hash
     }
-    hdr[0].count    = cnt
-    hdr[0].node_crc = zfs_eytz_node_crc32c(node_buf)
+    hdr[0].level      = 0
+    hdr[0].total_keys = leaf_cnt
+    hdr[0].gen_ext    = gen_ext
+    hdr[0].count      = leaf_cnt
+    hdr[0].node_crc   = zfs_eytz_node_crc32c(node_buf)
     return 4096
 }
 
-// Unpacks an Eytzinger node (`1..count`) back into sorted `zfs_staging_keys` via inorder walk
+fn zfs_materialize_eytz_root(node_buf: ptr* u8, epoch: u64) u64 {
+    return zfs_materialize_eytz_leaf_slice(node_buf, epoch, 0, zfs_state[6], zfs_state[13])
+}
+
+fn zfs_eytz_fill_branch_rec(dst_pivs: ptr* EytzPivot, n: u64, k: u64, src_idx: ref& u64) u64 {
+    when k <= n {
+        _ := zfs_eytz_fill_branch_rec(dst_pivs, n, k * 2, src_idx)
+        dst_pivs[k] = zfs_staging_pivots[src_idx]
+        src_idx += 1
+        _ := zfs_eytz_fill_branch_rec(dst_pivs, n, k * 2 + 1, src_idx)
+    }
+    return 0
+}
+
+fn zfs_materialize_eytz_branch(node_buf: ptr* u8, epoch: u64, level: u64, total_keys: u64, piv_cnt: u64, gen_ext: u64) u64 {
+    when piv_cnt == 0 || piv_cnt > ZFS_NODE_FANOUT => fail ZFS_FAULT_NOSPC
+    qw := ptr* u64 (node_buf)
+    for z in 0..512 {
+        uz: u64 = z
+        qw[uz] = 0
+    }
+
+    dst_pivs := ptr* EytzPivot (node_buf)
+    cur_src: u64 = 0
+    _ := zfs_eytz_fill_branch_rec(dst_pivs, piv_cnt, 1, cur_src)
+
+    hdr := ptr* EytzNodeHdr (node_buf)
+    hdr[0].magic      = ZEYTZ_MAGIC
+    hdr[0].epoch      = epoch
+    hdr[0].min_id     = zfs_staging_pivots[0].min_id
+    hdr[0].max_id     = zfs_staging_pivots[piv_cnt - 1].max_id
+    hdr[0].level      = level
+    hdr[0].total_keys = total_keys
+    hdr[0].gen_ext    = gen_ext
+    hdr[0].count      = piv_cnt
+    hdr[0].node_crc   = zfs_eytz_node_crc32c(node_buf)
+    return 4096
+}
+
+// Unpacks a `level = 0` Eytzinger leaf (`1..count`) into `zfs_staging_keys[dst_idx..]` via inorder walk
 fn zfs_eytz_unpack_rec(src_keys: ptr* LedgerKey, n: u64, k: u64, dst_idx: ref& u64) u64 {
     when k <= n {
         _ := zfs_eytz_unpack_rec(src_keys, n, k * 2, dst_idx)
         sk_ptr := src_keys + k
         when zfs_ledger_key_crc32c(sk_ptr) != sk_ptr[0].entry_crc => fail ZFS_FAULT_CORRUPT
+        when dst_idx >= ZFS_MAX_TOTAL_KEYS => fail ZFS_FAULT_NOSPC
         zfs_staging_keys[dst_idx] = src_keys[k]
         dst_idx += 1
         _ := zfs_eytz_unpack_rec(src_keys, n, k * 2 + 1, dst_idx)
@@ -450,8 +693,48 @@ fn zfs_eytz_unpack_rec(src_keys: ptr* LedgerKey, n: u64, k: u64, dst_idx: ref& u
     return 0
 }
 
-// Mounts `ZeroFS` from Superblock A & B (`0x20_0000` / `0x40_0000`) + `4 KiB` `root_buf`!
-// Returns `0` in `SAFE_RO` mode (`zfs_state[0] = 0`) if neither superblock carries `ZLEDGER1` + valid `CRC32C`.
+// Unpacks all child leaves of a `level = 1` Eytzinger branch inside `arena` via inorder walk
+fn zfs_eytz_unpack_branch_arena_rec(arena: ptr* u8, src_pivs: ptr* EytzPivot, n: u64, k: u64, dst_idx: ref& u64) u64 {
+    when k <= n {
+        _ := zfs_eytz_unpack_branch_arena_rec(arena, src_pivs, n, k * 2, dst_idx)
+
+        pp := src_pivs + k
+        when zfs_pivot_crc32c(pp) != pp[0].pivot_crc => fail ZFS_FAULT_CORRUPT
+        child_off: u64 = mask<pp[0].child_ext | ZFS_ADDR42_MASK> << 6
+        child_buf := arena + child_off
+        chdr      := ptr* EytzNodeHdr (child_buf)
+        when chdr[0].magic != ZEYTZ_MAGIC || chdr[0].level != 0 => fail ZFS_FAULT_CORRUPT
+        calc_ccrc: u32 = zfs_eytz_node_crc32c(child_buf)
+        when calc_ccrc != chdr[0].node_crc || calc_ccrc != pp[0].child_crc => fail ZFS_FAULT_CORRUPT
+
+        ckeys := ptr* LedgerKey (child_buf)
+        _ := zfs_eytz_unpack_rec(ckeys, chdr[0].count, 1, dst_idx)
+
+        _ := zfs_eytz_unpack_branch_arena_rec(arena, src_pivs, n, k * 2 + 1, dst_idx)
+    }
+    return 0
+}
+
+// Advances per-bucket append cursors past all unpacked extents so CoW allocations never overwrite live data
+fn zfs_advance_cursors_from_keys() i64 {
+    cnt: u64 = zfs_state[6]
+    for i in 0..cnt {
+        ui: u64 = i
+        ew: u64 = zfs_staging_keys[ui].ext_word
+        eo: u64 = mask<ew | ZFS_ADDR42_MASK> << 6
+        eb: u64 = eo / ZFS_BUCKET_BYTES
+        span_aligned: u64 = (zfs_decode_extent_span(ew) + 128 + 4095) & (~4095)
+        e_end: u64 = (eo % ZFS_BUCKET_BYTES) + span_aligned
+        if eb >= ZFS_BUCKET_COW0 && eb < ZFS_MAX_BUCKETS && e_end <= ZFS_BUCKET_FOOTER_OFF {
+            if e_end > zfs_bucket_cursors[eb] {
+                zfs_bucket_cursors[eb] = e_end
+            }
+        }
+    }
+    return 0
+}
+
+// Mounts a single-root (`level == 0`) `ZeroFS` ledger from Superblock A & B + `root_buf`!
 fn zfs_mount_from_supers(
     sb_a     : ptr* ZLedgerSuperblock,
     sb_b     : ptr* ZLedgerSuperblock,
@@ -475,10 +758,16 @@ fn zfs_mount_from_supers(
     }
 
     hdr := ptr* EytzNodeHdr (root_buf)
-    if hdr[0].magic != ZEYTZ_MAGIC || hdr[0].count != chosen[0].key_count {
+    if hdr[0].magic != ZEYTZ_MAGIC {
         fail ZFS_FAULT_CORRUPT
     }
     if zfs_eytz_node_crc32c(root_buf) != hdr[0].node_crc {
+        fail ZFS_FAULT_CORRUPT
+    }
+    if hdr[0].level == 0 && hdr[0].count != chosen[0].key_count {
+        fail ZFS_FAULT_CORRUPT
+    }
+    if hdr[0].level > 0 && hdr[0].total_keys != chosen[0].key_count {
         fail ZFS_FAULT_CORRUPT
     }
 
@@ -494,33 +783,24 @@ fn zfs_mount_from_supers(
     }
     zfs_unpack_gens_3_to_6(chosen[0].gen_pack)
 
-    cnt: u64 = chosen[0].key_count
-    zfs_state[6] = cnt
-    when cnt > 0 {
-        src_keys := ptr* LedgerKey (root_buf)
-        out_i: u64 = 0
-        _ := zfs_eytz_unpack_rec(src_keys, cnt, 1, out_i)
-    }
-
-    // Advance per-bucket append cursors past all live extents + root page so CoW never overwrites live data!
     root_off: u64 = mask<chosen[0].root_ext | ZFS_ADDR42_MASK> << 6
     root_b:   u64 = root_off / ZFS_BUCKET_BYTES
     root_end: u64 = (root_off % ZFS_BUCKET_BYTES) + 4096
-    if root_b < ZFS_MAX_BUCKETS && root_end > zfs_bucket_cursors[root_b] {
+    if root_b < ZFS_MAX_BUCKETS && root_end <= ZFS_BUCKET_FOOTER_OFF && root_end > zfs_bucket_cursors[root_b] {
         zfs_bucket_cursors[root_b] = root_end
     }
-    for i in 0..cnt {
-        ui: u64 = i
-        ew: u64 = zfs_staging_keys[ui].ext_word
-        eo: u64 = mask<ew | ZFS_ADDR42_MASK> << 6
-        eb: u64 = eo / ZFS_BUCKET_BYTES
-        span_aligned: u64 = (zfs_decode_extent_span(ew) + 128 + 4095) & (~4095)
-        e_end: u64 = (eo % ZFS_BUCKET_BYTES) + span_aligned
-        if eb >= ZFS_BUCKET_COW0 && eb < ZFS_MAX_BUCKETS && e_end <= ZFS_BUCKET_BYTES {
-            if e_end > zfs_bucket_cursors[eb] {
-                zfs_bucket_cursors[eb] = e_end
-            }
+
+    if hdr[0].level == 0 {
+        cnt: u64 = chosen[0].key_count
+        zfs_state[6] = cnt
+        when cnt > 0 {
+            src_keys := ptr* LedgerKey (root_buf)
+            out_i: u64 = 0
+            _ := zfs_eytz_unpack_rec(src_keys, cnt, 1, out_i)
         }
+        zfs_advance_cursors_from_keys()
+    } else {
+        zfs_state[6] = 0
     }
 
     zfs_state[0]  = ZLEDGER_ARMED_TOKEN
@@ -531,11 +811,73 @@ fn zfs_mount_from_supers(
     zfs_state[5]  = chosen[0].active_mask
     zfs_state[7]  = chosen[0].root_ext
     zfs_state[11] = mirror
+    zfs_state[12] = hdr[0].level
+    zfs_state[13] = hdr[0].gen_ext
+    zfs_state[14] = 0
     zfs_rebuild_open_mask()
     return chosen[0].epoch
 }
 
-// Formats an in-RAM `arena` (`total_buckets >= 6`, each `2 MiB` or scaled test arena) with `ZLEDGER1`
+// Full Cold-Reboot Scale-Out Mount on an in-RAM `arena`:
+//   1. Validates `ZLEDGER1` Superblocks A/B & selects highest valid `epoch`
+//   2. Restores multi-bucket `ZfsGenHdr` (`u16` generations) if `hdr.gen_ext != 0`
+//   3. Unpacks `level == 0` OR multi-level (`level == 1`) Merkle-`CRC32C` Eytzinger B+Tree
+//   4. Restores per-bucket `+0x1FF000` `ZfsBucketFooterHdr` `Backpointer32[]` tables & cursors!
+fn zfs_mount_arena_cold(arena: ptr* u8) u64 {
+    sb_a := ptr* ZLedgerSuperblock (arena + ZFS_BUCKET_SUPER_A * ZFS_BUCKET_BYTES)
+    sb_b := ptr* ZLedgerSuperblock (arena + ZFS_BUCKET_SUPER_B * ZFS_BUCKET_BYTES)
+
+    va: u64 = zfs_validate_super(sb_a)
+    vb: u64 = zfs_validate_super(sb_b)
+    if va == 0 && vb == 0 {
+        zfs_disarm_safe_ro()
+        return 0
+    }
+    chosen : ptr* ZLedgerSuperblock = sb_a
+    if vb == 1 && (va == 0 || sb_b[0].epoch >= sb_a[0].epoch) {
+        chosen = sb_b
+    }
+
+    root_off: u64 = mask<chosen[0].root_ext | ZFS_ADDR42_MASK> << 6
+    root_buf := arena + root_off
+    ep: u64 = zfs_mount_from_supers(sb_a, sb_b, root_buf)
+    if ep == 0 {
+        return 0
+    }
+
+    hdr := ptr* EytzNodeHdr (root_buf)
+    if hdr[0].gen_ext != 0 {
+        gen_off: u64 = mask<hdr[0].gen_ext | ZFS_ADDR42_MASK> << 6
+        _ := zfs_load_gen_page(arena + gen_off)
+        gen_b:   u64 = gen_off / ZFS_BUCKET_BYTES
+        gen_end: u64 = (gen_off % ZFS_BUCKET_BYTES) + 4096
+        if gen_b < ZFS_MAX_BUCKETS && gen_end <= ZFS_BUCKET_FOOTER_OFF && gen_end > zfs_bucket_cursors[gen_b] {
+            zfs_bucket_cursors[gen_b] = gen_end
+        }
+    }
+
+    if hdr[0].level == 1 {
+        pivs := ptr* EytzPivot (root_buf)
+        out_k: u64 = 0
+        _ := zfs_eytz_unpack_branch_arena_rec(arena, pivs, hdr[0].count, 1, out_k)
+        when out_k != chosen[0].key_count => fail ZFS_FAULT_CORRUPT
+        zfs_state[6] = out_k
+        zfs_advance_cursors_from_keys()
+        zfs_rebuild_open_mask()
+    }
+
+    // Restore sealed `+0x1FF000` `Backpointer32` footers on all active CoW buckets (`@bits` walk!)
+    act_m: u64 = zfs_state[5]
+    when for bid in act_m @bits {
+        if bid >= ZFS_BUCKET_COW0 && bid < zfs_state[4] {
+            fbuf := arena + bid * ZFS_BUCKET_BYTES + ZFS_BUCKET_FOOTER_OFF
+            _ := zfs_load_bucket_footer_page(fbuf, bid)
+        }
+    }
+    return ep
+}
+
+// Formats an in-RAM `arena` (`total_buckets >= 5`) with `ZLEDGER1` (`epoch = 1`)
 fn zfs_format_memory_ledger(arena: ptr* u8, total_buckets: u32) u64 {
     when total_buckets < 5 || total_buckets > ZFS_MAX_BUCKETS => fail ZFS_FAULT_NOSPC
 
@@ -548,7 +890,10 @@ fn zfs_format_memory_ledger(arena: ptr* u8, total_buckets: u32) u64 {
     zfs_bucket_cursors[0] = ZFS_BUCKET_BYTES
     zfs_bucket_cursors[1] = ZFS_BUCKET_BYTES
     zfs_bucket_cursors[2] = ZFS_BUCKET_BYTES
-    zfs_bucket_cursors[3] = 4096 // `[0..4096)` of Bucket 3 holds initial Eytzinger root
+    zfs_bucket_cursors[3] = 8192 // `[0..4096)` = Eytzinger root, `[4096..8192)` = `ZfsGenHdr` page!
+
+    gen_off:  u64 = ZFS_BUCKET_COW0 * ZFS_BUCKET_BYTES + 4096
+    gen_ext:  u64 = zfs_encode_extent_word(gen_off, 4096, ZFS_PERM_RO, ZFS_CRYPT_CRC_SEAL, 0, 0)
 
     zfs_state[0]  = ZLEDGER_ARMED_TOKEN
     zfs_state[1]  = ZLEDGER_MAGIC
@@ -560,13 +905,20 @@ fn zfs_format_memory_ledger(arena: ptr* u8, total_buckets: u32) u64 {
     zfs_state[8]  = 0
     zfs_state[9]  = 0
     zfs_state[11] = 1
+    zfs_state[12] = 0
+    zfs_state[13] = gen_ext
+    zfs_state[14] = 0
+    zfs_rebuild_open_mask()
+
+    _ := zfs_write_gen_page(arena + gen_off, 1)
 
     root_off: u64 = ZFS_BUCKET_COW0 * ZFS_BUCKET_BYTES
-    _ := zfs_materialize_eytz_root(arena + root_off, 1)
+    _ := zfs_materialize_eytz_leaf_slice(arena + root_off, 1, 0, 0, gen_ext)
     root_ext: u64 = zfs_encode_extent_word(root_off, 4096, ZFS_PERM_RO, ZFS_CRYPT_CRC_SEAL, 0, 0)
     zfs_state[7]  = root_ext
 
-    // Stamp Superblock A (`Bucket 1`, `epoch = 1`) and clear Superblock B (`Bucket 2`)
+    _ := zfs_write_bucket_footer_page(arena + ZFS_BUCKET_COW0 * ZFS_BUCKET_BYTES + ZFS_BUCKET_FOOTER_OFF, ZFS_BUCKET_COW0, 1)
+
     sb_a := ptr* ZLedgerSuperblock (arena + ZFS_BUCKET_SUPER_A * ZFS_BUCKET_BYTES)
     sb_b := ptr* ZLedgerSuperblock (arena + ZFS_BUCKET_SUPER_B * ZFS_BUCKET_BYTES)
     b_qw := ptr* u64 (sb_b)
@@ -577,7 +929,7 @@ fn zfs_format_memory_ledger(arena: ptr* u8, total_buckets: u32) u64 {
 
     sb_a[0].magic        = ZLEDGER_MAGIC
     sb_a[0].version      = 1
-    sb_a[0].sb_flags     = 1
+    sb_a[0].sb_flags     = 3
     sb_a[0].epoch        = 1
     sb_a[0].root_ext     = root_ext
     sb_a[0].current_snap = ZFS_SNAP_INIT
@@ -599,7 +951,7 @@ fn zfs_create_snapshot() u32 {
     return next_s
 }
 
-// Allocates `aligned_bytes` (`64 B` or `4 KiB` aligned) from reactor `rid`'s CoW bucket (`Bucket 3 + (rid & 3)`)
+// Allocates `aligned_bytes` (`64 B` or `4 KiB` aligned) inside `[0 .. 0x1FF000)` of reactor `rid`'s CoW bucket!
 fn zfs_alloc_cow_bytes(reactor_id: u64, byte_len: u64, align_bytes: u64, out_bucket: ref& u64) u64 {
     zfs_require_write_armed()
     b_cnt: u64 = zfs_state[4]
@@ -614,9 +966,10 @@ fn zfs_alloc_cow_bytes(reactor_id: u64, byte_len: u64, align_bytes: u64, out_buc
         cur: u64 = zfs_bucket_cursors[bid]
         al_cur: u64 = (cur + align_bytes - 1) & (~(align_bytes - 1))
         al_len: u64 = (byte_len + 63) & (~63)
-        if al_cur + al_len <= ZFS_BUCKET_BYTES {
+        if al_cur + al_len <= ZFS_BUCKET_FOOTER_OFF {
             zfs_bucket_cursors[bid] = al_cur + al_len
-            zfs_state[5] |= (1 << bid)
+            zfs_state[5]  |= (1 << bid)
+            zfs_state[14] |= (1 << bid)
             out_bucket = bid
             return bid * ZFS_BUCKET_BYTES + al_cur
         }
@@ -637,6 +990,7 @@ fn zfs_record_backpointer(bid: u64, id_hash: u64, ext_word: u64, snap_id: u32, b
         crc = @crc32c(crc, snap_id)
         zfs_bp_table[slot].bp_crc   = crc
         zfs_bp_counts[bid]          = cnt + 1
+        zfs_state[14]              |= (1 << bid)
     }
     return 0
 }
@@ -672,24 +1026,23 @@ fn zfs_put_contiguous(
     domain_tag: u64 = (perm_dom >> 8) & 0xFF
     when perm == 0 || byte_len == 0 => fail ZFS_FAULT_DENIED
 
-    bid: u64  = 0
-    off: u64  = zfs_alloc_cow_bytes(reactor_id, byte_len, 64, bid)
-    dst       := arena + off
+    bid: u64 = 0
+    off: u64 = zfs_alloc_cow_bytes(reactor_id, byte_len, 64, bid)
+    dst      := arena + off
     for i in 0..byte_len {
         ui: u64 = i
         dst[ui] = src[ui]
     }
-    // Zero-pad tail to 64B cacheline boundary
     al_len: u64 = (byte_len + 63) & (~63)
     for z in byte_len..al_len {
         uz: u64 = z
         dst[uz] = 0
     }
 
-    dcrc: u32 = zfs_crc32c_bytes(dst, byte_len)
+    dcrc:  u32 = zfs_crc32c_bytes(dst, byte_len)
     ext_w: u64 = zfs_encode_extent_word(off, byte_len, perm, ZFS_CRYPT_OPEN, 0, 0)
-    snap: u32  = zfs_state[3]
-    h2: u64    = (id_hash >> 56) & 0xFF
+    snap:  u32 = zfs_state[3]
+    h2:    u64 = (id_hash >> 56) & 0xFF
 
     kp := ptr* LedgerKey (zfs_key_scratch.base)
     kp[0].id_hash     = id_hash
@@ -730,7 +1083,6 @@ fn zfs_put_pieces(
         return zfs_put_contiguous(arena, reactor_id, id_hash, s0, seg_lens[0], perm | (1 << 8))
     }
 
-    // Write each data piece first and compute end-to-end CRC32C
     total_bytes : u64 = 0
     crc_acc     : u64 = 0xFFFF_FFFF
     home_bid    : u64 = 0
@@ -753,7 +1105,6 @@ fn zfs_put_pieces(
             uz: u64 = z
             pdst[uz] = 0
         }
-        // Fold 64-bit chunks into stream CRC
         qwn: u64 = (slen + 7) >> 3
         qwp := ptr* u64 (pdst)
         for q in 0..qwn {
@@ -766,7 +1117,6 @@ fn zfs_put_pieces(
 
     ext_w: u64 = 0
     if seg_cnt == 2 {
-        // `010` (`pcs = 2`): compact `32B` `PieceHeader32`!
         hbid: u64 = 0
         hoff: u64 = zfs_alloc_cow_bytes(reactor_id, 64, 64, hbid)
         home_bid  = hbid
@@ -778,7 +1128,6 @@ fn zfs_put_pieces(
         ext_w = zfs_encode_extent_word(hoff, total_bytes, perm, ZFS_CRYPT_OPEN, 2, 1)
     } else {
         if seg_cnt <= 5 {
-            // `100` (`pcs = 4`): single `64B` `ExtentChain64 @cell64` (`pieces[0..4]`, `next_ext = 0`)!
             cbid: u64 = 0
             coff: u64 = zfs_alloc_cow_bytes(reactor_id, 64, 64, cbid)
             home_bid  = cbid
@@ -796,7 +1145,6 @@ fn zfs_put_pieces(
             ch[0].next_ext = 0
             ext_w = zfs_encode_extent_word(coff, total_bytes, perm, ZFS_CRYPT_OPEN, 4, 1)
         } else {
-            // `111` (`pcs = 7`): multi-cacheline linked `ExtentChain64 @cell64` chain (built tail-to-head)!
             nodes_needed: u64 = (seg_cnt + 4) / 5
             next_link: u64    = 0
             head_off: u64     = 0
@@ -866,7 +1214,6 @@ fn zfs_put_locked(
     num_blocks: u64 = (byte_len + 63) >> 6
     pay_bytes:  u64 = num_blocks << 6
     bid: u64        = 0
-    // `64B` header prefix (`ZfsPieceHeader32`) + `pay_bytes` of independent `AES-128-CTR` 64B cachelines!
     off: u64        = zfs_alloc_cow_bytes(reactor_id, 64 + pay_bytes, 64, bid)
 
     tag: u64 = @sha256_tag(user_key, id_hash)
@@ -877,7 +1224,6 @@ fn zfs_put_locked(
     hdr[0].p1        = 0
 
     cipher_base := arena + off + 64
-    // Copy & zero-pad into `cipher_base`, then encrypt each 64-byte block in-place via `AES-128-CTR`!
     for i in 0..byte_len {
         ui: u64 = i
         cipher_base[ui] = src[ui]
@@ -893,9 +1239,9 @@ fn zfs_put_locked(
         _ := @aes128_ctr64(bptr, bptr, user_key, nonce)
     }
 
-    ccrc: u32  = zfs_crc32c_bytes(cipher_base, pay_bytes)
+    ccrc:  u32 = zfs_crc32c_bytes(cipher_base, pay_bytes)
     ext_w: u64 = zfs_encode_extent_word(off, byte_len, ZFS_PERM_RW, ZFS_CRYPT_AES_SHA, 0, 1)
-    snap: u32  = zfs_state[3]
+    snap:  u32 = zfs_state[3]
 
     kp := ptr* LedgerKey (zfs_key_scratch.base)
     kp[0].id_hash     = id_hash
@@ -917,28 +1263,70 @@ fn zfs_put_locked(
     return ext_w
 }
 
-// --- 4. Branchless 1-Based Eytzinger Lookup + Generational & `CRC32C` Verification ---
+// --- 4. Multi-Level Branchless 1-Based Eytzinger Descent (`level 2 -> 1 -> 0`) ---
 
-fn zfs_lookup_eytz(
-    root_buf   : ptr* u8,
-    target_id  : u64,
-    query_snap : u32,
-    out_slot   : ref& u64
+// Routes `(target_id, query_snap)` through one `4 KiB` Eytzinger `level >= 1` branch page,
+// verifying node `CRC32C` + pivot `CRC32C` and returning `child_ext` (+ expected Merkle `out_child_crc`)!
+fn zfs_branch_find_child(
+    branch_buf    : ptr* u8,
+    target_id     : u64,
+    query_snap    : u32,
+    out_child_crc : ref& u64
 ) u64 {
-    hdr := ptr* EytzNodeHdr (root_buf)
-    when hdr[0].magic != ZEYTZ_MAGIC => fail ZFS_FAULT_CORRUPT
-    when zfs_eytz_node_crc32c(root_buf) != hdr[0].node_crc => fail ZFS_FAULT_CORRUPT
+    hdr := ptr* EytzNodeHdr (branch_buf)
+    when hdr[0].magic != ZEYTZ_MAGIC || hdr[0].level == 0 => fail ZFS_FAULT_CORRUPT
+    when zfs_eytz_node_crc32c(branch_buf) != hdr[0].node_crc => fail ZFS_FAULT_CORRUPT
 
     n: u64 = hdr[0].count
     when n == 0 => fail ZFS_FAULT_NOENT
 
-    keys := ptr* LedgerKey (root_buf)
+    pivs := ptr* EytzPivot (branch_buf)
     k    : u64 = 1
     cand : u64 = 0
 
     loop <max: 8 | until: k > n> {
         if k * 4 <= n {
-            @prefetch(root_buf + (k * 4) * 64)
+            @prefetch(branch_buf + (k * 4) * 64)
+        }
+        mid: u64 = pivs[k].max_id
+        msn: u32 = pivs[k].max_snap
+        ge:  u64 = 0
+        if mid > target_id || (mid == target_id && msn >= query_snap) {
+            ge   = 1
+            cand = k
+        }
+        k = k * 2 + (1 - ge)
+    }
+
+    when cand == 0 => fail ZFS_FAULT_NOENT
+    pp := pivs + cand
+    when zfs_pivot_crc32c(pp) != pp[0].pivot_crc => fail ZFS_FAULT_CORRUPT
+
+    out_child_crc = pp[0].child_crc
+    return pp[0].child_ext
+}
+
+// Leaf-level (`level == 0`) 1-based Eytzinger `lower_bound` + `CRC32C` + `bucket_gen` verification
+fn zfs_lookup_eytz(
+    leaf_buf   : ptr* u8,
+    target_id  : u64,
+    query_snap : u32,
+    out_slot   : ref& u64
+) u64 {
+    hdr := ptr* EytzNodeHdr (leaf_buf)
+    when hdr[0].magic != ZEYTZ_MAGIC || hdr[0].level != 0 => fail ZFS_FAULT_CORRUPT
+    when zfs_eytz_node_crc32c(leaf_buf) != hdr[0].node_crc => fail ZFS_FAULT_CORRUPT
+
+    n: u64 = hdr[0].count
+    when n == 0 => fail ZFS_FAULT_NOENT
+
+    keys := ptr* LedgerKey (leaf_buf)
+    k    : u64 = 1
+    cand : u64 = 0
+
+    loop <max: 8 | until: k > n> {
+        if k * 4 <= n {
+            @prefetch(leaf_buf + (k * 4) * 64)
         }
         cid: u64 = keys[k].id_hash
         csn: u32 = keys[k].snap_id
@@ -953,10 +1341,9 @@ fn zfs_lookup_eytz(
     when cand == 0 => fail ZFS_FAULT_NOENT
     when keys[cand].id_hash != target_id => fail ZFS_FAULT_NOENT
 
-    kp := ptr* LedgerKey (root_buf + cand * 64)
+    kp := ptr* LedgerKey (leaf_buf + cand * 64)
     when zfs_ledger_key_crc32c(kp) != kp[0].entry_crc => fail ZFS_FAULT_CORRUPT
 
-    // $O(1)$ Generational Bucket Validation (`ZERO_NEXT_GEN_SPEC.md` §3.4)!
     bid: u64  = kp[0].bucket_id
     bgen: u64 = kp[0].bucket_gen
     when bid >= ZFS_MAX_BUCKETS || bgen != zfs_bucket_gens[bid] => fail ZFS_FAULT_CORRUPT
@@ -966,6 +1353,39 @@ fn zfs_lookup_eytz(
     when (mask<ext_w | ZFS_CRYPT_MASK> >> 44) == 3 => fail ZFS_FAULT_CORRUPT
 
     out_slot = cand
+    return ext_w
+}
+
+// Descends a `level = 0, 1, 2` Merkle-`CRC32C` Eytzinger B+Tree in `arena`, copying the matched
+// `LedgerKey` into `zfs_key_scratch[1]` so callers read `exact_len`/`data_crc32c` uniformly!
+fn zfs_lookup_tree_arena(
+    arena      : ptr* u8,
+    root_buf   : ptr* u8,
+    target_id  : u64,
+    query_snap : u32
+) u64 {
+    cur_buf := root_buf
+    hdr     := ptr* EytzNodeHdr (cur_buf)
+    when hdr[0].magic != ZEYTZ_MAGIC => fail ZFS_FAULT_CORRUPT
+
+    depth_guard: u64 = 0
+    loop <max: 4 | until: hdr[0].level == 0> {
+        depth_guard += 1
+        when depth_guard > 3 => fail ZFS_FAULT_CORRUPT
+        prev_lvl: u64  = hdr[0].level
+        want_ccrc: u64 = 0
+        child_ext: u64 = zfs_branch_find_child(cur_buf, target_id, query_snap, want_ccrc)
+        child_off: u64 = mask<child_ext | ZFS_ADDR42_MASK> << 6
+        cur_buf        = arena + child_off
+        hdr            = ptr* EytzNodeHdr (cur_buf)
+        when hdr[0].magic != ZEYTZ_MAGIC || hdr[0].level != prev_lvl - 1 => fail ZFS_FAULT_CORRUPT
+        when hdr[0].node_crc != want_ccrc => fail ZFS_FAULT_CORRUPT
+    }
+
+    slot_idx: u64 = 0
+    ext_w: u64    = zfs_lookup_eytz(cur_buf, target_id, query_snap, slot_idx)
+    lkeys        := ptr* LedgerKey (cur_buf)
+    zfs_key_scratch[1] = lkeys[slot_idx]
     return ext_w
 }
 
@@ -1001,20 +1421,16 @@ fn zfs_read_open_extent(
     dst_buf    : ptr* u8,
     out_bytes  : ref& u64
 ) u64 {
-    slot_idx: u64 = 0
-    ext: u64      = zfs_lookup_eytz(root_buf, id_hash, query_snap, slot_idx)
+    ext: u64 = zfs_lookup_tree_arena(arena, root_buf, id_hash, query_snap)
 
-    // Unauthenticated open reads MUST fail immediately on `CRYPT_BIT` extents (`0` `cmp`!)
     with when mask<ext | ZFS_CRYPT_BIT> ; !ZF {
         fail ZFS_FAULT_DENIED
     }
 
-    keys := ptr* LedgerKey (root_buf)
-    want_len: u64 = keys[slot_idx].exact_len
-    want_crc: u32 = keys[slot_idx].data_crc32c
+    want_len: u64 = zfs_key_scratch[1].exact_len
+    want_crc: u32 = zfs_key_scratch[1].data_crc32c
     base_off: u64 = mask<ext | ZFS_ADDR42_MASK> << 6
 
-    // Single BMI1 `bextr` fuses `(ext & PIECES_BITS) >> 46` AND sets `ZF=1` for `000` contiguous!
     with pcs := mask<ext | ZFS_PIECES_BITS> >> 46 ; when ZF {
         psrc := arena + base_off
         for i in 0..want_len {
@@ -1068,9 +1484,6 @@ fn zfs_read_open_extent(
 }
 
 // --- 6. Seekable Single-Cacheline `AES-128-CTR` + `SHA-NI` + `ptr* @oneshot` Unlock (§3.6) ---
-// Decrypts ONLY the single `64-byte` cacheline containing `byte_offset` (`blk_idx = byte_offset >> 6`),
-// reads the requested `u64` via a 1-hop `ptr* @oneshot` capability (immediately `xor`-wiped from GPRs!),
-// and zeroes the 64-byte transient pad before returning!
 
 fn zfs_seek_locked_qword(
     arena       : ptr* u8,
@@ -1082,8 +1495,7 @@ fn zfs_seek_locked_qword(
 ) u64 {
     when caller_key == 0 || (byte_offset & 7) != 0 => fail ZFS_FAULT_DENIED
 
-    slot_idx: u64 = 0
-    ext: u64      = zfs_lookup_eytz(root_buf, id_hash, query_snap, slot_idx)
+    ext: u64 = zfs_lookup_tree_arena(arena, root_buf, id_hash, query_snap)
 
     with when mask<ext | ZFS_CRYPT_BIT> ; !ZF {
         base_off := mask<ext | ZFS_ADDR42_MASK> << 6
@@ -1098,16 +1510,13 @@ fn zfs_seek_locked_qword(
         cipher_blk := arena + base_off + 64 + (blk_idx << 6)
         pad_ptr    := ptr* u8 (zfs_crypto_scratch.base)
 
-        // Decrypt ONLY this single 64-byte cacheline (`nonce = id_hash ^ (blk_idx << 2)`)!
         _ := @aes128_ctr64(pad_ptr, cipher_blk, caller_key, id_hash ^ (blk_idx << 2))
         zfs_state[10] = hdr[0].exact_len
 
-        // Ephemeral register-only `ptr* @oneshot u64` -> 1-hop relay -> single load + immediate GPR `xor` wipe!
         secret_p : ptr* @oneshot u64 = pad_ptr + qw_off
         shown    : ptr* @oneshot u64 = secret_p
         plain_qw : u64               = shown[0]
 
-        // Zero transient 64-byte plaintext pad in `.bss` so `0` secret bytes remain in RAM OR GPRs!
         pad_qw := ptr* u64 (zfs_crypto_scratch.base)
         for z in 0..8 {
             uz: u64 = z
@@ -1120,21 +1529,24 @@ fn zfs_seek_locked_qword(
     return 0
 }
 
-// --- 7. $O(1)$ `@bits` Open-Extent Fingerprint Search (Zero Disk Reads on Locked Files!) ---
+// --- 7. $O(1)$ `@bits` Open-Extent Fingerprint Search Across All `512` Slots ---
 
 fn zfs_scan_open_domain(want_domain_tag: u64, out_hits: ref& u64) u64 {
-    open_m : u64 = zfs_state[9]
     hits   : u64 = 0
     digest : u64 = 0
 
-    when for slot in open_m @bits {
-        ext_w: u64 = zfs_staging_keys[slot].ext_word
-        // Double-verify bit 44 (`CRYPT_BIT`) is clear in 1 `test` instruction (`0` `cmp`!)
-        with when mask<ext_w | ZFS_CRYPT_BIT> ; ZF {
-            dtag: u64 = (zfs_staging_keys[slot].meta_flags >> 8) & 0xFF
-            if want_domain_tag == 0 || dtag == want_domain_tag {
-                hits += 1
-                digest = @crc32c(digest ^ zfs_staging_keys[slot].id_hash, zfs_staging_keys[slot].exact_len)
+    for wi in 0..8 {
+        uwi: u64    = wi
+        open_m: u64 = zfs_open_masks[uwi]
+        when for bit in open_m @bits {
+            slot: u64  = uwi * 64 + bit
+            ext_w: u64 = zfs_staging_keys[slot].ext_word
+            with when mask<ext_w | ZFS_CRYPT_BIT> ; ZF {
+                dtag: u64 = (zfs_staging_keys[slot].meta_flags >> 8) & 0xFF
+                if want_domain_tag == 0 || dtag == want_domain_tag {
+                    hits += 1
+                    digest = @crc32c(digest ^ zfs_staging_keys[slot].id_hash, zfs_staging_keys[slot].exact_len)
+                }
             }
         }
     }
@@ -1154,24 +1566,23 @@ fn zfs_evacuate_bucket(arena: ptr* u8, victim_bid: u64, dst_bid: u64) u64 {
     kcnt  : u64 = zfs_state[6]
 
     for bi in 0..bp_n {
-        ubi: u64    = bi
+        ubi: u64     = bi
         bp_slot: u64 = victim_bid * ZFS_BP_PER_BUCKET + ubi
         bp_id: u64   = zfs_bp_table[bp_slot].id_hash
         bp_sn: u32   = zfs_bp_table[bp_slot].snap_id
         bp_ew: u64   = zfs_bp_table[bp_slot].ext_word
         bp_len: u64  = zfs_bp_table[bp_slot].byte_len
 
-        // Check if `(bp_id, bp_sn)` is still live in `zfs_staging_keys` with matching `ext_word`
         for ki in 0..kcnt {
             uki: u64 = ki
             if zfs_staging_keys[uki].id_hash == bp_id && zfs_staging_keys[uki].snap_id == bp_sn && zfs_staging_keys[uki].ext_word == bp_ew {
-                // Only evacuate single-allocation extents (`pcs == 0`) directly via backpointer copy
                 with pcs := mask<bp_ew | ZFS_PIECES_BITS> >> 46 ; when ZF {
                     al_len: u64 = (bp_len + 63) & (~63)
                     cur_d:  u64 = (zfs_bucket_cursors[dst_bid] + 63) & (~63)
-                    when cur_d + al_len > ZFS_BUCKET_BYTES => fail ZFS_FAULT_NOSPC
+                    when cur_d + al_len > ZFS_BUCKET_FOOTER_OFF => fail ZFS_FAULT_NOSPC
                     zfs_bucket_cursors[dst_bid] = cur_d + al_len
-                    zfs_state[5] |= (1 << dst_bid)
+                    zfs_state[5]  |= (1 << dst_bid)
+                    zfs_state[14] |= (1 << dst_bid)
 
                     new_off: u64 = dst_bid * ZFS_BUCKET_BYTES + cur_d
                     old_off: u64 = mask<bp_ew | ZFS_ADDR42_MASK> << 6
@@ -1182,7 +1593,6 @@ fn zfs_evacuate_bucket(arena: ptr* u8, victim_bid: u64, dst_bid: u64) u64 {
                         dst_p[uc] = src_p[uc]
                     }
 
-                    // Rewrite `Base42` in `ext_word` while preserving `[63:42]` (`Scale|Len11|Hdr|Pieces|Crypt|Perm`)!
                     hi_meta: u64 = bp_ew & (~ZFS_ADDR42_MASK)
                     new_ew:  u64 = hi_meta | ((new_off >> 6) & ZFS_ADDR42_MASK)
 
@@ -1199,7 +1609,6 @@ fn zfs_evacuate_bucket(arena: ptr* u8, victim_bid: u64, dst_bid: u64) u64 {
         }
     }
 
-    // $O(1)$ Generational Reclamation: bump `bucket_gens[victim_bid]`, reset cursor & backpointers!
     zfs_bucket_gens[victim_bid]    = zfs_bucket_gens[victim_bid] + 1
     zfs_bucket_cursors[victim_bid] = 0
     zfs_bp_counts[victim_bid]      = 0
@@ -1207,26 +1616,17 @@ fn zfs_evacuate_bucket(arena: ptr* u8, victim_bid: u64, dst_bid: u64) u64 {
     return moved
 }
 
-// --- 9. Transactional CoW Root & Alternating Superblock Commit Builder ---
+// --- 9. Transactional CoW Multi-Level Tree, GenPage, Bucket Footers & Superblock Commit ---
 
-fn zfs_prepare_cow_commit(
-    root_buf          : ptr* u8,
-    root_disk_byte_off: u64,
-    out_sb            : ptr* ZLedgerSuperblock
-) u64 {
-    zfs_require_write_armed()
-    when root_disk_byte_off < ZFS_BUCKET_COW0 * ZFS_BUCKET_BYTES || (root_disk_byte_off & 4095) != 0 => fail ZFS_FAULT_DENIED
-
-    next_epoch: u64 = zfs_state[2] + 1
-    _ := zfs_materialize_eytz_root(root_buf, next_epoch)
-
-    root_ext: u64 = zfs_encode_extent_word(root_disk_byte_off, 4096, ZFS_PERM_RO, ZFS_CRYPT_CRC_SEAL, 0, 0)
+fn zfs_finalize_superblock(root_ext: u64, next_epoch: u64, tree_lvl: u64, gen_ext: u64, out_sb: ptr* ZLedgerSuperblock) u64 {
     zfs_state[2]  = next_epoch
     zfs_state[7]  = root_ext
+    zfs_state[12] = tree_lvl
+    zfs_state[13] = gen_ext
 
     out_sb[0].magic        = ZLEDGER_MAGIC
     out_sb[0].version      = 1
-    out_sb[0].sb_flags     = 1
+    out_sb[0].sb_flags     = 3
     out_sb[0].epoch        = next_epoch
     out_sb[0].root_ext     = root_ext
     out_sb[0].current_snap = zfs_state[3]
@@ -1236,7 +1636,6 @@ fn zfs_prepare_cow_commit(
     out_sb[0].key_count    = zfs_state[6]
     out_sb[0].crc32c       = zfs_super_crc32c(out_sb)
 
-    // Alternate CoW superblock target: even epochs -> Mirror B (`Bucket 2`), odd epochs -> Mirror A (`Bucket 1`)!
     target_mirror: u64 = 1
     if (next_epoch & 1) == 0 {
         target_mirror = 2
@@ -1245,14 +1644,98 @@ fn zfs_prepare_cow_commit(
     return target_mirror
 }
 
-// Commits a prepared `4 KiB` CoW Eytzinger root + alternating `ZLedgerSuperblock` directly into an in-RAM `arena`
+// Single-page `level = 0` root commit helper (`count <= 63`)
+fn zfs_prepare_cow_commit(
+    root_buf          : ptr* u8,
+    root_disk_byte_off: u64,
+    out_sb            : ptr* ZLedgerSuperblock
+) u64 {
+    zfs_require_write_armed()
+    when root_disk_byte_off < ZFS_BUCKET_COW0 * ZFS_BUCKET_BYTES || (root_disk_byte_off & 4095) != 0 => fail ZFS_FAULT_DENIED
+    when zfs_state[6] > ZFS_NODE_FANOUT => fail ZFS_FAULT_NOSPC
+
+    next_epoch: u64 = zfs_state[2] + 1
+    _ := zfs_materialize_eytz_leaf_slice(root_buf, next_epoch, 0, zfs_state[6], zfs_state[13])
+    root_ext: u64 = zfs_encode_extent_word(root_disk_byte_off, 4096, ZFS_PERM_RO, ZFS_CRYPT_CRC_SEAL, 0, 0)
+    return zfs_finalize_superblock(root_ext, next_epoch, 0, zfs_state[13], out_sb)
+}
+
+// Full Scale-Out CoW Commit into `arena`:
+//   • Writes `4 KiB` `ZfsGenHdr` `u16` generation page
+//   • Splits `zfs_staging_keys[0..cnt)` into `level = 0` single root (`cnt <= 63`) OR
+//     `level = 1` Merkle-`CRC32C` Eytzinger branch + `ceil(cnt / 63)` `4 KiB` child leaves (`cnt > 63`)!
+//   • Seals `+0x1FF000` `ZfsBucketFooterHdr` `Backpointer32[]` footers on all dirty CoW buckets
+//   • Atomically updates alternating `ZLedgerSuperblock` (`Mirror A` <-> `Mirror B`)!
 fn zfs_commit_to_memory_arena(arena: ptr* u8, reactor_id: u64) u64 {
     zfs_require_write_armed()
-    rbid: u64     = 0
-    root_off: u64 = zfs_alloc_cow_bytes(reactor_id, 4096, 4096, rbid)
+    next_epoch: u64 = zfs_state[2] + 1
+    cnt: u64        = zfs_state[6]
 
-    sbp := ptr* ZLedgerSuperblock (zfs_sb_scratch.base)
-    mirror_b: u64 = zfs_prepare_cow_commit(arena + root_off, root_off, sbp)
+    gbid: u64    = 0
+    gen_off: u64 = zfs_alloc_cow_bytes(reactor_id, 4096, 4096, gbid)
+    _ := zfs_write_gen_page(arena + gen_off, next_epoch)
+    gen_ext: u64 = zfs_encode_extent_word(gen_off, 4096, ZFS_PERM_RO, ZFS_CRYPT_CRC_SEAL, 0, 0)
+
+    root_off: u64 = 0
+    tree_lvl: u64 = 0
+
+    if cnt <= ZFS_NODE_FANOUT {
+        rbid: u64 = 0
+        root_off  = zfs_alloc_cow_bytes(reactor_id, 4096, 4096, rbid)
+        _ := zfs_materialize_eytz_leaf_slice(arena + root_off, next_epoch, 0, cnt, gen_ext)
+        tree_lvl  = 0
+    } else {
+        leaf_cnt: u64 = (cnt + ZFS_NODE_FANOUT - 1) / ZFS_NODE_FANOUT
+        when leaf_cnt > ZFS_NODE_FANOUT => fail ZFS_FAULT_NOSPC
+
+        for li in 0..leaf_cnt {
+            uli: u64   = li
+            start_k: u64 = uli * ZFS_NODE_FANOUT
+            rem_k: u64   = cnt - start_k
+            if rem_k > ZFS_NODE_FANOUT { rem_k = ZFS_NODE_FANOUT }
+
+            lbid: u64 = 0
+            loff: u64 = zfs_alloc_cow_bytes(uli & 3, 4096, 4096, lbid)
+            lbuf     := arena + loff
+            _ := zfs_materialize_eytz_leaf_slice(lbuf, next_epoch, start_k, rem_k, 0)
+            lhdr := ptr* EytzNodeHdr (lbuf)
+            lext: u64 = zfs_encode_extent_word(loff, 4096, ZFS_PERM_RO, ZFS_CRYPT_CRC_SEAL, 0, 0)
+
+            last_k: u64 = start_k + rem_k - 1
+            zfs_staging_pivots[uli].max_id      = zfs_staging_keys[last_k].id_hash
+            zfs_staging_pivots[uli].max_snap    = zfs_staging_keys[last_k].snap_id
+            zfs_staging_pivots[uli].child_count = rem_k
+            zfs_staging_pivots[uli].child_level = 0
+            zfs_staging_pivots[uli].child_ext   = lext
+            zfs_staging_pivots[uli].min_id      = zfs_staging_keys[start_k].id_hash
+            zfs_staging_pivots[uli].min_snap    = zfs_staging_keys[start_k].snap_id
+            zfs_staging_pivots[uli].pad0        = 0
+            zfs_staging_pivots[uli].child_crc   = lhdr[0].node_crc
+            zfs_staging_pivots[uli].flags       = 1
+            zfs_staging_pivots[uli].reserved    = 0
+            pp := ptr* EytzPivot (zfs_staging_pivots.base + uli * 64)
+            zfs_staging_pivots[uli].pivot_crc   = zfs_pivot_crc32c(pp)
+        }
+
+        rbid2: u64 = 0
+        root_off   = zfs_alloc_cow_bytes(reactor_id, 4096, 4096, rbid2)
+        _ := zfs_materialize_eytz_branch(arena + root_off, next_epoch, 1, cnt, leaf_cnt, gen_ext)
+        tree_lvl   = 1
+    }
+
+    // Seal `+0x1FF000` `ZfsBucketFooterHdr` pages on all dirty active CoW buckets!
+    dirty_m: u64 = zfs_state[14] & zfs_state[5]
+    when for bid in dirty_m @bits {
+        if bid >= ZFS_BUCKET_COW0 && bid < zfs_state[4] {
+            fbuf := arena + bid * ZFS_BUCKET_BYTES + ZFS_BUCKET_FOOTER_OFF
+            _ := zfs_write_bucket_footer_page(fbuf, bid, next_epoch)
+        }
+    }
+    zfs_state[14] = 0
+
+    root_ext: u64 = zfs_encode_extent_word(root_off, 4096, ZFS_PERM_RO, ZFS_CRYPT_CRC_SEAL, 0, 0)
+    sbp          := ptr* ZLedgerSuperblock (zfs_sb_scratch.base)
+    mirror_b: u64 = zfs_finalize_superblock(root_ext, next_epoch, tree_lvl, gen_ext, sbp)
 
     dst_sb := ptr* ZLedgerSuperblock (arena + mirror_b * ZFS_BUCKET_BYTES)
     dst_sb[0] = sbp[0]

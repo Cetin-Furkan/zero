@@ -484,9 +484,19 @@ fn draw_zerofs_panel(handoff: @BootHandoff) i64 {
     cx: u64 = draw_deck_text(handoff, 636, 92, "ZEROFS ZLEDGER1 // PCI DOMAINS:", fg_white)
     draw_deck_val(handoff, cx + 6, 92, hw_dom_summary[0], fg_cyan)
 
-    // Row 1 (`y = 122`): Non-POSIX Hardware Domains (`nvme`, `gt`, `gna`, `xhci`, `net`)
+    // Row 1 (`y = 122`): Non-POSIX Hardware Domains (`nvme` w/ multi-queue count, `gt`, `gna`, `xhci`)
     cx = draw_deck_text(handoff, 636, 122, "DOM:", fg_sky)
-    if dom_nvme.present != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "NVME:ON", fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "NVME:--", fg_muted) }
+    if dom_nvme.present != 0 {
+        if nvme_ctrl_state[7] > 0 {
+            cx = draw_deck_text(handoff, cx + 8, 122, "NVME:", fg_cyan)
+            cx = draw_deck_val(handoff, cx, 122, nvme_ctrl_state[7], fg_amber)
+            cx = draw_deck_text(handoff, cx, 122, "Q", fg_cyan)
+        } else {
+            cx = draw_deck_text(handoff, cx + 8, 122, "NVME:ON", fg_cyan)
+        }
+    } else {
+        cx = draw_deck_text(handoff, cx + 8, 122, "NVME:--", fg_muted)
+    }
     if dom_gt.present   != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "GT:ON",   fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "GT:--",   fg_muted) }
     if dom_gna.present  != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "GNA:ON",  fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "GNA:--",  fg_muted) }
     if dom_xhci.present != 0 { cx = draw_deck_text(handoff, cx + 8, 122, "XHCI:ON", fg_cyan) } else { cx = draw_deck_text(handoff, cx + 8, 122, "XHCI:--", fg_muted) }
@@ -513,11 +523,13 @@ fn draw_zerofs_panel(handoff: @BootHandoff) i64 {
         }
     }
 
-    // Row 4 (`y = 200`): Descending Snapshot ID & Eytzinger B-Tree Key Count
-    cx = draw_deck_text(handoff, 636, 200, "EYTZ KEYS:", fg_sky)
-    cx = draw_deck_val(handoff, cx + 8, 200, zfs_state[6], fg_cyan)
-    cx = draw_deck_text(handoff, cx + 14, 200, "SNAP:", fg_sky)
-    draw_deck_val(handoff, cx + 8, 200, zfs_state[3], fg_amber)
+    // Row 4 (`y = 200`): Eytzinger Merkle B+Tree Key Count, Tree Level (`0..2`), & Snapshot ID
+    cx = draw_deck_text(handoff, 636, 200, "KEYS:", fg_sky)
+    cx = draw_deck_val(handoff, cx + 6, 200, zfs_state[6], fg_cyan)
+    cx = draw_deck_text(handoff, cx + 11, 200, "LVL:", fg_sky)
+    cx = draw_deck_val(handoff, cx + 6, 200, zfs_state[12], fg_violet)
+    cx = draw_deck_text(handoff, cx + 11, 200, "SNAP:", fg_sky)
+    draw_deck_val(handoff, cx + 6, 200, zfs_state[3], fg_amber)
 
     // Row 5 (`y = 224`): Hardware Crypto & `@oneshot` Engine
     draw_deck_text(handoff, 636, 224, "CRYPTO: AES-128-CTR + SHA-NI + ONESHOT", fg_violet)

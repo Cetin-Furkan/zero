@@ -257,6 +257,10 @@ fn main(handoff: @BootHandoff) i64 {
                 if qemu_debug == 1 {
                     dbg_str("ZFS=OK EPOCH=")
                     dbg_u64_dec(zfs_state[2])
+                    dbg_str(" LVL=")
+                    dbg_u64_dec(zfs_state[12])
+                    dbg_str(" Q=")
+                    dbg_u64_dec(nvme_ctrl_state[7])
                     dbg_str(" SNAP=")
                     dbg_u64_dec(zfs_state[3])
                     dbg_str(" KEYS=")

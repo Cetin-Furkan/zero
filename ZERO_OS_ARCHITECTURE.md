@@ -3,7 +3,7 @@
 > [!IMPORTANT]
 > **`ZeroOS`** (`examples/gate1_os.zr` + `examples/os/*.zr`) is a single-image, reactor-driven, strictly `W^X` Ring-0 monolithic operating system co-designed with the self-hosted **`Zero` (`.zr`)** compiler (`compiler/zero1.zr`, `--target=efi-os` and `--target=capsule`).
 >
-> Every hardware address, MSR, page-table flag, descriptor table, interrupt gate, PCIe `@domain` descriptor, NVMe `@dma_queue`, and `ZeroFS` (`ZLEDGER1`) CoW storage path documented below is **implemented and verified today** in `build/gate1_os_z2.efi` (`159,744 B`) and `build/gate1_laptop_z2.efi` (`155,136 B`, `0` port-`0xE9` instructions), except Section 10 which explicitly marks the future Gate-4 `Iris Xe` `CCS0` GPU compute walker.
+> Every hardware address, MSR, page-table flag, descriptor table, interrupt gate, PCIe `@domain` descriptor, multi-queue NVMe `@dma_queue` (`SQ1..SQ4` + `PRP-List`), and Scale-Out `ZeroFS` (`ZLEDGER1`) CoW storage path documented below is **implemented and verified today** in `build/gate1_os_z2.efi` (`192,000 B`) and `build/gate1_laptop_z2.efi` (`186,368 B`, `0` port-`0xE9` instructions), except Section 10 which explicitly blueprints the next hardware target (Gate 4: `Iris Xe` `8086:9a49` Gen12LP direct `ELSP` / EU compute).
 
 ---
 
@@ -33,9 +33,9 @@ Every architectural decision in `ZeroOS` is anchored to direct inspection of `/p
 | **Cacheline Doorbells & Sleep** | `MOVDIR64B`, `MOVDIRI`, Ring-0 `MONITOR`/`MWAIT` | **`waitpkg` (`umwait`/`tpause`) Absent**; **`lam` Absent** | `publish(addr, cell64)` emits `MOVDIR64B` (`66 0F 38 F8`); `wait(...)` emits Intel SDM §9.10.4 race-free Ring-0 `MONITOR` + recheck + `MWAIT` + `IA32_TSC_DEADLINE` (`MSR 0x6E0`), with `CPUID.01H:ECX[3]` fallback to `PAUSE`/`sti; hlt` on hypervisors without `MWAIT`. |
 | **Memory Protection** | `4-level PML4` (`pdpe1gb`, `NX`), `PKU` (`OSPKE`) | `5-level la57` Absent | Full `W^X` `CR3` hierarchy (`verify_no_wx_pages() == 0`) + `PKRU = 0` initialized across all cores. |
 | **APIC & Timers** | Register-mode `x2APIC` (`MSR 0x800..0x83F`), `I/O APIC` (`0xFEC0_0000`), invariant `TSC` | `x2apic`, `tsc_deadline_timer`, `constant_tsc`, `nonstop_tsc` Present | `MADT`-driven `INIT-SIPI` SMP wake via `X2APIC_ICR_MSR` (`0x830`); `I/O APIC` routes `IRQ 1` $\rightarrow$ vector `0x21` with **zero periodic timer ticks**. |
-| **Integrated GPU** | `00:02.0` Intel TigerLake-LP GT2 `[Iris Xe Graphics]` `[8086:9a49]` | Shared DRAM via PPGTT + slice-local SRAM (SLM) + `WC` GOP | UEFI GOP framebuffer mapped `PTE_WC_NX` (`PAT1 = WC`) and painted at 64 bytes/store via `AVX-512` `vmovntdq`. *(Direct `CCS0` compute walker = Gate 4).* |
-| **Scoring Accelerator** | `00:08.0` Intel GNA Scoring Accelerator 2.0 `[8086:9a11]` | Low-power neural/GMM block *(No Meteor Lake NPU on this die)* | Stage-2 `gna` hardware domain target (`npu` is statically rejected on Tiger Lake). |
-| **NVMe Storage** | `02:00.0` SK hynix BC511 NVMe SSD `[1c5c:1339]` | **Intel VMD Disabled** — directly visible via ACPI `MCFG`/`ECAM` (`Class 01h:08h:02h`) | Lock-free Ring-0 Admin (`ASQ`/`ACQ`) & I/O (`SQ1`/`CQ1`) `@dma_queue` pairs over `UC+NX` `BAR0` doorbells. |
+| **Integrated GPU** | `00:02.0` Intel TigerLake-LP GT2 `[Iris Xe Graphics]` `[8086:9a49]` (`BAR0 = 0x60_0000_0000` `16 MiB` `GTTMMADR`, `BAR2 = 0x40_0000_0000` `256 MiB` `GMADR`) | `96` EUs (`768` hw threads), shared DRAM via `GGTT`/`PPGTT` + slice-local `SLM` + `WC` GOP; **supports direct hardware `ELSP` Execlists (zero GuC firmware required!)** | `@domain dom_gt : gt` discovered via `MCFG`; UEFI GOP mapped `PTE_WC_NX` (`PAT1 = WC`) and painted at 64 bytes/store via `AVX-512` `vmovntdq`. *(Direct Gen12LP EU compute = Gate 4).* |
+| **Scoring Accelerator** | `00:08.0` Intel GNA Scoring Accelerator 2.0 `[8086:9a11]` (`BAR0 = 0x60_0113_d000` `4 KiB`) | Low-power neural/GMM DMA block *(No Meteor Lake NPU on this die)* | `@domain dom_gna : gna` bound via `MCFG` (`@domain ... : npu` is statically rejected at compile time on Tiger Lake). |
+| **NVMe Storage** | `02:00.0` SK hynix BC511 NVMe SSD `[1c5c:1339]` | **Intel VMD Disabled** — directly visible via ACPI `MCFG`/`ECAM` (`Class 01h:08h:02h`) | `@domain dom_nvme : nvme` + Admin (`ASQ`/`ACQ`) + up to **`4` lockless per-reactor I/O `@dma_queue` pairs (`SQ1..SQ4` / `CQ1..CQ4`)** + `4 KiB` `PRP-List` scatter-gather DMA. |
 | **Input & Buses** | `i8042` (`0x60`/`0x64` `@port`, `IRQ 1`), `00:14.0` xHCI `[8086:a0ed]`, `00:15.0/1` LPSS I2C `[8086:a0e8/9]`, `01:00.0` Wi-Fi 7 `[8086:272b]` | Built-in PS/2 AT keyboard + `ELAN0712` I2C touchpad + USB 3.2 boot | Interrupt-driven `IRQ1` scancode ring (`kbd_ring`) + GPT/FAT32 USB boot (`make usb-img`). |
 
 ---
@@ -187,14 +187,16 @@ BSP (Reactor 0)                                     Worker Reactor k (1..N-1)
 
 ---
 
-## 8. PCIe `MCFG` + Lock-Free NVMe `@dma_queue` + `.zcap` Capsule Engine
+## 8. PCIe `MCFG` + Multi-Queue NVMe (`SQ1..SQ4`, `PRP-List`) + `.zcap` Capsule Engine
 
-`examples/os/nvme_capsule.zr` brings up bare-metal NVMe DMA and hardware-verified code capsules in ~350 lines of pure `.zr`:
+`examples/os/nvme_capsule.zr` brings up multi-queue bare-metal NVMe scatter-gather DMA, hardware-verified `.zcap` capsules, and Scale-Out `ZeroFS` (`ZLEDGER1`) in pure `.zr`:
 
-1. **PCIe `MCFG`/`ECAM` Enumeration:** Reads `AcpiMcfgEntry` from `handoff.mcfg`, maps bus ECAM space `PTE_UC_NX`, locates PCI Class `01h` / Subclass `08h` / ProgIF `02h` (`NVMe`), enables `Command.MSE | Command.BME`, reads 64-bit `BAR0`, and maps `BAR0` `PTE_UC_NX`.
-2. **Controller Reset & `@dma_queue` Binding:**
+1. **PCIe `MCFG`/`ECAM` Enumeration:** Reads `AcpiMcfgEntry` from `handoff.mcfg`, maps bus ECAM space `PTE_UC_NX`, locates PCI Class `01h` / Subclass `08h` / ProgIF `02h` (`NVMe`), enables `Command.MSE | Command.BME`, reads 64-bit `BAR0`, and maps `BAR0` (`0x2000 B`) `PTE_UC_NX`.
+2. **Controller Reset, `MDTS`, & Per-Reactor Lockless `@dma_queue` Allocation (`SQ1..SQ4` / `CQ1..CQ4`):**
    - Clears `CC.EN`, awaits `CSTS.RDY == 0`, binds 4 KiB page-aligned `@dma_queue nvme_admin_sq` (`16 x 64B NvmeCmd`) and `nvme_admin_cq` (`16 x 16B NvmeCqe`) to `AQA`/`ASQ`/`ACQ`, sets `CC = 0x0046_0001` (`IOSQES=6, IOCQES=4, EN=1`), and awaits `CSTS.RDY == 1`.
-   - Issues `Identify Namespace 1` (`CNS=0`) to discover exact logical block shift `LBADS` (`512 B` or `4096 B`), then creates I/O Completion Queue `1` (`Opcode 0x05`) and I/O Submission Queue `1` (`Opcode 0x01`) backed by `nvme_io_cq1` / `nvme_io_sq1`.
+   - Issues `Identify Controller` (`Opcode 0x06, CNS=1`) to extract hardware `MDTS` (`max_pages_per_cmd`, capped at `64` pages = `256 KiB`/cmd) and `Identify Namespace 1` (`CNS=0`) to extract exact `NSZE` & `LBADS` (`512 B` or `4096 B`).
+   - Requests `want_qs = min(handoff.core_count, 4)` I/O queue pairs via `Set Features (FID = 0x07)` and creates `IOCQ1..k` (`Opcode 0x05`) + `IOSQ1..k` (`Opcode 0x01`) backed by `@dma_queue nvme_io_sq1..4` / `nvme_io_cq1..4` with `64 B` cacheline-isolated `NvmeQueueSeq[4]` sequence counters (`0` cross-core lock or cacheline bouncing!).
+   - **Scatter-Gather `PRP` Builder (`nvme_io_submit_chunk_q`):** Transfers `1` page via `PRP1`, `2` pages via `PRP1 + PRP2`, and `3..64` pages in a **single NVMe command** by populating queue `q`'s dedicated `4 KiB`-aligned `@slab nvme_prp_lists` slot (`PRP2 = prp_list_phys`).
 3. **Master Extent Table (`ZEXTENT1`) & `.zcap` (`ZEROZCAP`) Verification + `W^X` Sealing:**
 
 ```text
@@ -203,7 +205,7 @@ LBA 0: MasterExtentSuper (24 B) + MasterExtentEntry[0..3] (32 B each)
 │ magic = "ZEXTENT1"   │ version=1 │ extent_count │ generation │  + hardware @crc32c
 └──────────────────────┴───────────┴──────────────┴────────────┘
          │
-         ▼  NVMe Read (Opcode 0x02) straight into 64 KiB slot k of `boot_capsule` (PTE_RW_NX)
+         ▼  Multi-Queue NVMe Read (Opcode 0x02) straight into 64 KiB slot k of `boot_capsule` (PTE_RW_NX)
 ┌───────────────────────────────────────────────────────────────────────────────────────┐
 │ ZeroCapsuleHeader (64 B): magic="ZEROZCAP" | ver=1 | entry_off=64 | code_bytes | crc  │
 ├───────────────────────────────────────────────────────────────────────────────────────┤
@@ -219,19 +221,24 @@ LBA 0: MasterExtentSuper (24 B) + MasterExtentEntry[0..3] (32 B each)
 
 ---
 
-## 9. Non-POSIX Hardware `@domain`s & `ZeroFS` (`ZLEDGER1`) CoW NVMe Engine
+## 9. Non-POSIX Hardware `@domain`s & Scale-Out `ZeroFS` (`ZLEDGER1`) CoW NVMe Engine
 
 1. **Compile-Time Separated Hardware `@domain` Descriptors (`examples/os/hw_domains.zr`):**
-   - `ZeroOS` abolishes `/dev/*` VFS device files: `@domain dom_nvme : nvme`, `dom_gt : gt`, `dom_gna : gna`, `dom_xhci : xhci`, and `dom_net : net` allocate `64 B`-aligned hardware descriptors bound directly via `MCFG`/`ECAM` (`discover_pci_domains`).
+   - `ZeroOS` abolishes `/dev/*` VFS device files: `@domain dom_nvme : nvme`, `dom_gt : gt`, `dom_gna : gna`, `dom_xhci : xhci`, and `dom_net : net` allocate `64 B`-aligned hardware descriptors bound directly via `MCFG`/`ECAM` (`discover_pci_domains`), rendered live in the right-hand `ZEROFS ZLEDGER1 // PCI DOMAINS` HUD panel (`DOM: NVME:4Q GT:ON ...`).
    - Naming `@domain ... : npu` on Tiger Lake (`i7-1165G7`) or indexing `@domain` as DRAM (`dom[0]`) is a **hard compile-time error**.
-2. **`ZeroFS` (`ZLEDGER1`) Crash-Safe CoW Storage & Hardware Write Guard (`examples/os/zerofs_ledger.zr` + `examples/os/nvme_capsule.zr`):**
-   - **Unified Disk Layout:** `Bucket 0` (`0..2 MiB`) holds immutable `ZEXTENT1` boot capsules; `Buckets 1..2` (`0x20_0000` / `0x40_0000`) hold alternating `ZLedgerSuperblock @cell64` mirrors; `Buckets 3..M` (`>= 0x60_0000`) hold `2 MiB` append-only generational CoW buckets (`EytzNodeHdr` + `63` `LedgerKey`s per `4 KiB` page, `000`/`010`/`100`/`111` extents, `Backpointer32` GC tables, and `AES-128-CTR` + `SHA-NI` locked cachelines).
-   - **Double Hardware NVMe Write Interlock:** `nvme_dma_write_4k_guarded` (`Opcode 0x01`) and `nvme_dma_flush_guarded` (`Opcode 0x00`) refuse all submissions unless `zfs_is_write_armed() == 1` (proven by reading a valid `ZLEDGER1` magic + `@crc32c` superblock off target media) **and** `byte_off >= 0x20_0000`. Foreign `GPT`/`LUKS`/`ext4` drives stay strictly in `SAFE_RO` (`0` sectors written, verified by SHA-256 disk hashing).
-   - **Ordered CoW Commit (`Key [4]`):** Advances descending snapshot (`current_snap -= 1`), encrypts payload via `@aes128_ctr64` + `@sha256_tag`, writes data + `4 KiB` Eytzinger `CRC32C` root, issues NVMe `Flush`, writes the alternating `ZLedgerSuperblock` mirror (`epoch + 1`), issues NVMe `Flush`, and verifies DMA readback through a register-wiped `ptr* @oneshot u64` capability.
+2. **Scale-Out `ZeroFS` (`ZLEDGER1`) CoW Storage & Hardware Write Guard (`examples/os/zerofs_ledger.zr` + `examples/os/nvme_capsule.zr`):**
+   - **Unified Disk Layout:** `Bucket 0` (`0..2 MiB`) holds immutable `ZEXTENT1` boot capsules; `Buckets 1..2` (`0x20_0000` / `0x40_0000`) hold alternating `ZLedgerSuperblock @cell64` mirrors; `Buckets 3..M` (`>= 0x60_0000`) hold `2 MiB` append-only generational CoW buckets (`level = 0` `LedgerKey` leaves + `level = 1..2` `EytzPivot` Merkle-`CRC32C` branches, `4 KiB` `ZfsGenHdr` `ZGENTBL1` generation pages, `+0x1FF000` `ZfsBucketFooterHdr` `ZBPFOOT1` `Backpointer32[126]` footers, `000`/`010`/`100`/`111` extents, and `AES-128-CTR` + `SHA-NI` locked cachelines).
+   - **Double Hardware NVMe Write Interlock:** `nvme_dma_write_pages_guarded_q` (`Opcode 0x01`) and `nvme_dma_flush_guarded_q` (`Opcode 0x00`) refuse all submissions unless `zfs_is_write_armed() == 1` (proven by reading a valid `ZLEDGER1` magic + `@crc32c` superblock off target media) **and** `byte_off >= 0x20_0000`. Foreign `GPT`/`LUKS`/`ext4` drives stay strictly in `SAFE_RO` (`0` sectors written, verified by SHA-256 disk hashing), and `Bucket 0` remains bit-for-bit untouched across CoW epochs.
+   - **Cold-Reboot Scale-Out Mount (`mount_nvme_zerofs`):** Selects the highest valid `ZLEDGER1` superblock mirror (`A` vs `B`), restores `ZfsGenHdr` (`u16` bucket generations), unpacks single-page (`level == 0`) or multi-level (`level == 1`) Merkle-`CRC32C` Eytzinger B+Trees across `SQ1..SQ4`, and restores `+0x1FF000` `ZfsBucketFooterHdr` backpointer tables on all active CoW buckets.
+   - **Ordered Multi-Queue `PRP-List` CoW Commit (`Key [4]` -> `exec_nvme_zerofs_cow_tx`):** Advances descending snapshot (`current_snap -= 1`), appends a `36`-key sharded batch (`35` open records + `1` `AES-128-CTR`/`SHA-NI` locked extent) in **one `16 KiB` (`4`-page) `PRP1 + PRP-List` NVMe command**, writes `ZfsGenHdr`, materializes either a `level = 0` root (`<= 63` keys, e.g. Boot 1 `0 -> 36` keys) or splits automatically into a **`level = 1` Merkle-`CRC32C` Eytzinger B+Tree** (`> 63` keys, e.g. Boot 2 `36 -> 72` keys across `2` leaves!), seals dirty `+0x1FF000` `ZBPFOOT1` footers, flushes all active queues, writes the alternating `ZLedgerSuperblock` mirror, flushes, and verifies multi-level NVMe Root$\rightarrow$Leaf descent + `4`-page `PRP-List` readback + `ptr* @oneshot` decrypt!
 
 ---
 
-## 10. Next-Stage Kernel Extension (Gate 4: `Iris Xe` `CCS0` GPU Compute)
+## 10. Next-Stage Kernel Extension (Gate 4: `Iris Xe` `8086:9a49` Gen12LP Direct EU Compute)
 
-1. **Gate 4 — `Iris Xe` (`8086:9a49`) Direct `CCS0` Compute Engine (Future Target, Not Yet Lowered):**
-   - `FORCEWAKE_RENDER` / `FORCEWAKE_GT`, 48-bit `PPGTT` binding, and `CCS0` `COMPUTE_WALKER` ring submission writing directly into shared DRAM / GOP scanout apertures without userland Mesa/OpenCL layers.
+> [!NOTE]
+> **Status — Future Gate 4 Target (Not Yet Lowered; Preserves Honesty Rule):**
+> With `ZeroFS` (`ZLEDGER1`) scale-out complete, the next architectural gate speaks directly to the **Intel TigerLake-LP GT2 (`Iris Xe`, `8086:9a49`)** Execution Units from Ring 0 without Mesa, OpenCL, DRM/i915, or closed-source GuC firmware:
+> - **Host Hardware Apertures Verified (`lspci -s 00:02.0 -nnv`):** `BAR0` (`GTTMMADR`) at `0x60_0000_0000` (`16 MiB` UC: `[0..8 MiB)` GT MMIO registers + `[8..16 MiB)` `8 MiB` `GGTT` Global GTT mapping `4 GiB` of GPU VA) and `BAR2` (`GMADR`) at `0x40_0000_0000` (`256 MiB` WC).
+> - **Why Tiger Lake `Gen12LP` Is Uniquely Direct-to-Metal:** Unlike Meteor Lake / Lunar Lake (which mandate encrypted GuC firmware microcontrollers for command submission), **Tiger Lake `Gen12LP` (`GFX_VER = 12.0`) natively supports direct CPU Ring-0 Hardware Execlist Submission (`ELSP` at engine base `+0x2230`, `RCS0 = 0x02000` / `CCS0 = 0x1A000`)**!
+> - **Planned Gate-4 Sequence:** `FORCEWAKE_RENDER` (`0xA278`) / `FORCEWAKE_GT` (`0xA188`) wake handshake (`FORCEWAKE_ACK`), `GGTT` / 48-bit `PPGTT` page binding over shared `WB` DRAM `@slab`s, native Gen12LP EU binary kernel emission (`96` EUs / `768` hardware threads), and direct `ELSP` ring submission + hardware `Context Status Buffer (CSB)` completion polling.

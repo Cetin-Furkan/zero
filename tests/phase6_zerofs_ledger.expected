@@ -5,3 +5,4 @@ SNAPSHOTS_OK s2=3 s1=2 s0=1 historical_isolation=1
 AES_SHA_ONESHOT_SEEK_OK off=1048576 wipe=1
 OPEN_SCAN_HITS=8
 GC_AND_FAILOVER_OK moved=1 gen3=2 recovered_epoch=3
+SCALEOUT_BTREE_AND_FOOTERS_OK level=1 keys=150 cold_gen4=9->10 merkle=1

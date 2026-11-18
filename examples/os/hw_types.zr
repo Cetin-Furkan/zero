@@ -249,5 +249,13 @@ ZeroCapsuleHeader :: <packed> {
 @dma_queue nvme_admin_cq  : <NvmeCqe | cap: 16>
 @dma_queue nvme_io_sq1    : <NvmeCmd | cap: 16>
 @dma_queue nvme_io_cq1    : <NvmeCqe | cap: 16>
-@slab      nvme_meta_page : <u8      | max: 4096>
-@capsule   boot_capsule   : <cap: 262144>
+@dma_queue nvme_io_sq2    : <NvmeCmd | cap: 16>
+@dma_queue nvme_io_cq2    : <NvmeCqe | cap: 16>
+@dma_queue nvme_io_sq3    : <NvmeCmd | cap: 16>
+@dma_queue nvme_io_cq3    : <NvmeCqe | cap: 16>
+@dma_queue nvme_io_sq4    : <NvmeCmd | cap: 16>
+@dma_queue nvme_io_cq4    : <NvmeCqe | cap: 16>
+@slab      nvme_prp_lists  : <u64     | max: 2048> // `4 x 4 KiB` page-aligned PRP scatter-gather lists!
+@slab      nvme_ctrl_state : <u64     | max: 8>    // [0]=ready, [1]=lbads, [5]=mdts_pages, [7]=io_queues!
+@slab      nvme_meta_page  : <u8      | max: 4096>
+@capsule   boot_capsule    : <cap: 262144>

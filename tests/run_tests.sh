@@ -659,6 +659,7 @@ sb_hdr_bytes = struct.pack("<QIIQQIIQQ", ZLEDGER_MAGIC, 1, 1, 1, root_ext, 0xFFF
 sb_qwords = list(struct.unpack("<7Q", sb_hdr_bytes))
 sb_crc = crc32c_seq_u64([*sb_qwords, 0])
 disk[1 * BUCKET_BYTES : 1 * BUCKET_BYTES + 64] = sb_hdr_bytes + struct.pack("<II", 0, sb_crc)
+bucket0_sha_before = hashlib.sha256(disk[:BUCKET_BYTES]).hexdigest()
 open("build/nvme_disk.img", "wb").write(disk)
 
 kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
@@ -714,7 +715,7 @@ def run_deck(tag, qemu_args, keys, dump_after=None, boot_tmo=12.0):
             proc.kill()
     return rd(), ppm_p
 
-# 1. 4-core Q35 + NVMe (`ZEXTENT1` + `ZLEDGER1`): `1` -> `2` -> `3` -> `4` (CoW TX -> EPOCH=2!) -> `b` -> `a` -> screendump -> `q`
+# 1. 4-core Q35 + NVMe (`ZEXTENT1` + `ZLEDGER1`): `1` -> `2` -> `3` -> `4` (4Q PRP-List CoW TX -> EPOCH=2, KEYS=36, LVL=0!) -> `b` -> `a` -> screendump -> `q`
 q35_nvme = ["-machine", "q35", *accel, *pm_flags, "-m", "512M",
             "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf}",
             "-drive", "format=raw,file=fat:rw:build/esp",
@@ -724,16 +725,16 @@ log, ppm = run_deck("gate1_debugcon", [*q35_nvme, "-smp", "4"], ["1", "2", "3", 
 c1, c2, c3 = EXPECT[4]
 m = re.search(r"^ZEROHAND W=(\d+) H=(\d+) S=(\d+) F=0 C=4 M=(\d+) PT=(\d+) WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=(\d+)/(\d+) CYC=(\d+) CAP=777 KBD\n"
               rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\n"
-              r"ZFS=OK EPOCH=2 SNAP=4294967293 KEYS=1 VAL=200401\n"
+              r"ZFS=OK EPOCH=2 LVL=0 Q=4 SNAP=4294967293 KEYS=36 VAL=200436\n"
               r"BENCH=OK\nSCAN=0x0000001E GATE1B_OK\nSHUTDOWN_OK\n$", log)
 if not m:
-    print("  [FAIL] unexpected 4-core Command Deck + ZeroFS debugcon log:\n" + log, file=sys.stderr)
+    print("  [FAIL] unexpected 4-core Command Deck + ZeroFS Scale-Out debugcon log:\n" + log, file=sys.stderr)
     sys.exit(1)
 gw, gh, gs, mc, pt, vec_cyc, sc_cyc, cyc = map(int, m.groups())
 assert gs >= gw * 4, f"stride {gs} < width*4 ({gw*4})"
 assert vec_cyc > 0 and sc_cyc > 0 and cyc > 0
-print(f"  [PASS] [zero2] Q35+OVMF -smp 4 + NVMe: C=4 WX=0({pt} PT) SIMD=1 VEC={vec_cyc}/{sc_cyc} CYC={cyc} CAP=777")
-print(f"  [PASS] [zero2] Command Deck + ZeroFS CoW TX: [1..3] CAP={c1}/{c2}/{c3} [4] ZFS=OK EPOCH=2 SNAP=0xFFFFFFFD KEYS=1 VAL=200401 [B] BENCH=OK [A] GATE1B_OK [Q] SHUTDOWN_OK")
+print(f"  [PASS] [zero2] Q35+OVMF -smp 4 + NVMe (4 I/O queues): C=4 WX=0({pt} PT) SIMD=1 VEC={vec_cyc}/{sc_cyc} CYC={cyc} CAP=777")
+print(f"  [PASS] [zero2] Command Deck + ZeroFS 4Q PRP-List CoW TX: [1..3] CAP={c1}/{c2}/{c3} [4] ZFS=OK EPOCH=2 LVL=0 Q=4 SNAP=0xFFFFFFFD KEYS=36 VAL=200436 [B] BENCH=OK [A] GATE1B_OK [Q] SHUTDOWN_OK")
 
 with open(ppm, "rb") as f:
     assert f.readline().strip() == b"P6"
@@ -780,14 +781,77 @@ except Exception:
     png_note = ""
 print(f"  [PASS] [zero2] GOP {pw}x{ph} stride={gs}B: AVX-512 scanout, 6 LEDs, 4 core pips, HUD, Command Deck + ZeroFS ZLEDGER1 Panel{png_note}")
 
-# 2. Cold-Reboot NVMe Persistence + Single-Core Q35 Path (`build/nvme_disk.img` NOT reformatted -> mounts Mirror B EPOCH=2 -> commits EPOCH=3!)
+# 2. Cold-Reboot NVMe Persistence + Live Multi-Level (`LVL=0 -> LVL=1`) Merkle B+Tree Split (`36 -> 72` keys!)
 c1, c2, c3 = EXPECT[1]
 log1n, _ = run_deck("gate1_smp1_nvme", [*q35_nvme, "-smp", "1"], ["1", "2", "3", "4", "q"])
 assert re.search(r"^ZEROHAND W=\d+ H=\d+ S=\d+ F=0 C=1 M=\d+ PT=\d+ WX=0 ACPI=1 GS=1 FAB=1 SIMD=1 VEC=\d+/\d+ CYC=\d+ CAP=777 KBD\n"
                  rf"CAP1={c1}\nCAP2={c2}\nCAP3={c3}\n"
-                 r"ZFS=OK EPOCH=3 SNAP=4294967292 KEYS=2 VAL=300102\n"
-                 r"SHUTDOWN_OK\n$", log1n), f"unexpected -smp 1 cold-reboot ZeroFS NVMe log: {log1n}"
-print(f"  [PASS] [zero2] cold-reboot NVMe persistence verified: mounted EPOCH=2 from Mirror B -> committed EPOCH=3 SNAP=0xFFFFFFFC KEYS=2 VAL=300102")
+                 r"ZFS=OK EPOCH=3 LVL=1 Q=1 SNAP=4294967292 KEYS=72 VAL=300172\n"
+                 r"SHUTDOWN_OK\n$", log1n), f"unexpected -smp 1 cold-reboot ZeroFS NVMe split log: {log1n}"
+print(f"  [PASS] [zero2] cold-reboot NVMe B+Tree split verified: mounted EPOCH=2 (36 keys) -> committed EPOCH=3 LVL=1 Q=1 SNAP=0xFFFFFFFC KEYS=72 VAL=300172")
+
+# 2b. Independent Host Structural Audit of On-Disk `build/nvme_disk.img` (`EPOCH=3`, `LVL=1` Merkle B+Tree, `ZGENTBL1`, `ZBPFOOT1`, untouched `Bucket 0`)
+ZGEN_MAGIC = 0x314C42544E45475A
+ZBPF_MAGIC = 0x31544F4F4650425A
+ADDR42_MASK = 0x000003FFFFFFFFFF
+post_disk = open("build/nvme_disk.img", "rb").read()
+assert hashlib.sha256(post_disk[:BUCKET_BYTES]).hexdigest() == bucket0_sha_before, "CRITICAL: Bucket 0 (ZEXTENT1) modified during ZeroFS CoW commits!"
+
+sb_a_raw = post_disk[1 * BUCKET_BYTES : 1 * BUCKET_BYTES + 64]
+sb_magic, sb_ver, sb_flags, sb_ep, sb_rext, sb_snap, sb_bcnt, sb_amask, sb_gpack, sb_kcnt, sb_crc_got = struct.unpack("<QIIQQIIQQII", sb_a_raw)
+sb_crc_exp = crc32c_seq_u64([*struct.unpack("<7Q", sb_a_raw[:56]), sb_kcnt])
+assert sb_magic == ZLEDGER_MAGIC and sb_ep == 3 and sb_flags == 3 and sb_kcnt == 72 and sb_crc_got == sb_crc_exp, \
+    f"Superblock A audit failed: ep={sb_ep} flags={sb_flags:#x} keys={sb_kcnt} crc={sb_crc_got:#x}/{sb_crc_exp:#x}"
+
+def verify_eytz_page(off):
+    buf = post_disk[off : off + 4096]
+    mg, ep, mn, mx, lvl, tkeys, gext, cnt, ncrc = struct.unpack_from("<7QII", buf, 0)
+    assert mg == ZEYTZ_MAGIC and cnt <= 63, f"bad EytzNodeHdr at {off:#x}"
+    words = [*struct.unpack_from("<7Q", buf, 0), cnt]
+    for s in range(1, cnt + 1):
+        words.extend(struct.unpack_from("<8Q", buf, s * 64))
+    assert crc32c_seq_u64(words) == ncrc, f"EytzNodeHdr CRC32C mismatch at {off:#x}"
+    return buf, ep, lvl, tkeys, gext, cnt, ncrc
+
+root_off3 = (sb_rext & ADDR42_MASK) << 6
+rbuf, rep, rlvl, rtkeys, rgext, rcnt, _ = verify_eytz_page(root_off3)
+assert rep == 3 and rlvl == 1 and rtkeys == 72 and rcnt == 2 and rgext != 0, \
+    f"unexpected root node: ep={rep} lvl={rlvl} total={rtkeys} cnt={rcnt} gext={rgext:#x}"
+
+# Verify `ZfsGenHdr` (`ZGENTBL1`) 4 KiB page
+gen_off3 = (rgext & ADDR42_MASK) << 6
+gbuf = post_disk[gen_off3 : gen_off3 + 4096]
+g_magic, g_ep, g_bcnt = struct.unpack_from("<3Q", gbuf, 0)
+g_rsv, g_crc = struct.unpack_from("<II", gbuf, 56)
+g_words = [*struct.unpack_from("<7Q", gbuf, 0), g_rsv, *struct.unpack_from("<504Q", gbuf, 64)]
+assert g_magic == ZGEN_MAGIC and g_ep == 3 and g_bcnt == 8 and crc32c_seq_u64(g_words) == g_crc, "ZfsGenHdr CRC/header mismatch"
+
+# Verify Merkle `EytzPivot` slots 1..2 -> child leaves (`63 + 9 == 72` keys)
+leaf_key_sum = 0
+for s in range(1, rcnt + 1):
+    p_raw = rbuf[s * 64 : (s + 1) * 64]
+    p_max_id, p_max_sn, p_ccnt, p_clvl, p_cext, p_min_id, p_min_sn, p_pad0, p_ccrc, p_fl, p_rsv, p_crc = struct.unpack("<QIHH4Q4I", p_raw)
+    assert crc32c_seq_u64([*struct.unpack("<7Q", p_raw[:56]), p_rsv]) == p_crc, f"EytzPivot {s} CRC mismatch"
+    _, lep, llvl, ltkeys, _, lcnt, lncrc = verify_eytz_page((p_cext & ADDR42_MASK) << 6)
+    assert llvl == 0 and lncrc == p_ccrc and lcnt == p_ccnt, f"Merkle child_crc mismatch on pivot {s}"
+    leaf_key_sum += lcnt
+assert leaf_key_sum == 72, f"leaf key sum {leaf_key_sum} != 72"
+
+# Verify `+0x1FF000` `ZfsBucketFooterHdr` (`ZBPFOOT1`) pages across active CoW buckets
+bp_total = 0
+footer_buckets = 0
+for bid in range(3, 8):
+    if (sb_amask >> bid) & 1:
+        fbuf = post_disk[bid * BUCKET_BYTES + 0x1FF000 : bid * BUCKET_BYTES + 0x200000]
+        f_mg, f_ep, f_bid, f_gen, f_used = struct.unpack_from("<QQIIQ", fbuf, 0)
+        f_bpc, f_crc = struct.unpack_from("<II", fbuf, 56)
+        if f_mg == ZBPF_MAGIC:
+            f_words = [*struct.unpack_from("<7Q", fbuf, 0), f_bpc, *struct.unpack_from(f"<{f_bpc * 4}Q", fbuf, 64)]
+            assert f_bid == bid and f_gen == 1 and crc32c_seq_u64(f_words) == f_crc, f"Bucket {bid} footer CRC mismatch"
+            bp_total += f_bpc
+            footer_buckets += 1
+assert footer_buckets >= 1 and bp_total == 72, f"expected 72 persistent Backpointer32 records across active footers, got {bp_total}"
+print(f"  [PASS] [zero2] host NVMe image audit: Bucket 0 untouched, LVL=1 Merkle B+Tree (2 leaves, 63+9=72 keys), ZGENTBL1 & {footer_buckets} ZBPFOOT1 footers ({bp_total} backpointers) CRC32C-valid")
 
 # 3. Adversarial Foreign NVMe Drive Protection Test (`GPT` + `LUKS` + `ext4`, NO `ZLEDGER1` -> `ZFS=SAFE_RO`, SHA-256 100% unchanged!)
 foreign_disk = bytearray(8 * 1024 * 1024)

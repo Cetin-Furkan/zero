@@ -5,8 +5,8 @@
 > [!IMPORTANT]
 > **Core Engineering Honesty Rule:**
 > Neither the compiler nor the documentation ever claims a construct exists before it lowers to verified machine instructions. Any unlowered syntax, attribute, memory space, or loop lens is a **hard compile-time error** tested by negative probes.
-> - **Implemented & Verified Today (`build/zero2` == `build/zero3` at `653,982 B`, `107 PASS / 0 FAIL`):** Tracks 1–3 + **Stage 1 Next-Gen `Zero` Spine** (`ptr*`, `ref&`, `ptr* @oneshot`, `;` flag-handoff, `mask<...>`, `when` / `with when` / `when while` / `when for`, `@ring(s..n)`, `@bits`) + **Stage 2 Non-POSIX `@domain`s & `ZeroFS` (`ZLEDGER1`) CoW NVMe Engine** (`@domain`, `@sha256_tag`, `@aes128_ctr64`, Eytzinger `CRC32C` B-tree, descending snapshots, `000..111` pieces, backpointer GC, and `ZLEDGER1` `SAFE_RO` drive protection).
-> - **Future Hardware Target (Gate 4 — Explicitly Rejected / Unscheduled Today):** `<tile: Size>`, `@cold` struct splitting, and `Iris Xe` `CCS0` GPU compute walker.
+> - **Implemented & Verified Today (`build/zero2` == `build/zero3` at `653,982 B`, `108 PASS / 0 FAIL`):** Tracks 1–3 + **Stage 1 Next-Gen `Zero` Spine** (`ptr*`, `ref&`, `ptr* @oneshot`, `;` flag-handoff, `mask<...>`, `when` / `with when` / `when while` / `when for`, `@ring(s..n)`, `@bits`) + **Stage 2A & 2B Scale-Out Non-POSIX `@domain`s & `ZeroFS` (`ZLEDGER1`) CoW NVMe Engine** (`@domain`, `@sha256_tag`, `@aes128_ctr64`, multi-level `level 0..2` Eytzinger Merkle-`CRC32C` B+Tree scaling `63 -> 3,969 -> 250,047` keys, persistent `ZfsGenHdr` `u16[2016]` + `+0x1FF000` `ZfsBucketFooterHdr` `Backpointer32[126]` cold-reboot GC, lockless `SQ1..SQ4` NVMe queues + `PRP1 + PRP2 / PRP-List` scatter-gather DMA, and `ZLEDGER1` `SAFE_RO` drive protection).
+> - **Future Hardware Target (Gate 4 — Explicitly Rejected / Unscheduled Today):** `<tile: Size>`, `@cold` struct splitting, and `Iris Xe` (`8086:9a49` Gen12LP) direct `ELSP` / EU compute execution.
 
 ---
 
@@ -31,7 +31,7 @@ flowchart LR
     Z2 -->|"self-reproduces\ncmp == 0 bytes diff!"| Z3["build/zero3\n653,982 B Fixed Point"]
 
     Z2 -->|"default target"| ELF["Linux Static ELF64\nPhdr[0] RX + Phdr[1] RW\n(10 Golden Suites)"]
-    Z2 -->|"--target=efi-os"| EFI["UEFI Bare-Metal PE32+\ngate1_os_z2.efi (159,744 B)\ngate1_laptop_z2.efi (155,136 B)"]
+    Z2 -->|"--target=efi-os"| EFI["UEFI Bare-Metal PE32+\ngate1_os_z2.efi (192,000 B)\ngate1_laptop_z2.efi (186,368 B)"]
     Z2 -->|"--target=capsule"| CAP["Position-Independent .zcap\nZEROZCAP + Hardware CRC32C\n(4 Verified Capsule Extents)"]
     EFI -->|"scripts/build_usb_image.py"| USB["build/zeroos_usb.img\n64 MiB GPT + FAT32 ESP\n/EFI/BOOT/BOOTX64.EFI"]
 ```
@@ -74,18 +74,18 @@ flowchart LR
 │   └── os/
 │       ├── hw_types.zr                # `BootHandoff`, `ReactorLocal`, `@PtePtr`, `@port`s, `@ring`s, `@dma_queue`s
 │       ├── hw_domains.zr              # Non-POSIX `@domain` PCIe discovery (`nvme`, `gt`, `gna`, `xhci`, `net`; `npu` rejected)
-│       ├── zerofs_ledger.zr           # Portable `ZeroFS` (`ZLEDGER1`) CoW ledger, Eytzinger B-tree, `AES-NI`/`SHA-NI` + `@oneshot`
+│       ├── zerofs_ledger.zr           # Scale-out `ZeroFS` (`ZLEDGER1`): `level 0..2` Merkle Eytzinger B+Tree, `ZGENTBL1` & `ZBPFOOT1`
 │       ├── debug_io.zr                # Port-`0xE9` telemetry (`0` instructions emitted when `qemu_debug :: 0`)
 │       ├── paging_wx.zr               # 4-level W^X page-table builder, `verify_no_wx_pages`, GDT/TSS/IDT, capsule sealing
 │       ├── smp_madt.zr                # ACPI `MADT` parser + `x2APIC` `INIT-SIPI` multi-core AP bring-up
 │       ├── reactor_fabric.zr          # `MOVDIR64B`/`MWAIT` worker loop, `CMD_EXEC_CAPSULE`, AVX-512 bench, `@isr`
-│       ├── nvme_capsule.zr            # NVMe `@dma_queue` capsules + hardware-interlocked `ZLEDGER1` CoW Write/Flush driver
+│       ├── nvme_capsule.zr            # 4Q NVMe (`SQ1..SQ4`), `PRP-List` DMA, `.zcap` capsules & guarded `ZLEDGER1` CoW driver
 │       ├── ioapic_kbd.zr              # `MADT` I/O APIC + ISO, 8259 mask, `@isr` IRQ1 -> `0x21`, tickless `MWAIT` key wait
 │       └── hud_render.zr              # AVX-512 `vmovntdq` scanout, 5x7 font, Command Deck + `ZEROFS ZLEDGER1` panel
 ├── scripts/
 │   └── build_usb_image.py             # Generates 64 MiB protective-MBR + GPT + FAT32 USB stick (`BOOTX64.EFI`)
 └── tests/
-    ├── run_tests.sh                   # 7-stage automated verifier (`107 PASS, 0 FAIL` in ~15s under KVM)
+    ├── run_tests.sh                   # 7-stage automated verifier (`108 PASS, 0 FAIL` in ~15s under KVM)
     ├── lib/                           # Diamond-import multi-file `use "lib/..."` modules
     └── *.zr / *.expected              # `first`, `step3_compute`, `step4_systems`, `phase0..6` golden suites
 ```
@@ -132,8 +132,8 @@ Engineers modifying `compiler/*.zr` should understand six core invariants of the
 | **512-Bit Ring-0 `AVX-512` (`u32x16`, `u64x8`, `<simd: 8\|16>`)** | **Implemented** | Full ZMM ALU, `@vec_splat`, `@vec_iota`, `{k1}{z}` masked `@vec_load`, `{k1}` masked `@vec_store`, `@vec_stream` (`vmovntdq`), 64b-safe `@vec_sum`, `<simd>` loops with `{k1}` tails, enforced inside `<tile>` on Ring-0 targets. |
 | **Bare-Metal `ZeroOS`: `W^X`, `x2APIC` SMP, NVMe `@capsule`s, `IRQ1` Deck & USB** | **Implemented** | 4-core Q35+KVM+OVMF+NVMe boot, 3 CRC32C-verified W^X-sealed `.zcap` extents dispatched across workers (`CAP1=2337`, `CAP2=1207754`, `CAP3=35277270`), tickless `IRQ1`/`MWAIT` Obsidian Command Deck, and `build/zeroos_usb.img` GPT+FAT32 boot stick. |
 | **Stage 1: Next-Gen Spine (`ptr*`, `ref&`, `ptr* @oneshot`, `;` flag-handoff, `mask<...>`, `when` / `with when` / `when while` / `when for`, `@ring(s..n)`, `@bits`)** | **Implemented** | Raw 8B `ptr* T`, zero-sigil caller `ref& T`, zero-spill GPR-only `ptr* @oneshot T` (`[r10, r9, rsi, rdi]` + immediate `xor` wipes), line-end `;` parse error, zero-`cmp` `mask<...>` (`bextr`, `bt`, `test`, 3-part `pause`+`dec rcx` spin), `when`/`with when`/`when while`/`when for`, `@ring(s..n)`, and `tzcnt`+`blsr` `@bits` (`tests/phase5_nextgen_spine.zr` + `cap_spine_probe.zcap`). |
-| **Stage 2: Non-POSIX Hardware Domains & `ZeroFS` (`ZLEDGER1`) CoW Ledger** | **Implemented** | `@domain` descriptors (`nvme`, `gt`, `gna`, `xhci`, `net`; `npu` rejected on Tiger Lake), `128-bit XMM` `@sha256_tag` (`SHA-NI`) & `@aes128_ctr64` (`AES-NI`) + immediate `pxor` wipes, 2 MiB generational buckets, `4 KiB` Eytzinger `@crc32c` B-tree, descending `u32` snapshots, `000..111` pieces, `Backpointer32` GC, and hardware-interlocked NVMe CoW commits (`ZLEDGER1` `SAFE_RO` guard on foreign disks). |
-| **`<tile: Size>` Cache-Blocking, `@cold` Splitting, `Iris Xe` `CCS0` GPU Walker** | **Future Target (Rejected Today)** | Explicitly rejected at compile time (or unscheduled until Gate 4) per the Honesty Rule. |
+| **Stage 2A & 2B: Non-POSIX Hardware Domains & Scale-Out `ZeroFS` (`ZLEDGER1`) CoW NVMe Engine** | **Implemented** | `@domain` descriptors (`nvme`, `gt`, `gna`, `xhci`, `net`; `npu` rejected on Tiger Lake), `128-bit XMM` `@sha256_tag` (`SHA-NI`) & `@aes128_ctr64` (`AES-NI`) + immediate `pxor` wipes, multi-level (`level 0..2`) 1-based Eytzinger Merkle-`CRC32C` B+Tree (`63 -> 3,969 -> 250,047` keys), persistent `ZfsGenHdr` (`ZGENTBL1`) + `+0x1FF000` `ZfsBucketFooterHdr` (`ZBPFOOT1`, `126` `Backpointer32`s) cold-reboot GC, lockless `SQ1..SQ4` NVMe queues + `PRP-List` bulk DMA, and `ZLEDGER1` `SAFE_RO` guard on foreign disks. |
+| **`<tile: Size>` Cache-Blocking, `@cold` Splitting, `Iris Xe` (`8086:9a49`) Direct EU Compute** | **Future Target (Rejected Today)** | Explicitly rejected at compile time (or unscheduled until Gate 4) per the Honesty Rule. |
 
 ---
 
@@ -142,7 +142,7 @@ Engineers modifying `compiler/*.zr` should understand six core invariants of the
 ### Core Commands
 
 ```bash
-# 1. Full clean bootstrap + 7-stage verification suite (~15 seconds with KVM; 107 PASS / 0 FAIL)
+# 1. Full clean bootstrap + 7-stage verification suite (~15 seconds with KVM; 108 PASS / 0 FAIL)
 make clean && make test
 
 # 2. Build physical laptop 64 MiB GPT + FAT32 bootable USB image (qemu_debug :: 0, zero 0xE9 I/O)
@@ -155,12 +155,12 @@ make qemu
 ### What `make test` (`tests/run_tests.sh`) Verifies Automatically
 
 1. **Stage 1 (Self-Hosting & `W^X`):** Builds `zero0 -> zero1 -> zero2 -> zero3`, verifies `cmp -s zero2 zero3` (`653,982 B`, `0` diff), checks `readelf -lW` for zero `RWE` segments, and tests `--lex`.
-2. **Stage 2 (10 Golden Suites & Disassembly Audit):** Compiles `first`, `step3_compute`, `step4_systems`, `phase0_scalar`, `phase1_zero_lang`, `phase2_zero_power`, `phase3_reactor_fabric`, `phase4_avx512_simd`, `phase5_nextgen_spine`, and `phase6_zerofs_ledger` via `build/zero2`, diffs stdout against `.expected`, and verifies exact silicon/EVEX + Stage-1 Spine + Stage-2 `SHA-NI`/`AES-NI`/`pxor` instructions via `objdump`.
+2. **Stage 2 (10 Golden Suites & Disassembly Audit):** Compiles `first`, `step3_compute`, `step4_systems`, `phase0_scalar`, `phase1_zero_lang`, `phase2_zero_power`, `phase3_reactor_fabric`, `phase4_avx512_simd`, `phase5_nextgen_spine`, and `phase6_zerofs_ledger` (`150`-key `3`-leaf `level=1` B+Tree split + cold-reboot `ZGENTBL1`/`ZBPFOOT1` GC recovery!) via `build/zero2`, diffs stdout against `.expected`, and verifies exact silicon/EVEX + Stage-1 Spine + Stage-2 `SHA-NI`/`AES-NI`/`pxor` instructions via `objdump`.
 3. **Stage 3 (77 Negative Compile-Rejection Probes):** Verifies `build/zero2` rejects 77 invalid programs across `ELF64`, `--target=efi-os`, and `--target=capsule` (54 baseline + 16 Stage-1 + 7 Stage-2 probes including `@domain : npu` on Tiger Lake, `@domain` indexed as DRAM, `@domain` in capsule, and `@sha256_tag`/`@aes128_ctr64` inside `@isr`/`@isr_ok`).
 4. **Stage 4 (Unhandled Fault Exit):** Confirms uncaught `fail` exits with status `1`.
-5. **Stage 5 (Bare-Metal Containers):** Builds 4 `.zcap` capsules + debug `gate1_os_z2.efi` (`159,744 B`) + `qemu_debug :: 0` `gate1_laptop_z2.efi` (`155,136 B`, `0` port-`0xE9` instructions).
-6. **Stage 6 (Live Multi-Core `ZeroOS` + `ZeroFS` NVMe Persistence & Foreign-Drive Guard):** Boots 4-core SMP, injects PS/2 keys `1 2 3 4 b a q`, verifies capsule sums (`2337`, `1207754`, `35277270`), live NVMe CoW `ZLEDGER1` commit (`EPOCH=2`), cold-reboot NVMe persistence (`EPOCH=2 -> EPOCH=3`), foreign GPT/LUKS/ext4 NVMe `ZFS=SAFE_RO` (`0` bytes modified via SHA-256), `-smp 1` fallback, and `-vga none` clean return.
-7. **Stage 7 (Bootable GPT + FAT32 USB Stick):** Audits protective MBR + primary/backup GPT CRCs + FAT32 cluster chains, extracts `/EFI/BOOT/BOOTX64.EFI` (`155,136 B`) to prove byte-identity with `gate1_laptop_z2.efi`, and boots OVMF from emulated xHCI `usb-storage`.
+5. **Stage 5 (Bare-Metal Containers):** Builds 4 `.zcap` capsules + debug `gate1_os_z2.efi` (`192,000 B`) + `qemu_debug :: 0` `gate1_laptop_z2.efi` (`186,368 B`, `0` port-`0xE9` instructions).
+6. **Stage 6 (Live Multi-Core `ZeroOS` + 4Q `PRP-List` `ZeroFS` B+Tree Split & Foreign-Drive Guard):** Boots 4-core SMP (`Q=4` NVMe I/O queues), injects PS/2 keys `1 2 3 4 b a q`, verifies capsule sums (`2337`, `1207754`, `35277270`), `16 KiB` `PRP-List` `36`-key CoW commit (`EPOCH=2 LVL=0 Q=4 KEYS=36 VAL=200436`), cold-reboot NVMe persistence + live `level 0 -> 1` Merkle B+Tree split (`EPOCH=3 LVL=1 Q=1 KEYS=72 VAL=300172`), host Python on-disk `CRC32C` audit of `LVL=1` B+Tree (`63+9=72` keys), `ZGENTBL1`, & `ZBPFOOT1` footers, foreign GPT/LUKS/ext4 NVMe `ZFS=SAFE_RO` (`0` bytes modified via SHA-256), `-smp 1` fallback, and `-vga none` clean return.
+7. **Stage 7 (Bootable GPT + FAT32 USB Stick):** Audits protective MBR + primary/backup GPT CRCs + FAT32 cluster chains, extracts `/EFI/BOOT/BOOTX64.EFI` (`186,368 B`) to prove byte-identity with `gate1_laptop_z2.efi`, and boots OVMF from emulated xHCI `usb-storage`.
 
 ### Interactive Obsidian Command Deck Controls
 

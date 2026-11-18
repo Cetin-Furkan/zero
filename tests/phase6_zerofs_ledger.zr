@@ -362,5 +362,92 @@ fn main() i64 {
     }
 
     print("GC_AND_FAILOVER_OK moved=1 gen3=2 recovered_epoch=3")
+
+    // -------------------------------------------------------------------------
+    // 7. Scale-Out: Multi-Level (`level = 1`, `150` Keys / `3` Leaves) B+Tree Split
+    //    + Cold-Reboot Persistent `ZfsGenHdr` & `+0x1FF000` `Backpointer32` GC!
+    // -------------------------------------------------------------------------
+    _ := zfs_format_memory_ledger(media, 8)
+    zfs_bucket_gens[4] = 9 // custom non-1 generation to verify `ZfsGenHdr` persistence!
+
+    // Insert `150` keys (`> 63` fanout -> forces `level = 1` root + `3` `level = 0` child leaves: `63 + 63 + 24`)!
+    for idx_m in 0..150 {
+        uk: u64 = idx_m
+        vbuf[0] = 0xCA11_0000_0000_0000 + uk * 131 + 17
+        _ := zfs_put_contiguous(media, uk & 3, 0x9000_0000_0000_0000 + uk, ptr* u8 (read_out_buf.base), 64, ZFS_PERM_RW | (1 << 8))
+    }
+
+    ep_ml: u64 = zfs_commit_to_memory_arena(media, 0)
+    if ep_ml != 2 || zfs_state[12] != 1 || zfs_state[6] != 150 {
+        return 71
+    }
+
+    // Wipe ALL in-DRAM `ZeroFS` caches (`zfs_bucket_gens`, `zfs_bp_counts`, `zfs_staging_keys`) to simulate cold power-off!
+    for b in 0..ZFS_MAX_BUCKETS {
+        ub: u64 = b
+        zfs_bucket_gens[ub]    = 0
+        zfs_bp_counts[ub]      = 0
+        zfs_bucket_cursors[ub] = 0
+    }
+    for k in 0..200 {
+        uk2: u64 = k
+        zfs_staging_keys[uk2].id_hash = 0
+    }
+
+    // Cold-mount from `media`: restores `ZfsGenHdr` (`gen[4]==9`), `level=1` B+Tree (`150` keys), & `+0x1FF000` footers!
+    cold_ep: u64 = zfs_mount_arena_cold(media)
+    if cold_ep != 2 || zfs_state[12] != 1 || zfs_state[6] != 150 || zfs_bucket_gens[4] != 9 || zfs_bp_counts[4] == 0 {
+        return 72
+    }
+
+    ml_root_off: u64 = mask<zfs_state[7] | ZFS_ADDR42_MASK> << 6
+    ml_root := media + ml_root_off
+
+    // Probe across all 3 leaf split boundaries (`0`, `62`, `63`, `125`, `126`, `149`)!
+    for probe_k in 0..150 {
+        up: u64 = probe_k
+        if up == 0 || up == 62 || up == 63 || up == 125 || up == 126 || up == 149 {
+            _ := zfs_read_open_extent(media, ml_root, 0x9000_0000_0000_0000 + up, ZFS_SNAP_INIT, out_p, got_len)
+            if got_len != 64 || vbuf[0] != 0xCA11_0000_0000_0000 + up * 131 + 17 {
+                return 73
+            }
+        }
+    }
+
+    // Verify `@bits` open-extent scan across all `150` keys (`3` `u64` mask words)!
+    ml_open_hits: u64 = 0
+    _ := zfs_scan_open_domain(0, ml_open_hits)
+    if ml_open_hits != 150 {
+        return 74
+    }
+
+    // Verify Merkle `child_crc` tamper detection on child leaf!
+    ml_pivs := ptr* EytzPivot (ml_root)
+    c1_off: u64 = mask<ml_pivs[1].child_ext | ZFS_ADDR42_MASK> << 6
+    media[c1_off + 80] ^= 0x01
+    merkle_fault: u64 = 0
+    {
+        _ := zfs_read_open_extent(media, ml_root, 0x9000_0000_0000_0000 + 70, ZFS_SNAP_INIT, out_p, got_len)
+    } recover mferr {
+        merkle_fault = mferr
+    }
+    media[c1_off + 80] ^= 0x01
+    if merkle_fault != ZFS_FAULT_CORRUPT {
+        return 75
+    }
+
+    // Evacuate `Bucket 4 -> Bucket 6` using ONLY the cold-restored `+0x1FF000` `Backpointer32` footer (`gen 9 -> 10`)!
+    evac4: u64 = zfs_evacuate_bucket(media, 4, 6)
+    ep_after_gc: u64 = zfs_commit_to_memory_arena(media, 0)
+    if evac4 == 0 || zfs_bucket_gens[4] != 10 || ep_after_gc != 3 {
+        return 76
+    }
+    gc_root := media + (mask<zfs_state[7] | ZFS_ADDR42_MASK> << 6)
+    _ := zfs_read_open_extent(media, gc_root, 0x9000_0000_0000_0000 + 1, ZFS_SNAP_INIT, out_p, got_len)
+    if vbuf[0] != 0xCA11_0000_0000_0000 + 1 * 131 + 17 {
+        return 77
+    }
+
+    print("SCALEOUT_BTREE_AND_FOOTERS_OK level=1 keys=150 cold_gen4=9->10 merkle=1")
     return 0
 }
